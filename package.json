@@ -1,0 +1,20 @@
+{
+  "name": "llm-council-search",
+  "private": true,
+  "description": "Ai 理事会（llm-council-search）— Hono + Next.js 多模型三阶段议会（Monorepo）",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VaynePeng/llm-council-search.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VaynePeng/llm-council-search/issues"
+  },
+  "homepage": "https://github.com/VaynePeng/llm-council-search#readme",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @llm-council-search/api --filter @llm-council-search/web dev",
+    "dev:api": "pnpm --filter @llm-council-search/api dev",
+    "dev:web": "pnpm --filter @llm-council-search/web dev",
+    "build": "pnpm -r build"
+  }
+}

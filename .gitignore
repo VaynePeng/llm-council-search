@@ -1,0 +1,15 @@
+node_modules
+dist
+.next
+
+# Secrets & local env（全仓库任意路径；模板文件用 .env.example 并保留提交）
+.env
+.env.*
+!.env.example
+!**/.env.example
+!.env*.example
+!**/.env*.example
+
+*.log
+apps/api/data/conversations/*.json
+.DS_Store

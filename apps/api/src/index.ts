@@ -1,0 +1,461 @@
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { API_PORT, CHAIRMAN_MODEL, COUNCIL_MODELS, TITLE_MODEL } from "./config.js";
+import {
+  calculateAggregateRankings,
+  generateConversationTitle,
+  labelToModelFromStage1,
+  runFullCouncil,
+  stage1CollectResponses,
+  stage2CollectRankings,
+  stage3SynthesizeFinal,
+} from "./council.js";
+import { withConversationLock } from "./lock.js";
+import { queryModel } from "./openrouter.js";
+import {
+  addAssistantMessage,
+  addUserMessage,
+  createConversation,
+  deleteConversation,
+  findPreviousUserQuery,
+  getConversation,
+  isAssistantMessage,
+  listConversations,
+  saveConversation,
+  updateConversationTitle,
+} from "./storage.js";
+
+const app = new Hono();
+
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000", "http://localhost:5173"],
+    allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    allowHeaders: ["*"],
+    credentials: true,
+  }),
+);
+
+app.get("/", (c) =>
+  c.json({ status: "ok", service: "Ai 理事会 API (Hono)" }),
+);
+
+app.get("/api/config", (c) =>
+  c.json({
+    council_models: COUNCIL_MODELS,
+    chairman_model: CHAIRMAN_MODEL,
+    title_model: TITLE_MODEL,
+  }),
+);
+
+app.get("/api/conversations", async (c) => {
+  const list = await listConversations();
+  return c.json(list);
+});
+
+app.post("/api/conversations", async (c) => {
+  const id = crypto.randomUUID();
+  const conv = await createConversation(id);
+  return c.json(conv);
+});
+
+app.get("/api/conversations/:id", async (c) => {
+  const id = c.req.param("id");
+  const conv = await getConversation(id);
+  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+  return c.json(conv);
+});
+
+app.delete("/api/conversations/:id", async (c) => {
+  const id = c.req.param("id");
+  const ok = await deleteConversation(id);
+  if (!ok) return c.json({ detail: "Conversation not found" }, 404);
+  return c.body(null, 204);
+});
+
+type SendBody = {
+  content?: string;
+  chairman_model?: string;
+  /** 与 `chairman_model` 同义（见项目重构 §5.4） */
+  final_model?: string;
+  use_web_search?: boolean;
+  judge_weights?: Record<string, number>;
+  /** 与 `judge_weights` 同义（见项目重构 §5.3 文档中的 weights 表述） */
+  weights?: Record<string, number>;
+};
+
+function parseChairman(
+  body: Pick<SendBody, "chairman_model" | "final_model">,
+): string | undefined {
+  const a = body.chairman_model?.trim();
+  const b = body.final_model?.trim();
+  const v = a || b;
+  return v || undefined;
+}
+
+function parseJudgeWeights(body: {
+  judge_weights?: Record<string, number>;
+  weights?: Record<string, number>;
+}): Record<string, number> | undefined {
+  const j = body.judge_weights ?? body.weights;
+  if (!j || typeof j !== "object") return undefined;
+  return j;
+}
+
+app.post("/api/conversations/:id/message", async (c) => {
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as SendBody;
+  const content = body.content?.trim();
+  if (!content) return c.json({ detail: "content required" }, 400);
+
+  const conv = await getConversation(id);
+  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+
+  const isFirst = conv.messages.length === 0;
+  const judgeWeights = parseJudgeWeights(body);
+
+  await withConversationLock(id, async () => {
+    await addUserMessage(id, content);
+  });
+
+  if (isFirst) {
+    const title = await generateConversationTitle(content);
+    await withConversationLock(id, async () => {
+      await updateConversationTitle(id, title);
+    });
+  }
+
+  const [s1, s2, s3, meta] = await runFullCouncil(content, {
+    chairmanModel: parseChairman(body),
+    useWebSearch: body.use_web_search,
+    judgeWeights,
+  });
+
+  await withConversationLock(id, async () => {
+    await addAssistantMessage(id, s1, s2, s3, {
+      label_to_model: meta.label_to_model,
+      aggregate_rankings: meta.aggregate_rankings,
+    });
+  });
+
+  return c.json({
+    stage1: s1,
+    stage2: s2,
+    stage3: s3,
+    metadata: meta,
+  });
+});
+
+function sseLine(obj: unknown): Uint8Array {
+  const s = `data: ${JSON.stringify(obj)}\n\n`;
+  return new TextEncoder().encode(s);
+}
+
+app.post("/api/conversations/:id/message/stream", async (c) => {
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => ({}))) as SendBody;
+  const content = body.content?.trim();
+  if (!content) return c.json({ detail: "content required" }, 400);
+
+  const conv = await getConversation(id);
+  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+
+  const isFirst = conv.messages.length === 0;
+  const chairmanModel = parseChairman(body);
+  const useWebSearch = body.use_web_search;
+  const judgeWeights = parseJudgeWeights(body);
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (obj: unknown) => controller.enqueue(sseLine(obj));
+
+      try {
+        await withConversationLock(id, async () => {
+          await addUserMessage(id, content);
+        });
+
+        const titlePromise = isFirst
+          ? generateConversationTitle(content)
+          : null;
+
+        push({ type: "stage1_start" });
+        const stage1Results = await stage1CollectResponses(
+          content,
+          useWebSearch,
+        );
+        push({ type: "stage1_complete", data: stage1Results });
+
+        push({ type: "stage2_start" });
+        const [stage2Results, labelToModel] = await stage2CollectRankings(
+          content,
+          stage1Results,
+          useWebSearch,
+        );
+        const aggregateRankings = calculateAggregateRankings(
+          stage2Results,
+          labelToModel,
+          judgeWeights,
+        );
+        push({
+          type: "stage2_complete",
+          data: stage2Results,
+          metadata: {
+            label_to_model: labelToModel,
+            aggregate_rankings: aggregateRankings,
+          },
+        });
+
+        push({ type: "stage3_start" });
+        const stage3Result = await stage3SynthesizeFinal(
+          content,
+          stage1Results,
+          stage2Results,
+          chairmanModel,
+          useWebSearch,
+          judgeWeights,
+          labelToModel,
+        );
+        push({ type: "stage3_complete", data: stage3Result });
+
+        if (titlePromise) {
+          const title = await titlePromise;
+          await withConversationLock(id, async () => {
+            await updateConversationTitle(id, title);
+          });
+          push({ type: "title_complete", data: { title } });
+        }
+
+        await withConversationLock(id, async () => {
+          await addAssistantMessage(
+            id,
+            stage1Results,
+            stage2Results,
+            stage3Result,
+            {
+              label_to_model: labelToModel,
+              aggregate_rankings: aggregateRankings,
+            },
+          );
+        });
+        push({ type: "complete" });
+      } catch (e) {
+        push({
+          type: "error",
+          message: e instanceof Error ? e.message : String(e),
+        });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+});
+
+type RerunBody = {
+  model?: string;
+  use_web_search?: boolean;
+  chairman_model?: string;
+  final_model?: string;
+  judge_weights?: Record<string, number>;
+  weights?: Record<string, number>;
+};
+
+function parseMsgIndex(c: { req: { param: (k: string) => string } }): number {
+  const n = parseInt(c.req.param("msgIndex"), 10);
+  return Number.isFinite(n) ? n : -1;
+}
+
+app.post(
+  "/api/conversations/:id/messages/:msgIndex/rerun-stage1-model",
+  async (c) => {
+    const id = c.req.param("id");
+    const msgIndex = parseMsgIndex(c);
+    if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+
+    const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+    const model = body.model?.trim();
+    if (!model) return c.json({ detail: "model required" }, 400);
+
+    const result = await withConversationLock(id, async () => {
+      const conv = await getConversation(id);
+      if (!conv) return { error: "Conversation not found" as const };
+      if (msgIndex >= conv.messages.length)
+        return { error: "invalid msgIndex" as const };
+      const msg = conv.messages[msgIndex];
+      if (!isAssistantMessage(msg))
+        return { error: "message is not assistant" as const };
+
+      const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
+      if (!userQuery) return { error: "no preceding user message" as const };
+
+      const res = await queryModel(
+        model,
+        [{ role: "user", content: userQuery }],
+        { useWebSearch: body.use_web_search },
+      );
+
+      const stage1 = [...msg.stage1];
+      const ix = stage1.findIndex((s) => s.model === model);
+      if (ix === -1) return { error: "model not in stage1" as const };
+
+      stage1[ix] = {
+        model,
+        response: res?.content ?? "(request failed)",
+      };
+      msg.stage1 = stage1;
+      msg.stale = { stage2: true, stage3: true };
+      msg.metadata = undefined;
+      await saveConversation(conv);
+
+      return {
+        ok: true as const,
+        stage1,
+        stale: msg.stale,
+        webSearchSkipped: res?.webSearchSkipped,
+      };
+    });
+
+    if (result.error === "Conversation not found")
+      return c.json({ detail: "Conversation not found" }, 404);
+    if (result.error === "invalid msgIndex")
+      return c.json({ detail: "invalid msgIndex" }, 400);
+    if (result.error === "message is not assistant")
+      return c.json({ detail: "message is not assistant" }, 400);
+    if (result.error === "no preceding user message")
+      return c.json({ detail: "no preceding user message" }, 400);
+    if (result.error === "model not in stage1")
+      return c.json({ detail: "model not in stage1" }, 400);
+
+    return c.json(result);
+  },
+);
+
+app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => {
+  const id = c.req.param("id");
+  const msgIndex = parseMsgIndex(c);
+  if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+
+  const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+  const judgeWeights = parseJudgeWeights(body);
+
+  const result = await withConversationLock(id, async () => {
+    const conv = await getConversation(id);
+    if (!conv) return { error: "Conversation not found" as const };
+    if (msgIndex >= conv.messages.length)
+      return { error: "invalid msgIndex" as const };
+    const msg = conv.messages[msgIndex];
+    if (!isAssistantMessage(msg))
+      return { error: "message is not assistant" as const };
+
+    const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
+    if (!userQuery) return { error: "no preceding user message" as const };
+    if (!msg.stage1.length) return { error: "empty stage1" as const };
+
+    const [stage2, labelToModel] = await stage2CollectRankings(
+      userQuery,
+      msg.stage1,
+      body.use_web_search,
+    );
+    const aggregate_rankings = calculateAggregateRankings(
+      stage2,
+      labelToModel,
+      judgeWeights,
+    );
+
+    msg.stage2 = stage2;
+    msg.stale = {
+      stage2: false,
+      stage3: true,
+    };
+    msg.metadata = {
+      label_to_model: labelToModel,
+      aggregate_rankings,
+    };
+    await saveConversation(conv);
+
+    return {
+      ok: true as const,
+      stage2,
+      metadata: { label_to_model: labelToModel, aggregate_rankings },
+      stale: msg.stale,
+    };
+  });
+
+  if (result.error === "Conversation not found")
+    return c.json({ detail: "Conversation not found" }, 404);
+  if (result.error === "invalid msgIndex")
+    return c.json({ detail: "invalid msgIndex" }, 400);
+  if (result.error === "message is not assistant")
+    return c.json({ detail: "message is not assistant" }, 400);
+  if (result.error === "no preceding user message")
+    return c.json({ detail: "no preceding user message" }, 400);
+  if (result.error === "empty stage1")
+    return c.json({ detail: "empty stage1" }, 400);
+
+  return c.json(result);
+});
+
+app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => {
+  const id = c.req.param("id");
+  const msgIndex = parseMsgIndex(c);
+  if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+
+  const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+  const judgeWeights = parseJudgeWeights(body);
+
+  const result = await withConversationLock(id, async () => {
+    const conv = await getConversation(id);
+    if (!conv) return { error: "Conversation not found" as const };
+    if (msgIndex >= conv.messages.length)
+      return { error: "invalid msgIndex" as const };
+    const msg = conv.messages[msgIndex];
+    if (!isAssistantMessage(msg))
+      return { error: "message is not assistant" as const };
+
+    const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
+    if (!userQuery) return { error: "no preceding user message" as const };
+
+    const labelToModel = labelToModelFromStage1(msg.stage1);
+    const stage3 = await stage3SynthesizeFinal(
+      userQuery,
+      msg.stage1,
+      msg.stage2,
+      parseChairman(body),
+      body.use_web_search,
+      judgeWeights,
+      labelToModel,
+    );
+
+    msg.stage3 = stage3;
+    msg.stale = {
+      stage2: msg.stale?.stage2 ?? false,
+      stage3: false,
+    };
+    await saveConversation(conv);
+
+    return { ok: true as const, stage3, stale: msg.stale };
+  });
+
+  if (result.error === "Conversation not found")
+    return c.json({ detail: "Conversation not found" }, 404);
+  if (result.error === "invalid msgIndex")
+    return c.json({ detail: "invalid msgIndex" }, 400);
+  if (result.error === "message is not assistant")
+    return c.json({ detail: "message is not assistant" }, 400);
+  if (result.error === "no preceding user message")
+    return c.json({ detail: "no preceding user message" }, 400);
+
+  return c.json(result);
+});
+
+console.log(`Ai 理事会 API listening on http://0.0.0.0:${API_PORT}`);
+serve({ fetch: app.fetch, port: API_PORT });

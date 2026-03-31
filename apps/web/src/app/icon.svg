@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Huida">
+  <defs>
+    <style>
+      .panel {
+        fill: #121212;
+      }
+      .mark {
+        fill: #ecfeff;
+      }
+      @media (prefers-color-scheme: dark) {
+        .panel {
+          fill: #2d3030;
+        }
+        .mark {
+          fill: #0f172a;
+        }
+      }
+    </style>
+  </defs>
+  <rect class="panel" width="32" height="32" rx="9" />
+  <circle class="mark" cx="16" cy="9.5" r="2.85" />
+  <circle class="mark" cx="9.25" cy="21.25" r="2.85" />
+  <circle class="mark" cx="22.75" cy="21.25" r="2.85" />
+  <circle class="mark" cx="16" cy="16.25" r="1.9" opacity="0.9" />
+</svg>
