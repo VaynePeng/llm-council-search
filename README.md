@@ -4,9 +4,9 @@
 
 ---
 
-# llm-council-search（Ai 理事会）
+# llm-council-search（Vela 助手）
 
-**中文名：Ai 理事会**；仓库与 npm 根包名为 `llm-council-search`。
+**中文名：Vela 助手**；仓库与 npm 根包名为 `llm-council-search`。
 
 基于 **多模型三阶段议会**（独立回答 → 匿名互评与排名 → 主席汇总）的 Web 应用，使用 **pnpm workspace** 拆分为 API 与前端。
 

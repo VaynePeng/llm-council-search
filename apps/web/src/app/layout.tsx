@@ -3,7 +3,7 @@ import { Providers } from "@/components/providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Ai 理事会",
+  title: "Vela 助手",
   description: "多模型各陈己见、互评打分，主席荟聚成一篇",
 };
 

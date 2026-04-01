@@ -198,3 +198,21 @@
     transform: scale(1);
   }
 }
+
+/* Stage3 流式输出末尾光标（打字机感） */
+@keyframes council-stream-cursor-blink {
+  0%,
+  40% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0.08;
+  }
+}
+
+.council-stream-cursor {
+  animation: council-stream-cursor-blink 0.95s cubic-bezier(0.4, 0, 0.6, 1)
+    infinite;
+  will-change: opacity;
+}

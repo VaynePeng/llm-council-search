@@ -1,4 +1,4 @@
-# Ai 理事会 · 前端（`@llm-council-search/web`）
+# Vela 助手 · 前端（`@llm-council-search/web`）
 
 [Next.js 16](https://nextjs.org/)（App Router）+ [Tailwind CSS 4](https://tailwindcss.com/) + [Radix UI](https://www.radix-ui.com/) 实现的聊天与三阶段结果展示：SSE、Stepper/Tabs、深浅色、移动端侧栏、高级设置（联网 / 主席 / 评委权重）、失败重试等。
 

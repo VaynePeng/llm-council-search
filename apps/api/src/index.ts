@@ -17,6 +17,7 @@ import {
   stage1CollectResponses,
   stage2CollectRankings,
   stage3SynthesizeFinal,
+  stage3SynthesizeFinalStream,
   stageWebFetch,
 } from "./council.js";
 import { withConversationLock } from "./lock.js";
@@ -47,7 +48,7 @@ app.use(
 );
 
 app.get("/", (c) =>
-  c.json({ status: "ok", service: "Ai 理事会 API (Hono)" }),
+  c.json({ status: "ok", service: "Vela 助手 API (Hono)" }),
 );
 
 app.get("/api/config", (c) =>
@@ -130,14 +131,17 @@ app.post("/api/conversations/:id/message", async (c) => {
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
 
-  const isFirst = conv.messages.length === 0;
+  const shouldGenerateTitle =
+    conv.messages.length === 0 ||
+    !conv.title?.trim() ||
+    conv.title.trim() === "New Conversation";
   const judgeWeights = parseJudgeWeights(body);
 
   await withConversationLock(id, async () => {
     await addUserMessage(id, content);
   });
 
-  if (isFirst) {
+  if (shouldGenerateTitle) {
     const title = await generateConversationTitle(content);
     await withConversationLock(id, async () => {
       await updateConversationTitle(id, title);
@@ -181,7 +185,10 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
 
-  const isFirst = conv.messages.length === 0;
+  const shouldGenerateTitle =
+    conv.messages.length === 0 ||
+    !conv.title?.trim() ||
+    conv.title.trim() === "New Conversation";
   const chairmanModel = parseChairman(body);
   const useWebSearch = body.use_web_search;
   const webFetchModel = parseWebFetchModel(body);
@@ -196,9 +203,26 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           await addUserMessage(id, content);
         });
 
-        const titlePromise = isFirst
+        const titlePromise = shouldGenerateTitle
           ? generateConversationTitle(content)
           : null;
+
+        void (async () => {
+          if (!titlePromise) return;
+          try {
+            const title = await titlePromise;
+            await withConversationLock(id, async () => {
+              await updateConversationTitle(id, title);
+            });
+            try {
+              push({ type: "title_complete", data: { title } });
+            } catch {
+              /* 流可能已因错误提前关闭 */
+            }
+          } catch (err) {
+            console.error("generateConversationTitle:", err);
+          }
+        })();
 
         let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
         let webContext: string | undefined;
@@ -245,8 +269,9 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           },
         });
 
-        push({ type: "stage3_start" });
-        const stage3Result = await stage3SynthesizeFinal(
+        const chairModel = chairmanModel?.trim() || CHAIRMAN_MODEL;
+        push({ type: "stage3_start", data: { model: chairModel } });
+        const stage3Result = await stage3SynthesizeFinalStream(
           content,
           stage1Results,
           stage2Results,
@@ -254,16 +279,9 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           useWebSearch,
           judgeWeights,
           labelToModel,
+          (delta) => push({ type: "stage3_delta", data: { delta } }),
         );
         push({ type: "stage3_complete", data: stage3Result });
-
-        if (titlePromise) {
-          const title = await titlePromise;
-          await withConversationLock(id, async () => {
-            await updateConversationTitle(id, title);
-          });
-          push({ type: "title_complete", data: { title } });
-        }
 
         await withConversationLock(id, async () => {
           await addAssistantMessage(
@@ -555,5 +573,5 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
   return c.json(result);
 });
 
-console.log(`Ai 理事会 API listening on http://0.0.0.0:${API_PORT}`);
+console.log(`Vela 助手 API listening on http://0.0.0.0:${API_PORT}`);
 serve({ fetch: app.fetch, port: API_PORT });

@@ -1,7 +1,7 @@
 {
   "name": "llm-council-search",
   "private": true,
-  "description": "Ai 理事会（llm-council-search）— Hono + Next.js 多模型三阶段议会（Monorepo）",
+  "description": "Vela 助手（llm-council-search）— Hono + Next.js 多模型三阶段议会（Monorepo）",
   "repository": {
     "type": "git",
     "url": "https://github.com/VaynePeng/llm-council-search.git"

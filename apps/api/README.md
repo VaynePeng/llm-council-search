@@ -1,4 +1,4 @@
-# Ai 理事会 · 后端（`@llm-council-search/api`）
+# Vela 助手 · 后端（`@llm-council-search/api`）
 
 [Hono](https://hono.dev/) + TypeScript 实现的 API 服务：OpenRouter 三阶段议会、会话 JSON 存储、SSE 流式端点、分阶段重跑、联网（`web` 插件）与失败降级等。
 

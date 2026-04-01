@@ -89,6 +89,20 @@ function webPluginPayload(
   return [plugin];
 }
 
+function chatRequestBody(
+  model: string,
+  messages: ChatMessage[],
+  plugins: Array<Record<string, unknown>> | undefined,
+  stream: boolean,
+): Record<string, unknown> {
+  return {
+    model,
+    messages,
+    stream,
+    ...(plugins && plugins.length > 0 ? { plugins } : {}),
+  };
+}
+
 async function doFetch(
   model: string,
   messages: ChatMessage[],
@@ -100,18 +114,80 @@ async function doFetch(
     Authorization: `Bearer ${OPENROUTER_API_KEY}`,
   };
 
-  const body: Record<string, unknown> = {
-    model,
-    messages,
-    ...(plugins && plugins.length > 0 ? { plugins } : {}),
+  return fetch(OPENROUTER_API_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(chatRequestBody(model, messages, plugins, false)),
+    signal,
+  });
+}
+
+async function doFetchStream(
+  model: string,
+  messages: ChatMessage[],
+  plugins: Array<Record<string, unknown>> | undefined,
+  signal: AbortSignal,
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
   };
 
   return fetch(OPENROUTER_API_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(body),
+    body: JSON.stringify(chatRequestBody(model, messages, plugins, true)),
     signal,
   });
+}
+
+/** 解析 OpenAI/OpenRouter 式 SSE 流，将正文增量交给 onDelta */
+async function consumeChatCompletionStream(
+  res: Response,
+  onDelta: (chunk: string) => void,
+): Promise<boolean> {
+  if (!res.ok) {
+    const text = await res.text();
+    console.error("OpenRouter stream HTTP error:", res.status, text);
+    return false;
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return false;
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trimEnd();
+      buffer = buffer.slice(nl + 1);
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith(":")) continue;
+      if (!trimmed.startsWith("data: ")) continue;
+      const raw = trimmed.slice(6).trim();
+      if (raw === "[DONE]") continue;
+      try {
+        const j = JSON.parse(raw) as {
+          choices?: Array<{
+            delta?: { content?: string | null };
+          }>;
+          error?: { message?: string };
+        };
+        if (j.error?.message) {
+          console.error("OpenRouter stream chunk error:", j.error.message);
+          continue;
+        }
+        const piece = j.choices?.[0]?.delta?.content;
+        if (typeof piece === "string" && piece.length > 0) onDelta(piece);
+      } catch {
+        /* 忽略单行解析失败 */
+      }
+    }
+  }
+  return true;
 }
 
 export async function queryModel(
@@ -233,6 +309,119 @@ export async function queryModel(
     return parseSuccess(res);
   } catch (e) {
     console.error(`Error querying model ${model}:`, e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export type QueryStreamOptions = QueryOptions & {
+  onDelta: (chunk: string) => void;
+};
+
+/**
+ * 流式调用模型（OpenRouter `stream: true`），通过 onDelta 推送正文增量。
+ * 联网插件失败时会与非流式逻辑一致：重试无插件或整段回退到 queryModel。
+ */
+export async function queryModelStream(
+  model: string,
+  messages: ChatMessage[],
+  options: QueryStreamOptions,
+): Promise<{
+  content: string;
+  reasoning_details?: unknown;
+  webSearchSkipped?: boolean;
+  citations?: UrlCitationItem[];
+} | null> {
+  const {
+    onDelta,
+    timeoutMs = 120_000,
+    useWebSearch = false,
+    webMaxResults = 5,
+    webSearchTemporalContext,
+  } = options;
+
+  const restQuery: QueryOptions = {
+    timeoutMs,
+    useWebSearch,
+    webMaxResults,
+    webSearchTemporalContext,
+  };
+
+  const effectiveModel = useWebSearch ? stripOnlineSuffix(model) : model;
+  const webPlugins = useWebSearch
+    ? webPluginPayload(
+        effectiveModel,
+        webMaxResults,
+        webSearchTemporalContext,
+      )
+    : undefined;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const runStream = async (
+    plugins: Array<Record<string, unknown>> | undefined,
+  ): Promise<string | null> => {
+    let accumulated = "";
+    const res = await doFetchStream(
+      effectiveModel,
+      messages,
+      plugins,
+      controller.signal,
+    );
+    const ok = await consumeChatCompletionStream(res, (ch) => {
+      accumulated += ch;
+      onDelta(ch);
+    });
+    return ok ? accumulated : null;
+  };
+
+  try {
+    if (useWebSearch) {
+      try {
+        const acc = await runStream(webPlugins);
+        if (acc !== null) return { content: acc };
+      } catch (e) {
+        console.warn(
+          `[OpenRouter] Web search stream threw for ${effectiveModel}:`,
+          e,
+        );
+      }
+      console.warn(
+        `[OpenRouter] Web search stream failed for ${effectiveModel}; retrying without web plugin.`,
+      );
+      try {
+        const acc = await runStream(undefined);
+        if (acc !== null) return { content: acc, webSearchSkipped: true };
+      } catch (e) {
+        console.error(
+          `[OpenRouter] Stream without web failed for ${effectiveModel}:`,
+          e,
+        );
+      }
+      const fb = await queryModel(model, messages, restQuery);
+      if (fb?.content) {
+        onDelta(fb.content);
+        return fb;
+      }
+      return null;
+    }
+
+    try {
+      const acc = await runStream(undefined);
+      if (acc !== null) return { content: acc };
+    } catch (e) {
+      console.error(`[OpenRouter] Stream failed for ${effectiveModel}:`, e);
+    }
+    const fb = await queryModel(model, messages, restQuery);
+    if (fb?.content) {
+      onDelta(fb.content);
+      return fb;
+    }
+    return null;
+  } catch (e) {
+    console.error(`Error streaming model ${model}:`, e);
     return null;
   } finally {
     clearTimeout(timer);

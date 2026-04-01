@@ -7,6 +7,7 @@ import {
 import {
   getWebSearchTemporalContext,
   queryModel,
+  queryModelStream,
   queryModelsParallel,
   type ChatMessage,
   type QueryOptions,
@@ -286,17 +287,13 @@ export function formatAggregateRankingSummary(
   return `${header}\n${lines.join("\n")}`;
 }
 
-export async function stage3SynthesizeFinal(
+function buildChairmanUserContent(
   userQuery: string,
   stage1Results: Stage1Item[],
   stage2Results: Stage2Item[],
-  chairmanModel?: string,
-  useWebSearch?: boolean,
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
-): Promise<Stage3Result> {
-  const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
-
+): string {
   const stage1Text = stage1Results
     .map((r) => `Model: ${r.model}\nResponse: ${r.response}`)
     .join("\n\n");
@@ -315,7 +312,7 @@ export async function stage3SynthesizeFinal(
     aggregateSection = `\n\nAGGREGATE RANKING SUMMARY:\n${formatAggregateRankingSummary(agg, judgeWeights)}`;
   }
 
-  const chairmanPrompt = `You are the Chairman of a multi-model deliberation: several AI models responded to the user's question and ranked each other's responses.
+  return `You are the Chairman of a multi-model deliberation: several AI models responded to the user's question and ranked each other's responses.
 
 Original Question: ${userQuery}
 
@@ -333,9 +330,69 @@ Your task as Chairman is to synthesize all of this information into a single, co
 - The aggregate ranking summary when present (it reflects peer evaluation${judgeWeights && Object.keys(judgeWeights).length ? ", weighted by configured judge importance" : ""})
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:`;
+}
+
+export async function stage3SynthesizeFinal(
+  userQuery: string,
+  stage1Results: Stage1Item[],
+  stage2Results: Stage2Item[],
+  chairmanModel?: string,
+  useWebSearch?: boolean,
+  judgeWeights?: Record<string, number>,
+  labelToModel?: Record<string, string>,
+): Promise<Stage3Result> {
+  const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
+
+  const chairmanPrompt = buildChairmanUserContent(
+    userQuery,
+    stage1Results,
+    stage2Results,
+    judgeWeights,
+    labelToModel,
+  );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
   const response = await queryModel(chair, messages, queryOpts(useWebSearch));
+
+  if (response == null) {
+    return {
+      model: chair,
+      response: "Error: Unable to generate final synthesis.",
+    };
+  }
+
+  return {
+    model: chair,
+    response: response.content ?? "",
+  };
+}
+
+/** Stage3 流式合成：通过 onDelta 推送 OpenRouter 返回的正文增量（供 SSE 转发）。 */
+export async function stage3SynthesizeFinalStream(
+  userQuery: string,
+  stage1Results: Stage1Item[],
+  stage2Results: Stage2Item[],
+  chairmanModel: string | undefined,
+  useWebSearch: boolean | undefined,
+  judgeWeights: Record<string, number> | undefined,
+  labelToModel: Record<string, string> | undefined,
+  onDelta: (chunk: string) => void,
+): Promise<Stage3Result> {
+  const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
+
+  const chairmanPrompt = buildChairmanUserContent(
+    userQuery,
+    stage1Results,
+    stage2Results,
+    judgeWeights,
+    labelToModel,
+  );
+
+  const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
+  const response = await queryModelStream(chair, messages, {
+    ...queryOpts(useWebSearch),
+    onDelta,
+  });
 
   if (response == null) {
     return {

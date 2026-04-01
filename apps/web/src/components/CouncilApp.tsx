@@ -1,6 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTheme } from "next-themes";
 import ReactMarkdown from "react-markdown";
 import {
@@ -138,6 +145,58 @@ const DEFAULT_ASSISTANT_LOADING: AssistantMsg["loading"] = {
   stage3: false,
 };
 
+/** 仅当距离底部 ≤ 此值才视为「贴在底部」— 过大时用户略往上滚仍会被判成贴底并遭强拽 */
+const SCROLL_STICK_BOTTOM_EPS_PX = 4;
+
+function scrollGapFromBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight;
+}
+
+function isStuckToBottom(el: HTMLElement) {
+  return scrollGapFromBottom(el) <= SCROLL_STICK_BOTTOM_EPS_PX;
+}
+
+/**
+ * Stage3 等内层滚动区：`followBottom` 表示「新内容出来要跟到底」。
+ * - 仅在距底 ≤ EPS 时置为 true；离开底部或向上滚轮则 false，避免略往上滚仍被拽回。
+ * - 跟随为 true 时，内容增高导致 gap 暂时变大也会滚到底（不能再用「当前 gap≤EPS」挡掉）。
+ */
+function usePinnedBottomAutoscroll(
+  containerRef: React.RefObject<HTMLElement | null>,
+  layoutDeps: ReadonlyArray<unknown>,
+) {
+  const followBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onScroll = () => {
+      if (isStuckToBottom(el)) followBottomRef.current = true;
+      else followBottomRef.current = false;
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) followBottomRef.current = false;
+    };
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
+    onScroll();
+
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [containerRef]);
+
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el || !followBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, layoutDeps);
+}
+
 function streamingAssistantShell(
   useWebSearch: boolean,
   webFetchModelId?: string,
@@ -216,6 +275,20 @@ export default function CouncilApp() {
   /** 重跑失败后重试 */
   const rerunRetryRef = useRef<(() => Promise<void>) | null>(null);
 
+  /** 避免异步 load 完成后把已切走的会话写回当前界面 */
+  const currentIdRef = useRef<string | null>(null);
+  /** 流式进行中且助手消息尚未落库时，按会话缓存完整 messages，切回该会话时与 GET 合并 */
+  const streamDraftRef = useRef<{
+    convId: string;
+    messages: Conversation["messages"];
+  } | null>(null);
+  /** 每条流式请求内至多刷新一次列表（同步侧栏 message_count） */
+  const streamSidebarRefreshRef = useRef(false);
+
+  useEffect(() => {
+    currentIdRef.current = currentId;
+  }, [currentId]);
+
   useEffect(() => {
     setMounted(true);
   }, []);
@@ -244,7 +317,13 @@ export default function CouncilApp() {
   const loadConversation = useCallback(async (id: string) => {
     try {
       const c = await getConversation(id);
-      setConversation(c);
+      if (currentIdRef.current !== id) return;
+      const draft = streamDraftRef.current;
+      if (draft?.convId === id) {
+        setConversation({ ...c, messages: draft.messages });
+      } else {
+        setConversation(c);
+      }
     } catch (e) {
       console.error(e);
     }
@@ -389,20 +468,44 @@ export default function CouncilApp() {
 
   const runStreamForContent = useCallback(
     async (convId: string, content: string) => {
+      streamSidebarRefreshRef.current = false;
+
+      const applyPatchToAssistantTail = (
+        messages: Conversation["messages"],
+        fn: (m: AssistantMsg) => AssistantMsg,
+      ): Conversation["messages"] | null => {
+        const msgs = [...messages];
+        const last = msgs[msgs.length - 1] as { role?: string } | undefined;
+        if (!last || last.role !== "assistant") return null;
+        msgs[msgs.length - 1] = fn(last as AssistantMsg) as unknown as
+          Conversation["messages"][number];
+        return msgs;
+      };
+
       const patchLastAssistant = (fn: (m: AssistantMsg) => AssistantMsg) => {
+        const d = streamDraftRef.current;
+        if (d?.convId === convId) {
+          const next = applyPatchToAssistantTail(d.messages, fn);
+          if (next) streamDraftRef.current = { convId, messages: next };
+        }
         setConversation((prev) => {
-          if (!prev) return prev;
-          const msgs = [...prev.messages];
-          const last = msgs[msgs.length - 1] as { role?: string } | undefined;
-          if (!last || last.role !== "assistant") return prev;
-          msgs[msgs.length - 1] = fn(last as AssistantMsg) as unknown as Conversation["messages"][number];
-          return { ...prev, messages: msgs };
+          if (!prev || prev.id !== convId) return prev;
+          const next = applyPatchToAssistantTail(prev.messages, fn);
+          if (!next) return prev;
+          return { ...prev, messages: next };
         });
+      };
+
+      const maybeRefreshSidebar = () => {
+        if (streamSidebarRefreshRef.current) return;
+        streamSidebarRefreshRef.current = true;
+        void loadConversations();
       };
 
       await sendMessageStream(convId, content, (type, ev) => {
         switch (type) {
           case "web_fetch_start":
+            maybeRefreshSidebar();
             patchLastAssistant((m) => ({
               ...m,
               loading: { ...m.loading, webFetch: true },
@@ -416,6 +519,7 @@ export default function CouncilApp() {
             }));
             break;
           case "stage1_start":
+            maybeRefreshSidebar();
             patchLastAssistant((m) => ({
               ...m,
               loading: { ...m.loading, stage1: true },
@@ -443,12 +547,28 @@ export default function CouncilApp() {
               loading: { ...m.loading, stage2: false },
             }));
             break;
-          case "stage3_start":
+          case "stage3_start": {
+            const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
             patchLastAssistant((m) => ({
               ...m,
               loading: { ...m.loading, stage3: true },
+              stage3: { model: sm || "…", response: "" },
             }));
             break;
+          }
+          case "stage3_delta": {
+            const delta = String(
+              (ev as { data?: { delta?: string } }).data?.delta ?? "",
+            );
+            if (!delta) break;
+            patchLastAssistant((m) => ({
+              ...m,
+              stage3: m.stage3
+                ? { ...m.stage3, response: m.stage3.response + delta }
+                : { model: "", response: delta },
+            }));
+            break;
+          }
           case "stage3_complete":
             patchLastAssistant((m) => ({
               ...m,
@@ -456,17 +576,32 @@ export default function CouncilApp() {
               loading: { ...m.loading, stage3: false },
             }));
             break;
-          case "title_complete":
+          case "title_complete": {
             void loadConversations();
+            const t = (ev as { data?: { title?: string } }).data?.title;
+            if (t && currentIdRef.current === convId) {
+              setConversation((prev) =>
+                prev?.id === convId ? { ...prev, title: t } : prev,
+              );
+            }
             break;
+          }
           case "complete":
+            if (streamDraftRef.current?.convId === convId) {
+              streamDraftRef.current = null;
+            }
             void loadConversations();
-            void loadConversation(convId);
+            if (currentIdRef.current === convId) {
+              void loadConversation(convId);
+            }
             setLoading(false);
             failedSendRef.current = null;
             setHasRetry(false);
             break;
           case "error":
+            if (streamDraftRef.current?.convId === convId) {
+              streamDraftRef.current = null;
+            }
             setActionError(String(ev.message ?? "流式错误"));
             setLoading(false);
             setHasRetry(true);
@@ -507,6 +642,7 @@ export default function CouncilApp() {
         msgs.push({ role: "user", content: f.content } as unknown as Conversation["messages"][number]);
       }
       msgs.push(assistantShell as unknown as Conversation["messages"][number]);
+      streamDraftRef.current = { convId: f.conversationId, messages: msgs };
       return { ...prev, messages: msgs };
     });
 
@@ -514,6 +650,9 @@ export default function CouncilApp() {
       await runStreamForContent(f.conversationId, f.content);
     } catch (e) {
       console.error(e);
+      if (streamDraftRef.current?.convId === f.conversationId) {
+        streamDraftRef.current = null;
+      }
       setConversation((prev) =>
         prev ? { ...prev, messages: prev.messages.slice(0, -2) } : prev,
       );
@@ -542,37 +681,30 @@ export default function CouncilApp() {
     };
 
     const userMessage: UserMsg = { role: "user", content };
-    setConversation((prev) =>
-      prev
-        ? {
-            ...prev,
-            messages: [...prev.messages, userMessage] as Conversation["messages"],
-          }
-        : prev,
-    );
-
     const o = sendOpts();
     const assistantShell = streamingAssistantShell(
       Boolean(o.use_web_search),
       o.web_fetch_model ?? apiConfig?.web_fetch_model,
     );
 
-    setConversation((prev) =>
-      prev
-        ? {
-            ...prev,
-            messages: [
-              ...prev.messages,
-              assistantShell as unknown as Conversation["messages"][number],
-            ],
-          }
-        : prev,
-    );
+    setConversation((prev) => {
+      if (!prev) return prev;
+      const messages = [
+        ...prev.messages,
+        userMessage as unknown as Conversation["messages"][number],
+        assistantShell as unknown as Conversation["messages"][number],
+      ];
+      streamDraftRef.current = { convId: currentId, messages };
+      return { ...prev, messages };
+    });
 
     try {
       await runStreamForContent(currentId, content);
     } catch (e) {
       console.error(e);
+      if (streamDraftRef.current?.convId === currentId) {
+        streamDraftRef.current = null;
+      }
       setConversation((prev) =>
         prev ? { ...prev, messages: prev.messages.slice(0, -2) } : prev,
       );
@@ -595,7 +727,7 @@ export default function CouncilApp() {
   const SidebarBody = (
     <>
       <div className="border-b border-border p-4">
-        <h1 className="text-lg font-semibold tracking-tight">Ai 理事会</h1>
+        <h1 className="text-lg font-semibold tracking-tight">Vela 助手</h1>
         <Button className="mt-3 w-full" onClick={() => void handleNew()}>
           新对话
         </Button>
@@ -1049,7 +1181,9 @@ function CouncilAssistantCard({
   const webFetchDone = Boolean(m.webFetch?.content?.trim());
   const s1done = Boolean(m.stage1?.length);
   const s2done = Boolean(m.stage2?.length);
-  const s3done = Boolean(m.stage3 && m.stage3.response);
+  const s3done = Boolean(
+    m.stage3 && m.stage3.response && !loading.stage3,
+  );
 
   const stale2 = m.stale?.stage2;
   const stale3 = m.stale?.stage3;
@@ -1091,12 +1225,13 @@ function CouncilAssistantCard({
   };
 
   const opts = sendOpts();
+  const stage3ScrollRef = useRef<HTMLDivElement>(null);
 
   return (
     <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
       <div className="flex shrink-0 flex-wrap items-center gap-2 mb-1">
         <span className="text-xs font-medium text-muted-foreground">
-          Ai 理事会
+          Vela 助手
         </span>
         {stale2 ? (
           <Badge variant="warning">Stage2/3 可能已过期</Badge>
@@ -1290,8 +1425,15 @@ function CouncilAssistantCard({
               重跑 Stage3
             </Button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-2 pr-1">
-            <Stage3View data={m.stage3} loading={effectiveLoading.stage3} />
+          <div
+            ref={stage3ScrollRef}
+            className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-2 pr-1"
+          >
+            <Stage3View
+              scrollContainerRef={stage3ScrollRef}
+              data={m.stage3}
+              loading={effectiveLoading.stage3}
+            />
           </div>
         </TabsContent>
       </Tabs>
@@ -1576,13 +1718,84 @@ function Stage2View({
 }
 
 function Stage3View({
+  scrollContainerRef,
   data,
   loading,
 }: {
+  scrollContainerRef: React.RefObject<HTMLDivElement | null>;
   data: Stage3 | null;
   loading: boolean;
 }) {
-  if (loading)
+  const fullText = data?.response ?? "";
+  const [displayed, setDisplayed] = useState("");
+  const idxRef = useRef(0);
+  const hasSeenStreamRef = useRef(false);
+
+  const streaming = Boolean(loading && data);
+  const waitingStage3 = Boolean(loading && !data);
+  const typing =
+    streaming || (Boolean(data) && displayed.length < fullText.length);
+
+  useEffect(() => {
+    if (!data) return;
+
+    if (loading) hasSeenStreamRef.current = true;
+
+    const isHistory =
+      !loading &&
+      !hasSeenStreamRef.current &&
+      fullText.length > 0;
+
+    if (isHistory) {
+      setDisplayed(fullText);
+      idxRef.current = fullText.length;
+      return;
+    }
+
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      const tgt = fullText;
+      const ld = loading;
+
+      if (ld && tgt.length === 0) {
+        idxRef.current = 0;
+        setDisplayed("");
+        return;
+      }
+
+      let i = idxRef.current;
+      if (i < tgt.length) {
+        const backlog = tgt.length - i;
+        const step = Math.min(
+          48,
+          Math.max(1, Math.ceil(backlog / (backlog > 200 ? 28 : 20))),
+        );
+        i = Math.min(tgt.length, i + step);
+        idxRef.current = i;
+        setDisplayed(tgt.slice(0, i));
+      }
+
+      // 仅在有「可见 backlog」时继续帧循环；等新 SSE 会更新 fullText 并重新挂载 effect
+      if (!cancelled && idxRef.current < tgt.length) {
+        requestAnimationFrame(run);
+      }
+    };
+
+    const id = requestAnimationFrame(run);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(id);
+    };
+  }, [data, fullText, loading]);
+
+  usePinnedBottomAutoscroll(scrollContainerRef, [
+    displayed,
+    loading,
+    fullText.length,
+  ]);
+
+  if (waitingStage3)
     return (
       <div
         className="rounded-lg border border-status-running-border/40 bg-status-running/15 p-3"
@@ -1593,11 +1806,26 @@ function Stage3View({
     );
   if (!data)
     return <p className="text-sm text-status-idle-foreground">暂无数据</p>;
+
+  const borderClass = streaming
+    ? "border-status-running-border/50 bg-status-running/12"
+    : "border-status-success-border bg-status-success/25";
+
   return (
-    <div className="rounded-lg border border-status-success-border bg-status-success/25 p-3">
+    <div className={cn("rounded-lg border p-3", borderClass)}>
       <div className="font-mono text-xs text-muted-foreground">{data.model}</div>
-      <div className="mt-2 max-w-none text-sm leading-relaxed text-foreground [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">
-        <ReactMarkdown>{data.response}</ReactMarkdown>
+      <div className="relative mt-2 max-w-none text-sm leading-relaxed text-foreground transition-opacity duration-200 ease-out [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">
+        {displayed ? (
+          <ReactMarkdown>{displayed}</ReactMarkdown>
+        ) : streaming ? (
+          <span className="text-muted-foreground">正在生成…</span>
+        ) : null}
+        {typing ? (
+          <span
+            className="council-stream-cursor ml-px inline-block h-[1em] w-2 translate-y-0.5 rounded-sm bg-foreground/75 align-[-0.15em] shadow-sm"
+            aria-hidden
+          />
+        ) : null}
       </div>
     </div>
   );
