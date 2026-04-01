@@ -15,15 +15,35 @@ export const OPENROUTER_API_URL =
 
 export const COUNCIL_MODELS: string[] = [
   "openai/gpt-5.1",
-  "google/gemini-3-pro-preview",
+  /** `gemini-3-pro-preview` 在 OpenRouter 上常返回 404（无可用 endpoint），已改为 3.1 */
+  "google/gemini-3.1-pro-preview",
   "anthropic/claude-sonnet-4.5",
   "x-ai/grok-4",
 ];
 
+/**
+ * 适合搭配 OpenRouter `web` 插件 / `:online` 的模型（原生搜索或 Exa 等兜底）。
+ * 文档亦提及可向 `openrouter:web_search` 服务端工具迁移；当前实现仍使用 `plugins: [{ id: "web" }]`。
+ * @see https://openrouter.ai/docs/guides/features/plugins/web-search
+ */
+export const WEB_SEARCH_MODELS: string[] = [
+  "openai/gpt-5.1:online",
+  "openai/gpt-4.1:online",
+  "anthropic/claude-sonnet-4.5",
+  "perplexity/sonar-pro",
+  "x-ai/grok-4",
+  "google/gemini-3.1-pro-preview",
+  "google/gemini-2.5-flash",
+];
+
 export const CHAIRMAN_MODEL =
-  process.env.CHAIRMAN_MODEL ?? "google/gemini-3-pro-preview";
+  process.env.CHAIRMAN_MODEL ?? "google/gemini-3.1-pro-preview";
 
 export const TITLE_MODEL = process.env.TITLE_MODEL ?? "google/gemini-2.5-flash";
+
+/** 默认用 `:online`，与 OpenRouter web 插件等价且对 OpenAI 原生联网最稳；Gemini 无 `:online` 时需依赖 Exa（见 openrouter.ts `engine: "exa"`）。 */
+export const WEB_FETCH_MODEL =
+  process.env.WEB_FETCH_MODEL ?? "openai/gpt-5.1:online";
 
 export const DATA_DIR = path.resolve(
   process.env.DATA_DIR ?? path.join(__dirname, "..", "data", "conversations"),

@@ -2,18 +2,47 @@ import {
   CHAIRMAN_MODEL,
   COUNCIL_MODELS,
   TITLE_MODEL,
+  WEB_FETCH_MODEL,
 } from "./config.js";
 import {
+  getWebSearchTemporalContext,
   queryModel,
   queryModelsParallel,
   type ChatMessage,
   type QueryOptions,
+  type UrlCitationItem,
 } from "./openrouter.js";
-import type { Stage1Item, Stage2Item, Stage3Result } from "./storage.js";
+import type {
+  Stage1Item,
+  Stage2Item,
+  Stage3Result,
+  WebFetchResult,
+  WebFetchSource,
+} from "./storage.js";
+
+function appendStructuredCitations(
+  body: string,
+  citations: UrlCitationItem[],
+): string {
+  if (citations.length === 0) return body;
+  const parts = citations.map((c, i) => {
+    const snippet = c.content
+      ? `\n   摘录：${
+          c.content.length > 400
+            ? `${c.content.slice(0, 400)}…`
+            : c.content
+        }`
+      : "";
+    return `${i + 1}. **${c.title ?? "(无标题)"}** — ${c.url}${snippet}`;
+  });
+  return `${body}\n\n---\n### 检索系统返回的站点与摘录（结构化 URL 引用）\n\n以下条目来自 API 的 \`url_citation\` 标注，可与正文交叉核对；**结论应优先采信高可信度来源**。\n\n${parts.join("\n\n")}\n`;
+}
 
 export type CouncilRunOptions = {
   chairmanModel?: string;
   useWebSearch?: boolean;
+  /** Override `WEB_FETCH_MODEL` for the web research stage */
+  webFetchModel?: string;
   /** Weight of each judge model's vote in Stage2 aggregate (default 1) */
   judgeWeights?: Record<string, number>;
 };
@@ -22,21 +51,134 @@ function queryOpts(useWebSearch?: boolean): QueryOptions {
   return { useWebSearch: Boolean(useWebSearch) };
 }
 
+export async function stageWebFetch(
+  userQuery: string,
+  modelOverride?: string,
+): Promise<WebFetchResult> {
+  const model = modelOverride?.trim() || WEB_FETCH_MODEL;
+  const t = getWebSearchTemporalContext();
+  const system = `You are a web research assistant with access to a web search tool. Your job is to retrieve fresh, checkable facts—not to guess.
+
+Temporal anchor: the search is executed at **${t.isoUtc}** (ISO 8601, UTC), Unix **${t.unixSeconds}** s. Do not assume the end user's local timezone. Interpret "recent", "latest", "currently" relative to this UTC instant; prefer sources with visible, plausible publication or update times; flag content that appears years out of date for time-sensitive topics.
+
+Rules:
+- Use the search tool; do not invent URLs, quotes, or publication dates.
+- Every important claim should be traceable to a real page/domain you saw in search results or API citations.
+- **Source triage (anti–fake news):** You must explicitly judge each major source: tier (e.g. A=official/registry/vendor docs/academic; B=major wire or national newspaper; C=niche blog/forum; D=unknown or sensational). Assign a **weight 0.0–1.0** and one-line rationale. Down-rank or flag clickbait, single-anonymous-source rumors, and coordinated low-quality domains.
+- **Synthesis:** Build the core answer primarily from the **highest-weight** sources; if only low-tier sources support a claim, label it「低可信度」「待核实」/ "low confidence" / "unverified".
+- If results conflict, say so and say which side has stronger sourcing.
+- Match the user's language: if the question is in Chinese, write in Simplified Chinese; otherwise mirror the question's language.
+- Use Markdown. Use real markdown links [site or title](full_url) in 参考来源 where you have URLs.`;
+
+  const userPrompt = `## 检索基准时间（本次请求发起时刻，仅 UTC，不推断用户本地时区）
+- **ISO 8601（UTC）**：${t.isoUtc}
+- **Unix 时间戳（秒）**：${t.unixSeconds}
+
+在此 UTC 时刻下检索与作答：涉及时效、版本、政策、安全公告、股价等议题时，**优先**采纳可核对日期且与上述时刻接近的资料；对明显过时、无日期或仅历史档案价值的页面降低权重并在文中说明。如需面向读者表述当地时间，仅可在文中根据来源页面自行说明，勿臆测用户时区。
+
+---
+
+Question:
+${userQuery}
+
+Produce this structure (adapt heading language to the user's language, e.g. 简体中文 for Chinese questions):
+
+## 检索摘要
+1–3 sentences: what you looked for and what you found (or that little relevant material exists). Mention if results skew old relative to the retrieval time above.
+
+## 来源可信度与权重
+Table or bullet list: for **each significant domain/URL** you rely on, give: 域名/URL、类型（官方/媒体/社区等）、权重 0.0–1.0、一句话理由。对可疑或易造谣场景（健康恐慌、政治爆料、无署名爆料）单独标注「谨慎采纳」。
+
+## 核心结论
+Direct answer, **explicitly grounded in the highest-weight sources** first. If the best available evidence is weak, say so up front.
+
+## 要点与事实
+Bullet list: concrete facts **only** with implied source strength (e.g. tag [高可信]/[中]/[低] or link). No fabricated numbers or dates.
+
+## 参考来源
+Numbered list with **Markdown links** [title or domain](https://...) for every URL you cite. If the API gave structured citations, align with them. If no usable URLs, state that clearly.`;
+
+  const messages: ChatMessage[] = [
+    { role: "system", content: system },
+    { role: "user", content: userPrompt },
+  ];
+  const response = await queryModel(model, messages, {
+    useWebSearch: true,
+    webMaxResults: 10,
+    timeoutMs: 180_000,
+    webSearchTemporalContext: t,
+  });
+
+  if (!response) {
+    return { model, content: "(Web fetch failed)" };
+  }
+
+  const citations = response.citations ?? [];
+  const content =
+    citations.length > 0
+      ? appendStructuredCitations(response.content ?? "", citations)
+      : (response.content ?? "");
+
+  const sources: WebFetchSource[] | undefined =
+    citations.length > 0
+      ? citations.map((c) => ({
+          url: c.url,
+          title: c.title,
+          snippet: c.content,
+        }))
+      : undefined;
+
+  return {
+    model,
+    content,
+    webSearchSkipped: response.webSearchSkipped,
+    retrievedAt: t.isoUtc,
+    retrievedAtUnixSeconds: t.unixSeconds,
+    ...(sources ? { sources } : {}),
+  };
+}
+
+export type WebRetrievalMeta = { isoUtc: string; unixSeconds: number };
+
 export async function stage1CollectResponses(
   userQuery: string,
   useWebSearch?: boolean,
+  webContext?: string,
+  webRetrievalMeta?: WebRetrievalMeta,
 ): Promise<Stage1Item[]> {
-  const messages: ChatMessage[] = [{ role: "user", content: userQuery }];
-  const responses = await queryModelsParallel(
-    COUNCIL_MODELS,
-    messages,
-    queryOpts(useWebSearch),
-  );
+  let userContent = userQuery;
+  if (webContext) {
+    const clock =
+      webRetrievalMeta != null
+        ? `Retrieval instant (UTC only; do not assume end-user local timezone): **${webRetrievalMeta.isoUtc}** · Unix **${webRetrievalMeta.unixSeconds}** s\n\n`
+        : "";
+    userContent = `The following web search results have been gathered for context. They may include a section of structured URL citations with snippets.
+
+Trust policy: Prefer claims backed by official or first-party documentation, regulated bodies, and established news organizations. Treat single low-tier or sensational sources as weak evidence—do not present them as certain fact. If the context includes a "来源可信度与权重" section from the web stage, respect that ranking when you answer.
+
+${clock}---
+
+${webContext}
+
+---
+
+Based on the above web context (and its source weighting when present) plus your own knowledge where appropriate, answer the following question:
+
+${userQuery}`;
+  }
+
+  const messages: ChatMessage[] = [{ role: "user", content: userContent }];
+  const opts = webContext ? {} : queryOpts(useWebSearch);
+  const responses = await queryModelsParallel(COUNCIL_MODELS, messages, opts);
 
   const stage1: Stage1Item[] = [];
   for (const [model, response] of responses) {
     if (response != null) {
-      stage1.push({ model, response: response.content ?? "" });
+      stage1.push({
+        model,
+        response: response.content ?? "",
+        webSearchSkipped: response.webSearchSkipped,
+      });
     }
   }
   return stage1;
@@ -310,10 +452,30 @@ export async function runFullCouncil(
   Stage2Item[],
   Stage3Result,
   { label_to_model: Record<string, string>; aggregate_rankings: AggregateRanking[] },
+  WebFetchResult | undefined,
 ]> {
-  const { chairmanModel, useWebSearch, judgeWeights } = options;
+  const { chairmanModel, useWebSearch, judgeWeights, webFetchModel } = options;
 
-  const stage1Results = await stage1CollectResponses(userQuery, useWebSearch);
+  let webFetchResult: WebFetchResult | undefined;
+  let webContext: string | undefined;
+  if (useWebSearch) {
+    webFetchResult = await stageWebFetch(userQuery, webFetchModel);
+    if (!webFetchResult.webSearchSkipped) {
+      webContext = webFetchResult.content;
+    }
+  }
+
+  const stage1Results = await stage1CollectResponses(
+    userQuery,
+    useWebSearch,
+    webContext,
+    webFetchResult?.retrievedAt != null
+      ? {
+          isoUtc: webFetchResult.retrievedAt,
+          unixSeconds: webFetchResult.retrievedAtUnixSeconds ?? 0,
+        }
+      : undefined,
+  );
   if (stage1Results.length === 0) {
     return [
       [],
@@ -323,6 +485,7 @@ export async function runFullCouncil(
         response: "All models failed to respond. Please try again.",
       },
       { label_to_model: {}, aggregate_rankings: [] },
+      webFetchResult,
     ];
   }
 
@@ -354,5 +517,6 @@ export async function runFullCouncil(
       label_to_model: labelToModel,
       aggregate_rankings: aggregateRankings,
     },
+    webFetchResult,
   ];
 }

@@ -17,8 +17,11 @@ export type Conversation = {
 
 export type ApiConfig = {
   council_models: string[];
+  /** 推荐用于 OpenRouter 联网（web 插件）的模型 ID */
+  web_search_models?: string[];
   chairman_model: string;
   title_model: string;
+  web_fetch_model?: string;
 };
 
 export async function fetchConfig(): Promise<ApiConfig> {
@@ -58,6 +61,7 @@ export async function deleteConversation(id: string): Promise<void> {
 
 export type SendOptions = {
   chairman_model?: string;
+  web_fetch_model?: string;
   use_web_search?: boolean;
   judge_weights?: Record<string, number>;
 };
@@ -75,6 +79,7 @@ export async function sendMessage(
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
+        web_fetch_model: options?.web_fetch_model,
         use_web_search: options?.use_web_search,
         judge_weights: options?.judge_weights,
       }),
@@ -98,6 +103,7 @@ export async function sendMessageStream(
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
+        web_fetch_model: options?.web_fetch_model,
         use_web_search: options?.use_web_search,
         judge_weights: options?.judge_weights,
       }),
@@ -137,6 +143,31 @@ export type RerunOpts = {
   chairman_model?: string;
   judge_weights?: Record<string, number>;
 };
+
+export async function rerunStage1(
+  conversationId: string,
+  msgIndex: number,
+  opts?: RerunOpts,
+) {
+  const res = await fetch(
+    `${API_BASE}/api/conversations/${conversationId}/messages/${msgIndex}/rerun-stage1`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        use_web_search: opts?.use_web_search,
+      }),
+    },
+  );
+  if (!res.ok) {
+    const j = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(j.detail ?? "Rerun stage1 failed");
+  }
+  return res.json() as Promise<{
+    stage1: Array<{ model: string; response: string; webSearchSkipped?: boolean }>;
+    stale: { stage2: boolean; stage3: boolean };
+  }>;
+}
 
 export async function rerunStage1Model(
   conversationId: string,

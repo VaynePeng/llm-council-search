@@ -9,7 +9,28 @@ export type AggregateRanking = {
   rankings_count: number;
 };
 
-export type Stage1Item = { model: string; response: string };
+export type WebFetchSource = {
+  url: string;
+  title?: string;
+  snippet?: string;
+};
+
+export type WebFetchResult = {
+  model: string;
+  content: string;
+  webSearchSkipped?: boolean;
+  /** ISO 8601 UTC，检索发起时刻；前端可用 dayjs 转本机时区展示 */
+  retrievedAt?: string;
+  retrievedAtUnixSeconds?: number;
+  /** OpenRouter 返回的结构化 URL 引用，供 UI 与 Stage1 核对 */
+  sources?: WebFetchSource[];
+};
+
+export type Stage1Item = {
+  model: string;
+  response: string;
+  webSearchSkipped?: boolean;
+};
 export type Stage2Item = {
   model: string;
   ranking: string;
@@ -23,6 +44,7 @@ export type AssistantMessage = {
   role: "assistant";
   schemaVersion?: number;
   assistantMessageId: string;
+  webFetch?: WebFetchResult;
   stage1: Stage1Item[];
   stage2: Stage2Item[];
   stage3: Stage3Result;
@@ -159,6 +181,7 @@ export async function addAssistantMessage(
   stage2: Stage2Item[],
   stage3: Stage3Result,
   metadata?: AssistantMessage["metadata"],
+  webFetch?: WebFetchResult,
 ): Promise<void> {
   const c = await getConversation(conversationId);
   if (!c) throw new Error(`Conversation ${conversationId} not found`);
@@ -166,6 +189,7 @@ export async function addAssistantMessage(
     role: "assistant",
     schemaVersion: 1,
     assistantMessageId: randomUUID(),
+    ...(webFetch ? { webFetch } : {}),
     stage1,
     stage2,
     stage3,
