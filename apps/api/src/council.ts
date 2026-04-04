@@ -73,6 +73,13 @@ const MAX_CONTEXT_ROUNDS = 6;
 const MAX_CONTEXT_CHARS = 12_000;
 const MAX_USER_CONTEXT_CHARS = 700;
 const MAX_ASSISTANT_CONTEXT_CHARS = 1_400;
+const WEB_SOURCE_DISCIPLINE = `Source discipline:
+- If you use any information obtained from web retrieval, you MUST label it with both:
+  1. a source name (article title, page title, site name, organization name, or domain name when nothing better is available);
+  2. a directly reachable source URL to the exact page.
+- Source name and source URL are both required. Do not cite web-retrieved material with only one of them.
+- If you cannot provide both the source name and the exact source URL, do not present that web-retrieved material as a sourced claim.
+- Prefer Markdown links whose anchor text is the source name, for example [OpenAI API docs](https://...).`;
 
 function clipText(text: string, maxChars: number): string {
   const s = text.trim();
@@ -387,7 +394,9 @@ Rules:
 - Source notes must stay descriptive, not prescriptive. It is acceptable to mark a source as official documentation, regulator page, company blog, press report, forum post, archived page, or undated page. It is acceptable to note visible recency or missing dates. Do not assign weights/scores.
 - If results conflict, report the conflict neutrally and cite both sides. Do not decide the winner for later models.
 - Match the user's language: if the question is in Chinese, write in Simplified Chinese; otherwise mirror the question's language.
-- Use Markdown. Use real markdown links [site or title](full_url) in 参考来源 where you have URLs.`;
+- Use Markdown. Use real markdown links [site or title](full_url) in 参考来源 where you have URLs.
+
+${WEB_SOURCE_DISCIPLINE}`;
 
   const userPrompt = `## 检索基准时间（本次请求发起时刻，仅 UTC，不推断用户本地时区）
 - **ISO 8601（UTC）**：${t.isoUtc}
@@ -411,10 +420,10 @@ Produce this structure (adapt heading language to the user's language, e.g. 简�
 1–3 sentences: what you searched for in the web-required part only, and what material you found (or that little relevant material exists). Mention if results skew old relative to the retrieval time above.
 
 ## 来源清单
-For each significant domain/URL you rely on, give: 域名/URL、来源类型（官方/媒体/社区/文档/论坛/聚合页等）、可见日期（若有）、一句客观说明。不要打分，不要排优先级，不要给采信建议。
+For each significant source you rely on, give: 来源名称、域名/URL、来源类型（官方/媒体/社区/文档/论坛/聚合页等）、可见日期（若有）、一句客观说明。不要打分，不要排优先级，不要给采信建议。
 
 ## 检索到的事实
-Bullet list: concrete externally sourced facts only. Each bullet should be traceable to one or more URLs. Keep wording factual and compact. No recommendations, no final synthesis, no answer framing.
+Bullet list: concrete externally sourced facts only. Each bullet should be traceable to one or more sources, and when you mention a sourced fact you must include both the source name and the exact URL. Keep wording factual and compact. No recommendations, no final synthesis, no answer framing.
 
 ## 冲突与缺口
 - List conflicts between sources, if any.
@@ -498,11 +507,11 @@ Important: this web stage was instructed to retrieve only the parts that truly n
 Trust policy: Prefer claims backed by official or first-party documentation, regulated bodies, and established news organizations. Use the web material as evidence, but make your own judgment instead of inheriting conclusions from the retrieval stage.
 
 Citation rule:
-- If you reference any third-party material such as a news report, article, blog post, documentation page, paper, post, filing, announcement, or external quote, you MUST include a concrete, directly reachable URL to that exact source or article.
+- **Inline citation (MANDATORY)**: Every time you state a fact from the web retrieval context, annotate it inline with a clickable Markdown link right after the claim. Use the format: "事实描述（[信息来源���来源名称](https://exact-url)）". For example: "目前中国人口约14亿（[信息来源：国家统计局](https://www.stats.gov.cn/...)）".
+- You MUST provide both the source name and the exact source URL together. A bare URL without a source name, or a source name without the exact URL, is not acceptable.
 - Do not use vague attributions such as "according to media reports", "消息来源", "Reuters", "Bloomberg", "official sources", "some article", or only a site/domain name without the specific page URL.
 - If the web context mentions a source but you cannot point to the exact URL, do not present it as a sourced third-party citation. Either omit the citation or explicitly say the exact source link is unavailable.
-- Format every citation as a Markdown link with human-readable anchor text, for example [BBC 文章](https://...). Do not expose raw bare URLs directly in the prose unless unavoidable.
-- Use the exact article/page title when possible; otherwise use a short descriptive label such as [OpenAI API docs](https://...).
+- Use the exact article/page title when possible; otherwise use a short descriptive label.
 
 ${clock}---
 
@@ -517,11 +526,11 @@ ${userQuery}`;
     userContent = `Answer the following question.
 
 Citation rule:
-- If you reference any third-party material such as a news report, article, blog post, documentation page, paper, post, filing, announcement, or external quote, you MUST include a concrete, directly reachable URL to that exact source or article.
+- **Inline citation (MANDATORY)**: Every time you state a fact from an external source, annotate it inline with a clickable Markdown link right after the claim. Use the format: "事实描述（[信息来��：来源名称](https://exact-url)）". For example: "目前中国人口约14亿（[信息来源：国家统计局](https://www.stats.gov.cn/...)）".
+- You MUST provide both the source name and the exact source URL together. A bare URL without a source name, or a source name without the exact URL, is not acceptable.
 - Do not use vague attributions such as "according to media reports", "消息来源", "Reuters", "Bloomberg", "official sources", "some article", or only a site/domain name without the specific page URL.
 - If you do not have the exact URL, do not present it as a sourced third-party citation. Either answer without that citation or explicitly say you cannot verify the exact source link.
-- Format every citation as a Markdown link with human-readable anchor text, for example [BBC 文章](https://...). Do not expose raw bare URLs directly in the prose unless unavoidable.
-- Use the exact article/page title when possible; otherwise use a short descriptive label such as [OpenAI API docs](https://...).
+- Use the exact article/page title when possible; otherwise use a short descriptive label.
 
 Question:
 ${userQuery}`;
@@ -654,6 +663,7 @@ function buildChairmanUserContent(
   stage2Results: Stage2Item[],
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
+  webFetchSources?: WebFetchSource[],
 ): string {
   const stage1Text = stage1Results
     .map((r) => `Model: ${r.model}\nResponse: ${r.response}`)
@@ -673,6 +683,14 @@ function buildChairmanUserContent(
     aggregateSection = `\n\nAGGREGATE RANKING SUMMARY:\n${formatAggregateRankingSummary(agg, judgeWeights)}`;
   }
 
+  let webSourcesSection = "";
+  if (webFetchSources?.length) {
+    const sourceLines = webFetchSources.map((s, i) =>
+      `${i + 1}. [${s.title ?? s.url}](${s.url})${s.snippet ? ` — ${clipText(s.snippet, 200)}` : ""}`,
+    );
+    webSourcesSection = `\n\nWEB RETRIEVAL SOURCES (from the web search stage — use these URLs when citing):\n${sourceLines.join("\n")}`;
+  }
+
   return `You are the Chairman of a multi-model deliberation: several AI models responded to the user's question and ranked each other's responses.
 
 Original Question: ${userQuery}
@@ -683,6 +701,7 @@ ${stage1Text}
 STAGE 2 - Peer Rankings:
 ${stage2Text}
 ${aggregateSection}
+${webSourcesSection}
 
 Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
 - The individual responses and their insights
@@ -691,12 +710,14 @@ Your task as Chairman is to synthesize all of this information into a single, co
 - The aggregate ranking summary when present (it reflects peer evaluation${judgeWeights && Object.keys(judgeWeights).length ? ", weighted by configured judge importance" : ""})
 
 Citation rule:
-- If your final answer references any third-party material such as a news report, article, blog post, documentation page, paper, social post, filing, announcement, or external quote, you MUST include a concrete, directly reachable URL to that exact source page.
+- **Inline citation (MANDATORY)**: Every time you state a fact that came from web retrieval or a third-party source, you MUST annotate it inline in the prose with a clickable Markdown link right after the claim. Use the format: "事实描述（[信息来源：来源名称](https://exact-url)）". For example: "目前中国人口约14亿（[信息来源：国家统计局](https://www.stats.gov.cn/...)）".
+- If your final answer uses any information that originated from web retrieval, you MUST present both the source name and the exact source URL together. A bare URL without a source name, or a source name without the exact URL, is not acceptable.
 - Do not write vague source labels such as "媒体报道", "有消息称", "Reuters", "Bloomberg", "官方消息", or only a homepage/domain unless you are specifically citing that exact homepage page.
 - If Stage 1 responses mention a source but do not provide a concrete URL, treat that citation as unsupported and do not repeat it as a sourced claim unless you can provide the exact link yourself.
 - If no exact URL is available, either omit the third-party citation or explicitly state that the exact source link is unavailable.
-- Format every citation as a Markdown link with human-readable anchor text, for example [BBC 文章](https://...). Do not expose raw bare URLs directly in the prose unless unavoidable.
-- Use the exact article/page title when possible; otherwise use a short descriptive label such as [OpenAI API docs](https://...).
+- Use the exact article/page title when possible; otherwise use a short descriptive label.
+- If WEB RETRIEVAL SOURCES are provided above, prefer those exact URLs for citations.
+- **MANDATORY**: You MUST end your answer with a "## 参考来源" section listing ALL sources you cited in the body, formatted as clickable Markdown links. Example: \`- [信息来源：BBC News](https://www.bbc.com/...)\`. Every source mentioned inline in the body must also appear in this final list.
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:`;
 }
@@ -730,6 +751,7 @@ export function analyzeChairmanContext(
   chairmanModel: string | undefined,
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
+  webFetchSources?: WebFetchSource[],
 ): ChairmanContextAnalysis {
   const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
   const prompt = buildChairmanUserContent(
@@ -738,6 +760,7 @@ export function analyzeChairmanContext(
     stage2Results,
     judgeWeights,
     labelToModel,
+    webFetchSources,
   );
   const estimated =
     estimateTextTokens(prompt) +
@@ -798,6 +821,7 @@ export function gateChairmanStage3(
   chairmanModel: string | undefined,
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
+  webFetchSources?: WebFetchSource[],
 ): ChairmanStage3Gate {
   const analysis = analyzeChairmanContext(
     userQuery,
@@ -806,6 +830,7 @@ export function gateChairmanStage3(
     chairmanModel,
     judgeWeights,
     labelToModel,
+    webFetchSources,
   );
   if (!analysis.exceeds) return { proceed: true };
   return {
@@ -828,6 +853,7 @@ export async function stage3SynthesizeFinal(
   labelToModel?: Record<string, string>,
   apiKey?: string,
   signal?: AbortSignal,
+  webFetchSources?: WebFetchSource[],
 ): Promise<Stage3Result> {
   const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
 
@@ -837,6 +863,7 @@ export async function stage3SynthesizeFinal(
     stage2Results,
     judgeWeights,
     labelToModel,
+    webFetchSources,
   );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
@@ -870,6 +897,7 @@ export async function stage3SynthesizeFinalStream(
   onDelta: (chunk: string) => void,
   apiKey?: string,
   signal?: AbortSignal,
+  webFetchSources?: WebFetchSource[],
 ): Promise<Stage3Result> {
   const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
 
@@ -879,6 +907,7 @@ export async function stage3SynthesizeFinalStream(
     stage2Results,
     judgeWeights,
     labelToModel,
+    webFetchSources,
   );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
@@ -1107,6 +1136,7 @@ export async function runFullCouncil(
     chairmanModel,
     judgeWeights,
     labelToModel,
+    webFetchResult?.sources,
   );
   const stage3Result = gate.proceed
     ? await stage3SynthesizeFinal(
@@ -1119,6 +1149,7 @@ export async function runFullCouncil(
         labelToModel,
         apiKey,
         signal,
+        webFetchResult?.sources,
       )
     : gate.stage3;
 

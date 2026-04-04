@@ -107,6 +107,12 @@ function extractApiKey(c: { req: { header: (k: string) => string | undefined } }
   return c.req.header("x-openrouter-key")?.trim() || undefined;
 }
 
+const MISSING_API_KEY_DETAIL =
+  "OpenRouter API key required via X-OpenRouter-Key header";
+
+const STAGE1_FAILURE_MESSAGE =
+  "All Stage 1 model requests failed. Check your OpenRouter API key, account credits, model availability, or server logs for the upstream error.";
+
 type SendBody = {
   content?: string;
   chairman_model?: string;
@@ -154,6 +160,7 @@ app.post("/api/conversations/:id/message", async (c) => {
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
   const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -229,6 +236,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
   const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -338,6 +346,32 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         );
         push({ type: "stage1_complete", data: stage1Results });
 
+        if (stage1Results.length === 0) {
+          const stage3Result: Stage3Result = {
+            model: "error",
+            response: STAGE1_FAILURE_MESSAGE,
+          };
+
+          ensureNotAborted();
+          await withConversationLock(id, async () => {
+            await addAssistantMessage(
+              id,
+              [],
+              [],
+              stage3Result,
+              {
+                label_to_model: {},
+                aggregate_rankings: [],
+              },
+              webFetchResult,
+            );
+          });
+
+          push({ type: "stage3_complete", data: stage3Result });
+          push({ type: "complete" });
+          return;
+        }
+
         push({ type: "stage2_start" });
         const [stage2Results, labelToModel] = await stage2CollectRankings(
           effectiveQuery,
@@ -368,6 +402,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           chairmanModel,
           judgeWeights,
           labelToModel,
+          webFetchResult?.sources,
         );
 
         let stage3Result: Stage3Result;
@@ -432,6 +467,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             (delta) => push({ type: "stage3_delta", data: { delta } }),
             apiKey,
             requestSignal,
+            webFetchResult?.sources,
           );
           push({ type: "stage3_complete", data: stage3Result });
 
@@ -496,6 +532,7 @@ app.post(
     const msgIndex = parseMsgIndex(c);
     if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
     const apiKey = extractApiKey(c);
+    if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
     const model = body.model?.trim();
@@ -575,6 +612,7 @@ app.post(
     const msgIndex = parseMsgIndex(c);
     if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
     const apiKey = extractApiKey(c);
+    if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
 
@@ -658,6 +696,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
   const msgIndex = parseMsgIndex(c);
   if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
   const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const judgeWeights = parseJudgeWeights(body);
@@ -731,6 +770,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
   const msgIndex = parseMsgIndex(c);
   if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
   const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const judgeWeights = parseJudgeWeights(body);
@@ -764,6 +804,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
           parseChairman(body),
           judgeWeights,
           labelToModel,
+          msg.webFetch?.sources,
         );
 
     if (!gate.proceed) {
@@ -798,6 +839,8 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
       judgeWeights,
       labelToModel,
       apiKey,
+      undefined,
+      msg.webFetch?.sources,
     );
 
     msg.stage3 = stage3;

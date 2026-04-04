@@ -46,8 +46,9 @@ export function getWebSearchTemporalContext(now: Date = new Date()) {
     `Prefer sources that are current as of this instant or clearly published recently; ` +
     `treat undated, undiscoverable-publish-date, or obviously stale pages as weaker evidence when the user needs up-to-date facts. ` +
     `Ground claims in the search results you obtain; do not invent URLs.\n\n` +
-    `IMPORTANT: Cite sources using markdown links named with the source domain.\n` +
-    `Example: [nytimes.com](https://nytimes.com/some-page).`;
+    `IMPORTANT: If you use web-retrieved information, every cited item must include both a source name and the exact source URL.\n` +
+    `Use Markdown links with human-readable source names as the anchor text.\n` +
+    `Example: [New York Times](https://nytimes.com/some-page).`;
   return { isoUtc, unixSeconds, webSearchInstruction };
 }
 

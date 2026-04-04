@@ -58,7 +58,11 @@ WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/web/package.json apps/web/package.json
-COPY --from=base /app/node_modules ./node_modules
+
+# Reinstall production dependencies in the runtime image so pnpm workspace
+# packages resolve correctly after the build stage.
+RUN pnpm install --frozen-lockfile --prod
+
 COPY --from=build /app/apps/web/.next ./apps/web/.next
 COPY --from=build /app/apps/web/public ./apps/web/public
 COPY --from=build /app/apps/web/next.config.ts ./apps/web/next.config.ts
@@ -86,7 +90,11 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
-COPY --from=base /app/node_modules ./node_modules
+
+# Reinstall production dependencies in the runtime image so pnpm workspace
+# packages resolve correctly after the build stage.
+RUN pnpm install --frozen-lockfile --prod
+
 COPY --from=build /app/apps/api/dist ./apps/api/dist
 COPY --from=build /app/apps/web/.next ./apps/web/.next
 COPY --from=build /app/apps/web/public ./apps/web/public

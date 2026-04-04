@@ -90,6 +90,14 @@ function modelShortName(model: string): string {
   return p && p.length > 0 ? p : model;
 }
 
+const markdownComponents: Record<string, React.ComponentType<React.AnchorHTMLAttributes<HTMLAnchorElement>>> = {
+  a: ({ children, ...props }) => (
+    <a {...props} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  ),
+};
+
 type WebFetchSource = {
   url: string;
   title?: string;
@@ -123,6 +131,7 @@ type Stage3 = { model: string; response: string };
 
 type AssistantMsg = {
   role: "assistant";
+  pending?: boolean;
   webFetch?: WebFetchResult | null;
   stage1: Stage1Item[] | null;
   stage2: Stage2Item[] | null;
@@ -203,9 +212,10 @@ function usePinnedBottomAutoscroll(
   }, [containerRef, trigger]);
 }
 
-function streamingAssistantShell(): AssistantMsg {
+function streamingAssistantShell(pending = false): AssistantMsg {
   return {
     role: "assistant",
+    pending,
     webFetch: null,
     stage1: null,
     stage2: null,
@@ -595,6 +605,9 @@ export default function CouncilApp() {
         });
       };
 
+      const patchLastAssistantActive = (fn: (m: AssistantMsg) => AssistantMsg) =>
+        patchLastAssistant((m) => fn({ ...m, pending: false }));
+
       const maybeRefreshSidebar = () => {
         if (streamSidebarRefreshRef.current) return;
         streamSidebarRefreshRef.current = true;
@@ -606,7 +619,7 @@ export default function CouncilApp() {
           switch (type) {
           case "web_fetch_start":
             maybeRefreshSidebar();
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               webFetch:
                 m.webFetch ??
@@ -615,7 +628,7 @@ export default function CouncilApp() {
             }));
             break;
           case "web_fetch_complete":
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               webFetch: ev.data as WebFetchResult,
               loading: { ...m.loading, webFetch: false },
@@ -623,13 +636,13 @@ export default function CouncilApp() {
             break;
           case "stage1_start":
             maybeRefreshSidebar();
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               loading: { ...m.loading, stage1: true },
             }));
             break;
           case "stage1_complete":
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               stage1: ev.data as Stage1Item[],
               loading: { ...m.loading, stage1: false },
@@ -637,13 +650,13 @@ export default function CouncilApp() {
             }));
             break;
           case "stage2_start":
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               loading: { ...m.loading, stage2: true },
             }));
             break;
           case "stage2_complete":
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               stage2: ev.data as Stage2Item[],
               metadata: (ev.metadata as AssistantMsg["metadata"]) ?? null,
@@ -660,7 +673,7 @@ export default function CouncilApp() {
               suggested_models: string[];
               stage3: Stage3;
             };
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               stage3: d.stage3,
               loading: { ...m.loading, stage3: false },
@@ -681,7 +694,7 @@ export default function CouncilApp() {
           }
           case "stage3_start": {
             const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               loading: { ...m.loading, stage3: true },
               stage3: { model: sm || "…", response: "" },
@@ -693,7 +706,7 @@ export default function CouncilApp() {
               (ev as { data?: { delta?: string } }).data?.delta ?? "",
             );
             if (!delta) break;
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               stage3: m.stage3
                 ? { ...m.stage3, response: m.stage3.response + delta }
@@ -702,7 +715,7 @@ export default function CouncilApp() {
             break;
           }
           case "stage3_complete":
-            patchLastAssistant((m) => ({
+            patchLastAssistantActive((m) => ({
               ...m,
               stage3: ev.data as Stage3,
               loading: { ...m.loading, stage3: false },
@@ -845,7 +858,7 @@ export default function CouncilApp() {
       reverted: false,
     };
 
-    const assistantShell = streamingAssistantShell();
+    const assistantShell = streamingAssistantShell(true);
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -893,7 +906,7 @@ export default function CouncilApp() {
     };
 
     const userMessage: UserMsg = { role: "user", content };
-    const assistantShell = streamingAssistantShell();
+    const assistantShell = streamingAssistantShell(true);
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -1512,6 +1525,13 @@ function CouncilAssistantCard({
     ...DEFAULT_ASSISTANT_LOADING,
     ...(m.loading ?? {}),
   };
+  const pending = Boolean(
+    m.pending &&
+    !m.webFetch &&
+    !m.stage1?.length &&
+    !m.stage2?.length &&
+    !m.stage3,
+  );
   const webFetchDone = Boolean(m.webFetch?.content?.trim());
   const s1done = Boolean(m.stage1?.length);
   const s2done = Boolean(m.stage2?.length);
@@ -1560,6 +1580,32 @@ function CouncilAssistantCard({
 
   const opts = sendOpts();
   const stage3ScrollRef = useRef<HTMLDivElement>(null);
+  const [stageTab, setStageTab] = useState<"web" | "1" | "2" | "3">(
+    showWebFetch ? "web" : "1",
+  );
+
+  useEffect(() => {
+    if (pending) return;
+    if (effectiveLoading.webFetch) {
+      setStageTab("web");
+      return;
+    }
+    if (!showWebFetch && stageTab === "web") {
+      setStageTab("1");
+      return;
+    }
+    if (stageTab === "1" && showWebFetch && !webFetchDone) {
+      setStageTab("web");
+      return;
+    }
+    if (stageTab === "3" && !s2done) {
+      setStageTab(s1done ? "2" : "1");
+      return;
+    }
+    if (stageTab === "2" && !s1done) {
+      setStageTab("1");
+    }
+  }, [effectiveLoading.webFetch, pending, showWebFetch, stageTab, s1done, s2done, webFetchDone]);
 
   return (
     <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
@@ -1599,15 +1645,39 @@ function CouncilAssistantCard({
           loading={effectiveLoading}
         />
       </div>
+      {pending ? (
+        <div
+          className="mt-3 flex h-[min(58dvh,32rem)] min-h-[220px] flex-col gap-3 rounded-lg border border-status-running-border/40 bg-status-running/15 p-4"
+          style={{ animation: "council-fade-in 0.3s ease-out both" }}
+          aria-live="polite"
+          aria-busy
+        >
+          <div className="flex items-center gap-2 text-sm text-foreground">
+            <Loader2
+              className="size-4 animate-spin text-status-running-foreground"
+              strokeWidth={2}
+              aria-hidden
+            />
+            <span>正在分析问题并判断是否需要联网检索…</span>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            已开始处理，本条回答会在收到阶段事件后立即切换到对应视图。
+          </div>
+          <Skeleton className="h-9 w-full rounded-lg bg-status-running/35" />
+          <Skeleton className="h-24 w-full rounded-lg bg-status-running/35" />
+          <Skeleton className="h-24 w-full rounded-lg bg-status-running/35" />
+        </div>
+      ) : (
       <Tabs
-        defaultValue={showWebFetch ? "web" : "1"}
+        value={stageTab}
+        onValueChange={(value) => setStageTab(value as "web" | "1" | "2" | "3")}
         className="flex h-[min(58dvh,32rem)] min-h-[220px] flex-col overflow-hidden pt-1"
       >
         <TabsList className="inline-flex h-auto min-h-10 w-full shrink-0 flex-wrap justify-start gap-1 overflow-x-auto rounded-lg bg-muted p-1">
           {showWebFetch ? <TabsTrigger value="web">Web 抓取</TabsTrigger> : null}
-          <TabsTrigger value="1">Stage 1</TabsTrigger>
-          <TabsTrigger value="2">Stage 2</TabsTrigger>
-          <TabsTrigger value="3">Stage 3</TabsTrigger>
+          <TabsTrigger value="1" disabled={showWebFetch && !webFetchDone}>Stage 1</TabsTrigger>
+          <TabsTrigger value="2" disabled={!s1done}>Stage 2</TabsTrigger>
+          <TabsTrigger value="3" disabled={!s2done}>Stage 3</TabsTrigger>
         </TabsList>
         {showWebFetch ? (
           <TabsContent
@@ -1782,6 +1852,7 @@ function CouncilAssistantCard({
           </div>
         </TabsContent>
       </Tabs>
+      )}
     </div>
   );
 }
@@ -1888,7 +1959,7 @@ function WebFetchView({
         </div>
       ) : null}
       <div className="mt-2 max-w-none text-sm leading-relaxed text-foreground [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">
-        <ReactMarkdown>{data.content}</ReactMarkdown>
+        <ReactMarkdown components={markdownComponents}>{data.content}</ReactMarkdown>
       </div>
     </div>
   );
@@ -1958,7 +2029,7 @@ function Stage1View({
                   isBusy && "pointer-events-none blur-[6px] opacity-60 select-none",
                 )}
               >
-                <ReactMarkdown>{it.response}</ReactMarkdown>
+                <ReactMarkdown components={markdownComponents}>{it.response}</ReactMarkdown>
               </div>
               {isBusy ? (
                 <div
@@ -2164,7 +2235,7 @@ function Stage3View({
       <div className="font-mono text-xs text-muted-foreground">{data.model}</div>
       <div className="relative mt-2 max-w-none text-sm leading-relaxed text-foreground transition-opacity duration-200 ease-out [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">
         {displayed ? (
-          <ReactMarkdown>{displayed}</ReactMarkdown>
+          <ReactMarkdown components={markdownComponents}>{displayed}</ReactMarkdown>
         ) : streaming ? (
           <span className="text-muted-foreground">正在生成…</span>
         ) : null}
