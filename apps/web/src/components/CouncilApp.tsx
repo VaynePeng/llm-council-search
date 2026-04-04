@@ -48,12 +48,14 @@ import {
   deleteConversation,
   fetchConfig,
   getConversation,
+  getStoredApiKey,
   listConversations,
   rerunStage1,
   rerunStage1Model,
   rerunStage2,
   rerunStage3,
   sendMessageStream,
+  setStoredApiKey,
   type ApiConfig,
   type Conversation,
   type ConversationMeta,
@@ -163,7 +165,7 @@ function isStuckToBottom(el: HTMLElement) {
  */
 function usePinnedBottomAutoscroll(
   containerRef: React.RefObject<HTMLElement | null>,
-  layoutDeps: ReadonlyArray<unknown>,
+  trigger: unknown,
 ) {
   const followBottomRef = useRef(true);
 
@@ -194,7 +196,7 @@ function usePinnedBottomAutoscroll(
     const el = containerRef.current;
     if (!el || !followBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
-  }, layoutDeps);
+  }, [containerRef, trigger]);
 }
 
 function streamingAssistantShell(
@@ -246,7 +248,7 @@ function buildJudgeWeights(
 }
 
 export default function CouncilApp() {
-  const { theme, setTheme, resolvedTheme } = useTheme();
+  const { setTheme, resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [apiConfig, setApiConfig] = useState<ApiConfig | null>(null);
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
@@ -262,9 +264,22 @@ export default function CouncilApp() {
   const [judgeWeights, setJudgeWeights] = useState<Record<string, number>>({});
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [openrouterKey, setOpenrouterKey] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [hasRetry, setHasRetry] = useState(false);
   const [rerunBusy, setRerunBusy] = useState<string | null>(null);
+  /** 主席 Stage3 因估算上下文不足被跳过时的引导弹窗 */
+  const [chairmanContextPrompt, setChairmanContextPrompt] = useState<{
+    convId: string;
+    messageIndex: number;
+    chairman_model: string;
+    estimated_input_tokens: number;
+    context_limit: number;
+    max_input_tokens: number;
+    suggested_models: string[];
+  } | null>(null);
+  const [chairmanPromptPick, setChairmanPromptPick] = useState("");
+  const [chairmanDialogWorking, setChairmanDialogWorking] = useState(false);
 
   /** 发送失败后重试（流式中失败 reverted=false；fetch 失败 reverted=true） */
   const failedSendRef = useRef<{
@@ -284,6 +299,8 @@ export default function CouncilApp() {
   } | null>(null);
   /** 每条流式请求内至多刷新一次列表（同步侧栏 message_count） */
   const streamSidebarRefreshRef = useRef(false);
+  /** 当前流式请求的中断控制器 */
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     currentIdRef.current = currentId;
@@ -291,6 +308,7 @@ export default function CouncilApp() {
 
   useEffect(() => {
     setMounted(true);
+    setOpenrouterKey(getStoredApiKey());
   }, []);
 
   const chairmanEffective = useMemo(() => {
@@ -334,6 +352,49 @@ export default function CouncilApp() {
     setHasRetry(false);
     failedSendRef.current = null;
     rerunRetryRef.current = null;
+  }, []);
+
+  const stopStreamingPreview = useCallback((convId: string) => {
+    const stopTailAssistant = (
+      messages: Conversation["messages"],
+    ): Conversation["messages"] => {
+      const next = [...messages];
+      const last = next[next.length - 1] as { role?: string } | undefined;
+      if (last?.role === "assistant") {
+        next[next.length - 1] = {
+          ...(last as AssistantMsg),
+          loading: { ...DEFAULT_ASSISTANT_LOADING },
+        } as unknown as Conversation["messages"][number];
+      }
+      return next;
+    };
+
+    const draft = streamDraftRef.current;
+    if (draft?.convId === convId) {
+      const next = stopTailAssistant(draft.messages);
+      streamDraftRef.current = null;
+      setConversation((prev) =>
+        prev?.id === convId ? { ...prev, messages: next } : prev,
+      );
+    } else {
+      setConversation((prev) =>
+        prev?.id === convId
+          ? { ...prev, messages: stopTailAssistant(prev.messages) }
+          : prev,
+      );
+    }
+
+    setLoading(false);
+    setHasRetry(false);
+    setActionError(null);
+    failedSendRef.current = null;
+  }, []);
+
+  const isAbortError = useCallback((err: unknown) => {
+    return (
+      (err as { name?: string })?.name === "AbortError" ||
+      (err instanceof Error && err.message === "The operation was aborted.")
+    );
   }, []);
 
   const armRerunRetry = useCallback(
@@ -469,6 +530,8 @@ export default function CouncilApp() {
   const runStreamForContent = useCallback(
     async (convId: string, content: string) => {
       streamSidebarRefreshRef.current = false;
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
 
       const applyPatchToAssistantTail = (
         messages: Conversation["messages"],
@@ -502,8 +565,9 @@ export default function CouncilApp() {
         void loadConversations();
       };
 
-      await sendMessageStream(convId, content, (type, ev) => {
-        switch (type) {
+      try {
+        await sendMessageStream(convId, content, (type, ev) => {
+          switch (type) {
           case "web_fetch_start":
             maybeRefreshSidebar();
             patchLastAssistant((m) => ({
@@ -547,6 +611,35 @@ export default function CouncilApp() {
               loading: { ...m.loading, stage2: false },
             }));
             break;
+          case "chairman_context_prompt": {
+            const d = ev.data as {
+              message_index: number;
+              chairman_model: string;
+              estimated_input_tokens: number;
+              context_limit: number;
+              max_input_tokens: number;
+              suggested_models: string[];
+              stage3: Stage3;
+            };
+            patchLastAssistant((m) => ({
+              ...m,
+              stage3: d.stage3,
+              loading: { ...m.loading, stage3: false },
+            }));
+            setChairmanContextPrompt({
+              convId,
+              messageIndex: d.message_index,
+              chairman_model: d.chairman_model,
+              estimated_input_tokens: d.estimated_input_tokens,
+              context_limit: d.context_limit,
+              max_input_tokens: d.max_input_tokens,
+              suggested_models: d.suggested_models,
+            });
+            setChairmanPromptPick(
+              d.suggested_models[0] ?? d.chairman_model,
+            );
+            break;
+          }
           case "stage3_start": {
             const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
             patchLastAssistant((m) => ({
@@ -606,13 +699,86 @@ export default function CouncilApp() {
             setLoading(false);
             setHasRetry(true);
             break;
-          default:
-            break;
+            default:
+              break;
+          }
+        }, sendOpts(), controller.signal);
+      } finally {
+        if (streamAbortRef.current === controller) {
+          streamAbortRef.current = null;
         }
-      }, sendOpts());
+      }
     },
     [loadConversations, loadConversation, sendOpts],
   );
+
+  const handleStop = useCallback(() => {
+    if (!loading || !currentId) return;
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    stopStreamingPreview(currentId);
+  }, [currentId, loading, stopStreamingPreview]);
+
+  const runChairmanRetryWithPick = useCallback(async () => {
+    const p = chairmanContextPrompt;
+    if (!p || !chairmanPromptPick.trim() || chairmanDialogWorking) return;
+    const o = sendOpts();
+    setChairmanDialogWorking(true);
+    setActionError(null);
+    try {
+      await rerunStage3(p.convId, p.messageIndex, {
+        use_web_search: o.use_web_search,
+        chairman_model: chairmanPromptPick.trim(),
+        judge_weights: o.judge_weights,
+      });
+      const pick = chairmanPromptPick.trim();
+      if (apiConfig?.council_models.includes(pick)) {
+        setChairmanSelect(pick);
+      } else {
+        setChairmanSelect("__custom__");
+        setChairmanCustom(pick);
+      }
+      setChairmanContextPrompt(null);
+      if (currentIdRef.current === p.convId) {
+        await loadConversation(p.convId);
+      }
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChairmanDialogWorking(false);
+    }
+  }, [
+    chairmanContextPrompt,
+    chairmanPromptPick,
+    chairmanDialogWorking,
+    sendOpts,
+    apiConfig?.council_models,
+    loadConversation,
+  ]);
+
+  const runChairmanForceCurrent = useCallback(async () => {
+    const p = chairmanContextPrompt;
+    if (!p || chairmanDialogWorking) return;
+    const o = sendOpts();
+    setChairmanDialogWorking(true);
+    setActionError(null);
+    try {
+      await rerunStage3(p.convId, p.messageIndex, {
+        use_web_search: o.use_web_search,
+        chairman_model: p.chairman_model,
+        judge_weights: o.judge_weights,
+        skip_chairman_context_check: true,
+      });
+      setChairmanContextPrompt(null);
+      if (currentIdRef.current === p.convId) {
+        await loadConversation(p.convId);
+      }
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChairmanDialogWorking(false);
+    }
+  }, [chairmanContextPrompt, chairmanDialogWorking, sendOpts, loadConversation]);
 
   const handleRetrySend = useCallback(async () => {
     const f = failedSendRef.current;
@@ -649,6 +815,7 @@ export default function CouncilApp() {
     try {
       await runStreamForContent(f.conversationId, f.content);
     } catch (e) {
+      if (isAbortError(e)) return;
       console.error(e);
       if (streamDraftRef.current?.convId === f.conversationId) {
         streamDraftRef.current = null;
@@ -665,7 +832,7 @@ export default function CouncilApp() {
       setActionError("发送失败");
       setHasRetry(true);
     }
-  }, [currentId, loading, runStreamForContent, sendOpts, apiConfig?.web_fetch_model]);
+  }, [currentId, isAbortError, loading, runStreamForContent, sendOpts, apiConfig?.web_fetch_model]);
 
   const handleSend = async () => {
     if (!currentId || !input.trim() || loading) return;
@@ -701,6 +868,7 @@ export default function CouncilApp() {
     try {
       await runStreamForContent(currentId, content);
     } catch (e) {
+      if (isAbortError(e)) return;
       console.error(e);
       if (streamDraftRef.current?.convId === currentId) {
         streamDraftRef.current = null;
@@ -778,7 +946,7 @@ export default function CouncilApp() {
   );
 
   return (
-    <div className="flex h-[100dvh] overflow-hidden bg-background">
+    <div className="flex h-dvh overflow-hidden bg-background">
       <aside className="hidden w-72 shrink-0 flex-col border-r border-border bg-card md:flex">
         {SidebarBody}
       </aside>
@@ -864,13 +1032,29 @@ export default function CouncilApp() {
                 <Settings2 className="h-4 w-4" />
               </Button>
             </SheetTrigger>
-            <SheetContent className="flex max-h-[100dvh] flex-col overflow-y-auto">
+            <SheetContent className="flex max-h-dvh flex-col overflow-y-auto">
               <SheetHeader>
                 <SheetTitle>高级设置</SheetTitle>
               </SheetHeader>
               <div className="mt-4 space-y-6">
+                <div className="space-y-2">
+                  <Label htmlFor="apiKey">OpenRouter API Key</Label>
+                  <Input
+                    id="apiKey"
+                    type="password"
+                    placeholder="sk-or-v1-..."
+                    value={openrouterKey}
+                    onChange={(e) => {
+                      setOpenrouterKey(e.target.value);
+                      setStoredApiKey(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    密钥仅保存在浏览器本地，不会上传至第三方。
+                  </p>
+                </div>
                 <div className="flex items-center justify-between gap-4">
-                  <Label htmlFor="web">OpenRouter 联网（web 插件）</Label>
+                  <Label htmlFor="web">OpenRouter 联网（web_search 工具）</Label>
                   <Switch
                     id="web"
                     checked={useWebSearch}
@@ -922,7 +1106,7 @@ export default function CouncilApp() {
                       Perplexity / xAI 等原生搜索，以及带{" "}
                       <span className="font-mono">:online</span> 或 Exa 兜底的模型，见{" "}
                       <a
-                        href="https://openrouter.ai/docs/guides/features/plugins/web-search"
+                        href="https://openrouter.ai/docs/guides/features/server-tools/web-search"
                         className="underline underline-offset-2"
                         target="_blank"
                         rel="noreferrer"
@@ -1055,25 +1239,125 @@ export default function CouncilApp() {
               className="flex-1"
               placeholder="输入问题… Enter 发送，Shift+Enter 换行"
               value={input}
-              disabled={!currentId || loading}
+              disabled={!currentId}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  void handleSend();
+                  if (!loading) void handleSend();
                 }
               }}
             />
-            <Button
-              disabled={!currentId || loading}
-              onClick={() => void handleSend()}
-              className="self-end"
-            >
-              发送
-            </Button>
+            {loading ? (
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={handleStop}
+                className="self-end"
+              >
+                停止
+              </Button>
+            ) : (
+              <Button
+                disabled={!currentId}
+                onClick={() => void handleSend()}
+                className="self-end"
+              >
+                发送
+              </Button>
+            )}
           </div>
         </footer>
       </main>
+
+      {chairmanContextPrompt ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="chairman-context-title"
+        >
+          <div className="max-h-[min(90dvh,32rem)] w-full max-w-lg overflow-y-auto rounded-lg border border-border bg-card p-5 shadow-lg">
+            <h3
+              id="chairman-context-title"
+              className="text-base font-semibold text-foreground"
+            >
+              主席模型上下文可能不足
+            </h3>
+            <p className="mt-3 text-sm text-muted-foreground leading-relaxed">
+              当前主席{" "}
+              <span className="font-mono text-xs text-foreground">
+                {chairmanContextPrompt.chairman_model}
+              </span>{" "}
+              的合成输入估算约{" "}
+              <strong className="text-foreground">
+                {chairmanContextPrompt.estimated_input_tokens}
+              </strong>{" "}
+              tokens，在预留回答空间后可用输入上限约{" "}
+              <strong className="text-foreground">
+                {chairmanContextPrompt.max_input_tokens}
+              </strong>{" "}
+              tokens（模型总上下文 {chairmanContextPrompt.context_limit}）。
+              Stage 3 已暂缓执行；请选择上下文更大的模型后重试，或强制使用当前模型（可能被截断或报错）。
+            </p>
+            <div className="mt-4 space-y-2">
+              <Label htmlFor="chairman-pick">改用主席模型</Label>
+              <Select
+                value={chairmanPromptPick || undefined}
+                onValueChange={setChairmanPromptPick}
+              >
+                <SelectTrigger id="chairman-pick" className="w-full">
+                  <SelectValue placeholder="选择模型" />
+                </SelectTrigger>
+                <SelectContent>
+                  {chairmanContextPrompt.suggested_models.map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={chairmanDialogWorking}
+                onClick={() => setChairmanContextPrompt(null)}
+              >
+                稍后处理
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={chairmanDialogWorking}
+                onClick={() => void runChairmanForceCurrent()}
+              >
+                仍用当前主席强制尝试
+              </Button>
+              <Button
+                type="button"
+                disabled={
+                  chairmanDialogWorking || !chairmanPromptPick.trim()
+                }
+                onClick={() => void runChairmanRetryWithPick()}
+              >
+                {chairmanDialogWorking ? (
+                  <>
+                    <Loader2
+                      className="mr-2 size-4 animate-spin"
+                      aria-hidden
+                    />
+                    重跑中…
+                  </>
+                ) : (
+                  "用所选模型重跑 Stage 3"
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1504,7 +1788,7 @@ function WebFetchView({
           </div>
           <ul className="mt-1.5 list-none space-y-2 pl-0 text-xs">
             {data.sources.map((s, i) => (
-              <li key={`${s.url}-${i}`} className="break-words">
+              <li key={`${s.url}-${i}`} className="wrap-break-word">
                 <span className="tabular-nums text-muted-foreground">{i + 1}. </span>
                 <a
                   href={s.url}
@@ -1574,7 +1858,7 @@ function Stage1View({
             key={it.model}
             value={`s1-${idx}`}
             className={cn(
-              "max-w-[9rem] shrink-0 truncate text-xs transition-opacity duration-300",
+              "max-w-36 shrink-0 truncate text-xs transition-opacity duration-300",
               busyModel === it.model && "opacity-70",
             )}
             title={it.model}
@@ -1594,7 +1878,7 @@ function Stage1View({
             <div className="font-mono text-xs text-muted-foreground">{it.model}</div>
             <div
               className={cn(
-                "relative mt-2 min-h-[4rem] overflow-hidden rounded-md",
+                "relative mt-2 min-h-16 overflow-hidden rounded-md",
                 isBusy && "ring-2 ring-status-running/40 ring-offset-2 ring-offset-background",
               )}
             >
@@ -1673,7 +1957,7 @@ function Stage2View({
           <TabsTrigger
             key={it.model}
             value={`s2-${idx}`}
-            className="max-w-[9rem] shrink-0 truncate text-xs"
+            className="max-w-36 shrink-0 truncate text-xs"
             title={it.model}
           >
             {modelShortName(it.model)}
@@ -1705,7 +1989,7 @@ function Stage2View({
           className="mt-2 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
         >
           <div className="font-mono text-xs text-muted-foreground">{it.model}</div>
-          <pre className="mt-2 min-h-[6rem] whitespace-pre-wrap rounded-md bg-muted/60 p-2 text-xs leading-relaxed">
+          <pre className="mt-2 min-h-24 whitespace-pre-wrap rounded-md bg-muted/60 p-2 text-xs leading-relaxed">
             {it.ranking}
           </pre>
           <div className="mt-2 text-xs text-muted-foreground">
@@ -1727,9 +2011,9 @@ function Stage3View({
   loading: boolean;
 }) {
   const fullText = data?.response ?? "";
-  const [displayed, setDisplayed] = useState("");
   const idxRef = useRef(0);
   const hasSeenStreamRef = useRef(false);
+  const [displayed, setDisplayed] = useState("");
 
   const streaming = Boolean(loading && data);
   const waitingStage3 = Boolean(loading && !data);
@@ -1741,20 +2025,16 @@ function Stage3View({
 
     if (loading) hasSeenStreamRef.current = true;
 
-    const isHistory =
-      !loading &&
-      !hasSeenStreamRef.current &&
-      fullText.length > 0;
-
-    if (isHistory) {
-      setDisplayed(fullText);
-      idxRef.current = fullText.length;
-      return;
-    }
-
     let cancelled = false;
     const run = () => {
       if (cancelled) return;
+
+      if (!hasSeenStreamRef.current && !loading && fullText.length > 0) {
+        idxRef.current = fullText.length;
+        setDisplayed(fullText);
+        return;
+      }
+
       const tgt = fullText;
       const ld = loading;
 
@@ -1776,7 +2056,6 @@ function Stage3View({
         setDisplayed(tgt.slice(0, i));
       }
 
-      // 仅在有「可见 backlog」时继续帧循环；等新 SSE 会更新 fullText 并重新挂载 effect
       if (!cancelled && idxRef.current < tgt.length) {
         requestAnimationFrame(run);
       }
@@ -1789,11 +2068,10 @@ function Stage3View({
     };
   }, [data, fullText, loading]);
 
-  usePinnedBottomAutoscroll(scrollContainerRef, [
-    displayed,
-    loading,
-    fullText.length,
-  ]);
+  usePinnedBottomAutoscroll(
+    scrollContainerRef,
+    `${displayed.length}|${loading}|${fullText.length}`,
+  );
 
   if (waitingStage3)
     return (

@@ -1,8 +1,10 @@
 import {
   CHAIRMAN_MODEL,
   COUNCIL_MODELS,
+  CHAIRMAN_OUTPUT_RESERVE_TOKENS,
   TITLE_MODEL,
   WEB_FETCH_MODEL,
+  resolveChairmanContextLimit,
 } from "./config.js";
 import {
   getWebSearchTemporalContext,
@@ -46,15 +48,20 @@ export type CouncilRunOptions = {
   webFetchModel?: string;
   /** Weight of each judge model's vote in Stage2 aggregate (default 1) */
   judgeWeights?: Record<string, number>;
+  /** 由前端传入的用户 API Key */
+  apiKey?: string;
+  signal?: AbortSignal;
 };
 
-function queryOpts(useWebSearch?: boolean): QueryOptions {
-  return { useWebSearch: Boolean(useWebSearch) };
+function queryOpts(useWebSearch?: boolean, apiKey?: string): QueryOptions {
+  return { useWebSearch: Boolean(useWebSearch), apiKey };
 }
 
 export async function stageWebFetch(
   userQuery: string,
   modelOverride?: string,
+  apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<WebFetchResult> {
   const model = modelOverride?.trim() || WEB_FETCH_MODEL;
   const t = getWebSearchTemporalContext();
@@ -108,6 +115,8 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
     webMaxResults: 10,
     timeoutMs: 180_000,
     webSearchTemporalContext: t,
+    apiKey,
+    signal,
   });
 
   if (!response) {
@@ -146,6 +155,8 @@ export async function stage1CollectResponses(
   useWebSearch?: boolean,
   webContext?: string,
   webRetrievalMeta?: WebRetrievalMeta,
+  apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<Stage1Item[]> {
   let userContent = userQuery;
   if (webContext) {
@@ -169,7 +180,7 @@ ${userQuery}`;
   }
 
   const messages: ChatMessage[] = [{ role: "user", content: userContent }];
-  const opts = webContext ? {} : queryOpts(useWebSearch);
+  const opts = webContext ? { apiKey, signal } : { ...queryOpts(useWebSearch, apiKey), signal };
   const responses = await queryModelsParallel(COUNCIL_MODELS, messages, opts);
 
   const stage1: Stage1Item[] = [];
@@ -189,6 +200,8 @@ export async function stage2CollectRankings(
   userQuery: string,
   stage1Results: Stage1Item[],
   useWebSearch?: boolean,
+  apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<[Stage2Item[], Record<string, string>]> {
   const labels = stage1Results.map((_, i) => String.fromCharCode(65 + i));
 
@@ -241,7 +254,7 @@ Now provide your evaluation and ranking:`;
   const responses = await queryModelsParallel(
     COUNCIL_MODELS,
     messages,
-    queryOpts(useWebSearch),
+    { ...queryOpts(useWebSearch, apiKey), signal },
   );
 
   const stage2: Stage2Item[] = [];
@@ -332,6 +345,123 @@ Your task as Chairman is to synthesize all of this information into a single, co
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:`;
 }
 
+/** 混合中英文的粗略 token 估算（偏保守，减少「该拦未拦」） */
+export function estimateTextTokens(text: string): number {
+  let latin = 0;
+  let cjk = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0x4e00 && c <= 0x9fff) cjk++;
+    else if (c >= 0x3040 && c <= 0x30ff) cjk++;
+    else if (c >= 0xac00 && c <= 0xd7a3) cjk++;
+    else latin++;
+  }
+  return Math.ceil(latin / 4 + cjk / 1.6);
+}
+
+export type ChairmanContextAnalysis = {
+  chairman_model: string;
+  estimated_input_tokens: number;
+  context_limit: number;
+  max_input_tokens: number;
+  exceeds: boolean;
+};
+
+export function analyzeChairmanContext(
+  userQuery: string,
+  stage1Results: Stage1Item[],
+  stage2Results: Stage2Item[],
+  chairmanModel: string | undefined,
+  judgeWeights?: Record<string, number>,
+  labelToModel?: Record<string, string>,
+): ChairmanContextAnalysis {
+  const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
+  const prompt = buildChairmanUserContent(
+    userQuery,
+    stage1Results,
+    stage2Results,
+    judgeWeights,
+    labelToModel,
+  );
+  const estimated =
+    estimateTextTokens(prompt) +
+    128; /* system/tool 等小额开销 */
+  const context_limit = resolveChairmanContextLimit(chair);
+  const max_input_tokens = Math.max(
+    4096,
+    context_limit - CHAIRMAN_OUTPUT_RESERVE_TOKENS,
+  );
+  return {
+    chairman_model: chair,
+    estimated_input_tokens: estimated,
+    context_limit,
+    max_input_tokens,
+    exceeds: estimated > max_input_tokens,
+  };
+}
+
+/** 按上下文从大到小，返回估算输入能放得下的候选主席模型 */
+export function suggestChairmanModelsThatFit(
+  estimatedInputTokens: number,
+  candidates: string[],
+): string[] {
+  const uniq = [...new Set(candidates.map((m) => m.trim()).filter(Boolean))];
+  const maxIn = (model: string) =>
+    Math.max(
+      4096,
+      resolveChairmanContextLimit(model) - CHAIRMAN_OUTPUT_RESERVE_TOKENS,
+    );
+  const fits = uniq.filter((m) => maxIn(m) >= estimatedInputTokens);
+  fits.sort((a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a));
+  return fits;
+}
+
+function chairmanBlockedResponseMarkdown(a: ChairmanContextAnalysis): string {
+  return [
+    "当前**主席模型**的最终合成（Stage 3）**未执行**：",
+    "",
+    `- 估算合成输入约 **${a.estimated_input_tokens}** tokens`,
+    `- 模型总上下文 **${a.context_limit}** tokens，扣除回答预留后可用输入约 **${a.max_input_tokens}** tokens`,
+    "",
+    "请在侧栏设置中更换**上下文更大**的主席模型，并在本回答的 **Stage 3** 面板点击「重跑 Stage 3」；若界面已弹出提示，可在提示中选择模型并一键重试，或使用「仍用当前主席强制尝试」（可能遭 API 截断或报错）。",
+  ].join("\n");
+}
+
+export type ChairmanStage3Gate =
+  | { proceed: true }
+  | {
+      proceed: false;
+      analysis: ChairmanContextAnalysis;
+      stage3: Stage3Result;
+    };
+
+export function gateChairmanStage3(
+  userQuery: string,
+  stage1Results: Stage1Item[],
+  stage2Results: Stage2Item[],
+  chairmanModel: string | undefined,
+  judgeWeights?: Record<string, number>,
+  labelToModel?: Record<string, string>,
+): ChairmanStage3Gate {
+  const analysis = analyzeChairmanContext(
+    userQuery,
+    stage1Results,
+    stage2Results,
+    chairmanModel,
+    judgeWeights,
+    labelToModel,
+  );
+  if (!analysis.exceeds) return { proceed: true };
+  return {
+    proceed: false,
+    analysis,
+    stage3: {
+      model: analysis.chairman_model,
+      response: chairmanBlockedResponseMarkdown(analysis),
+    },
+  };
+}
+
 export async function stage3SynthesizeFinal(
   userQuery: string,
   stage1Results: Stage1Item[],
@@ -340,6 +470,8 @@ export async function stage3SynthesizeFinal(
   useWebSearch?: boolean,
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
+  apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<Stage3Result> {
   const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
 
@@ -352,7 +484,10 @@ export async function stage3SynthesizeFinal(
   );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
-  const response = await queryModel(chair, messages, queryOpts(useWebSearch));
+  const response = await queryModel(chair, messages, {
+    ...queryOpts(useWebSearch, apiKey),
+    signal,
+  });
 
   if (response == null) {
     return {
@@ -377,6 +512,8 @@ export async function stage3SynthesizeFinalStream(
   judgeWeights: Record<string, number> | undefined,
   labelToModel: Record<string, string> | undefined,
   onDelta: (chunk: string) => void,
+  apiKey?: string,
+  signal?: AbortSignal,
 ): Promise<Stage3Result> {
   const chair = chairmanModel?.trim() || CHAIRMAN_MODEL;
 
@@ -390,8 +527,9 @@ export async function stage3SynthesizeFinalStream(
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
   const response = await queryModelStream(chair, messages, {
-    ...queryOpts(useWebSearch),
+    ...queryOpts(useWebSearch, apiKey),
     onDelta,
+    signal,
   });
 
   if (response == null) {
@@ -470,7 +608,11 @@ export function calculateAggregateRankings(
   return aggregate;
 }
 
-export async function generateConversationTitle(userQuery: string): Promise<string> {
+export async function generateConversationTitle(
+  userQuery: string,
+  apiKey?: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const titlePrompt = `Generate a very short title (3-5 words maximum) that summarizes the following question.
 The title should be concise and descriptive. Do not use quotes or punctuation in the title.
 
@@ -479,7 +621,11 @@ Question: ${userQuery}
 Title:`;
 
   const messages: ChatMessage[] = [{ role: "user", content: titlePrompt }];
-  const response = await queryModel(TITLE_MODEL, messages, { timeoutMs: 30_000 });
+  const response = await queryModel(TITLE_MODEL, messages, {
+    timeoutMs: 30_000,
+    apiKey,
+    signal,
+  });
 
   if (response == null) return "New Conversation";
 
@@ -511,12 +657,24 @@ export async function runFullCouncil(
   { label_to_model: Record<string, string>; aggregate_rankings: AggregateRanking[] },
   WebFetchResult | undefined,
 ]> {
-  const { chairmanModel, useWebSearch, judgeWeights, webFetchModel } = options;
+  const {
+    chairmanModel,
+    useWebSearch,
+    judgeWeights,
+    webFetchModel,
+    apiKey,
+    signal,
+  } = options;
 
   let webFetchResult: WebFetchResult | undefined;
   let webContext: string | undefined;
   if (useWebSearch) {
-    webFetchResult = await stageWebFetch(userQuery, webFetchModel);
+    webFetchResult = await stageWebFetch(
+      userQuery,
+      webFetchModel,
+      apiKey,
+      signal,
+    );
     if (!webFetchResult.webSearchSkipped) {
       webContext = webFetchResult.content;
     }
@@ -532,6 +690,8 @@ export async function runFullCouncil(
           unixSeconds: webFetchResult.retrievedAtUnixSeconds ?? 0,
         }
       : undefined,
+    apiKey,
+    signal,
   );
   if (stage1Results.length === 0) {
     return [
@@ -550,21 +710,35 @@ export async function runFullCouncil(
     userQuery,
     stage1Results,
     useWebSearch,
+    apiKey,
+    signal,
   );
   const aggregateRankings = calculateAggregateRankings(
     stage2Results,
     labelToModel,
     judgeWeights,
   );
-  const stage3Result = await stage3SynthesizeFinal(
+  const gate = gateChairmanStage3(
     userQuery,
     stage1Results,
     stage2Results,
     chairmanModel,
-    useWebSearch,
     judgeWeights,
     labelToModel,
   );
+  const stage3Result = gate.proceed
+    ? await stage3SynthesizeFinal(
+        userQuery,
+        stage1Results,
+        stage2Results,
+        chairmanModel,
+        useWebSearch,
+        judgeWeights,
+        labelToModel,
+        apiKey,
+        signal,
+      )
+    : gate.stage3;
 
   return [
     stage1Results,

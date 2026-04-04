@@ -1,6 +1,27 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 
+const API_KEY_STORAGE = "llm-council-search-openrouter-key";
+
+export function getStoredApiKey(): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(API_KEY_STORAGE) ?? "";
+}
+
+export function setStoredApiKey(key: string): void {
+  if (typeof window === "undefined") return;
+  if (key.trim()) {
+    localStorage.setItem(API_KEY_STORAGE, key.trim());
+  } else {
+    localStorage.removeItem(API_KEY_STORAGE);
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const key = getStoredApiKey();
+  return key ? { "X-OpenRouter-Key": key } : {};
+}
+
 export type ConversationMeta = {
   id: string;
   created_at: string;
@@ -17,11 +38,14 @@ export type Conversation = {
 
 export type ApiConfig = {
   council_models: string[];
-  /** 推荐用于 OpenRouter 联网（web 插件）的模型 ID */
+  /** 推荐用于 OpenRouter 联网（`openrouter:web_search`）的模型 ID */
   web_search_models?: string[];
   chairman_model: string;
   title_model: string;
   web_fetch_model?: string;
+  /** 已知模型的大致上下文上限（tokens），用于主席阶段预估 */
+  chairman_context_limits?: Record<string, number>;
+  chairman_output_reserve_tokens?: number;
 };
 
 export async function fetchConfig(): Promise<ApiConfig> {
@@ -39,7 +63,7 @@ export async function listConversations(): Promise<ConversationMeta[]> {
 export async function createConversation(): Promise<Conversation> {
   const res = await fetch(`${API_BASE}/api/conversations`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({}),
   });
   if (!res.ok) throw new Error("Failed to create conversation");
@@ -75,7 +99,7 @@ export async function sendMessage(
     `${API_BASE}/api/conversations/${conversationId}/message`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
@@ -94,12 +118,14 @@ export async function sendMessageStream(
   content: string,
   onEvent: (type: string, event: Record<string, unknown>) => void,
   options?: SendOptions,
+  signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch(
     `${API_BASE}/api/conversations/${conversationId}/message/stream`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      signal,
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
@@ -142,6 +168,8 @@ export type RerunOpts = {
   use_web_search?: boolean;
   chairman_model?: string;
   judge_weights?: Record<string, number>;
+  /** 跳过主席上下文检查并强制调用 Stage3 */
+  skip_chairman_context_check?: boolean;
 };
 
 export async function rerunStage1(
@@ -153,7 +181,7 @@ export async function rerunStage1(
     `${API_BASE}/api/conversations/${conversationId}/messages/${msgIndex}/rerun-stage1`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
       }),
@@ -179,7 +207,7 @@ export async function rerunStage1Model(
     `${API_BASE}/api/conversations/${conversationId}/messages/${msgIndex}/rerun-stage1-model`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         model,
         use_web_search: opts?.use_web_search,
@@ -206,7 +234,7 @@ export async function rerunStage2(
     `${API_BASE}/api/conversations/${conversationId}/messages/${msgIndex}/rerun-stage2`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
         judge_weights: opts?.judge_weights,
@@ -244,16 +272,35 @@ export async function rerunStage3(
     `${API_BASE}/api/conversations/${conversationId}/messages/${msgIndex}/rerun-stage3`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
         chairman_model: opts?.chairman_model,
         judge_weights: opts?.judge_weights,
+        skip_chairman_context_check: opts?.skip_chairman_context_check,
       }),
     },
   );
   if (!res.ok) {
-    const j = (await res.json().catch(() => ({}))) as { detail?: string };
+    const j = (await res.json().catch(() => ({}))) as {
+      detail?: string;
+      chairman_context?: {
+        chairman_model: string;
+        estimated_input_tokens: number;
+        context_limit: number;
+        max_input_tokens: number;
+      };
+      suggested_models?: string[];
+    };
+    if (res.status === 409 && j.detail === "chairman_context_exceeded") {
+      const hint =
+        j.chairman_context && j.suggested_models?.length
+          ? ` 建议改用：${j.suggested_models.slice(0, 5).join("、")}`
+          : "";
+      throw new Error(
+        `主席模型上下文可能不足（估算输入约 ${j.chairman_context?.estimated_input_tokens ?? "?"} tokens，可用上限约 ${j.chairman_context?.max_input_tokens ?? "?"}）。请在设置中更换主席模型后重试，或使用弹窗中的「强制尝试」。${hint}`,
+      );
+    }
     throw new Error(j.detail ?? "Rerun stage3 failed");
   }
   return res.json() as Promise<{

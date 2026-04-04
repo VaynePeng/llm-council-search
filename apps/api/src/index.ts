@@ -4,13 +4,17 @@ import { cors } from "hono/cors";
 import {
   API_PORT,
   CHAIRMAN_MODEL,
+  CHAIRMAN_OUTPUT_RESERVE_TOKENS,
   COUNCIL_MODELS,
   TITLE_MODEL,
   WEB_FETCH_MODEL,
   WEB_SEARCH_MODELS,
+  chairmanContextLimitsForApi,
+  resolveChairmanContextLimit,
 } from "./config.js";
 import {
   calculateAggregateRankings,
+  gateChairmanStage3,
   generateConversationTitle,
   labelToModelFromStage1,
   runFullCouncil,
@@ -19,6 +23,7 @@ import {
   stage3SynthesizeFinal,
   stage3SynthesizeFinalStream,
   stageWebFetch,
+  suggestChairmanModelsThatFit,
 } from "./council.js";
 import { withConversationLock } from "./lock.js";
 import { queryModel } from "./openrouter.js";
@@ -33,6 +38,7 @@ import {
   listConversations,
   saveConversation,
   updateConversationTitle,
+  type Stage3Result,
 } from "./storage.js";
 
 const app = new Hono();
@@ -58,6 +64,8 @@ app.get("/api/config", (c) =>
     chairman_model: CHAIRMAN_MODEL,
     title_model: TITLE_MODEL,
     web_fetch_model: WEB_FETCH_MODEL,
+    chairman_context_limits: chairmanContextLimitsForApi(),
+    chairman_output_reserve_tokens: CHAIRMAN_OUTPUT_RESERVE_TOKENS,
   }),
 );
 
@@ -85,6 +93,10 @@ app.delete("/api/conversations/:id", async (c) => {
   if (!ok) return c.json({ detail: "Conversation not found" }, 404);
   return c.body(null, 204);
 });
+
+function extractApiKey(c: { req: { header: (k: string) => string | undefined } }): string | undefined {
+  return c.req.header("x-openrouter-key")?.trim() || undefined;
+}
 
 type SendBody = {
   content?: string;
@@ -122,11 +134,16 @@ function parseWebFetchModel(body: { web_fetch_model?: string }): string | undefi
   return v || undefined;
 }
 
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: string })?.name === "AbortError";
+}
+
 app.post("/api/conversations/:id/message", async (c) => {
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
+  const apiKey = extractApiKey(c);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -142,7 +159,11 @@ app.post("/api/conversations/:id/message", async (c) => {
   });
 
   if (shouldGenerateTitle) {
-    const title = await generateConversationTitle(content);
+    const title = await generateConversationTitle(
+      content,
+      apiKey,
+      c.req.raw.signal,
+    );
     await withConversationLock(id, async () => {
       await updateConversationTitle(id, title);
     });
@@ -153,6 +174,8 @@ app.post("/api/conversations/:id/message", async (c) => {
     useWebSearch: body.use_web_search,
     webFetchModel: parseWebFetchModel(body),
     judgeWeights,
+    apiKey,
+    signal: c.req.raw.signal,
   });
 
   await withConversationLock(id, async () => {
@@ -181,6 +204,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
+  const apiKey = extractApiKey(c);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -197,20 +221,30 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const push = (obj: unknown) => controller.enqueue(sseLine(obj));
+      const requestSignal = c.req.raw.signal;
+      const ensureNotAborted = () => {
+        if (requestSignal.aborted) {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+      };
 
       try {
+        ensureNotAborted();
         await withConversationLock(id, async () => {
           await addUserMessage(id, content);
         });
 
         const titlePromise = shouldGenerateTitle
-          ? generateConversationTitle(content)
+          ? generateConversationTitle(content, apiKey, requestSignal)
           : null;
 
         void (async () => {
           if (!titlePromise) return;
           try {
             const title = await titlePromise;
+            ensureNotAborted();
             await withConversationLock(id, async () => {
               await updateConversationTitle(id, title);
             });
@@ -228,7 +262,12 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         let webContext: string | undefined;
         if (useWebSearch) {
           push({ type: "web_fetch_start" });
-          webFetchResult = await stageWebFetch(content, webFetchModel);
+          webFetchResult = await stageWebFetch(
+            content,
+            webFetchModel,
+            apiKey,
+            requestSignal,
+          );
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped) {
             webContext = webFetchResult.content;
@@ -246,6 +285,8 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
                 unixSeconds: webFetchResult.retrievedAtUnixSeconds ?? 0,
               }
             : undefined,
+          apiKey,
+          requestSignal,
         );
         push({ type: "stage1_complete", data: stage1Results });
 
@@ -254,6 +295,8 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           content,
           stage1Results,
           useWebSearch,
+          apiKey,
+          requestSignal,
         );
         const aggregateRankings = calculateAggregateRankings(
           stage2Results,
@@ -270,34 +313,98 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         });
 
         const chairModel = chairmanModel?.trim() || CHAIRMAN_MODEL;
-        push({ type: "stage3_start", data: { model: chairModel } });
-        const stage3Result = await stage3SynthesizeFinalStream(
+        const gate = gateChairmanStage3(
           content,
           stage1Results,
           stage2Results,
           chairmanModel,
-          useWebSearch,
           judgeWeights,
           labelToModel,
-          (delta) => push({ type: "stage3_delta", data: { delta } }),
         );
-        push({ type: "stage3_complete", data: stage3Result });
 
-        await withConversationLock(id, async () => {
-          await addAssistantMessage(
-            id,
+        let stage3Result: Stage3Result;
+
+        if (!gate.proceed) {
+          stage3Result = gate.stage3;
+          const candidates = [
+            ...COUNCIL_MODELS,
+            CHAIRMAN_MODEL,
+            gate.analysis.chairman_model,
+          ];
+          let suggested = suggestChairmanModelsThatFit(
+            gate.analysis.estimated_input_tokens,
+            candidates,
+          );
+          if (suggested.length === 0) {
+            suggested = [...new Set(candidates)].sort(
+              (a, b) =>
+                resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
+            );
+          }
+
+          ensureNotAborted();
+          await withConversationLock(id, async () => {
+            await addAssistantMessage(
+              id,
+              stage1Results,
+              stage2Results,
+              stage3Result,
+              {
+                label_to_model: labelToModel,
+                aggregate_rankings: aggregateRankings,
+              },
+              webFetchResult,
+            );
+          });
+
+          const convAfter = await getConversation(id);
+          const msgIndex = convAfter ? convAfter.messages.length - 1 : -1;
+          push({
+            type: "chairman_context_prompt",
+            data: {
+              message_index: msgIndex,
+              chairman_model: gate.analysis.chairman_model,
+              estimated_input_tokens: gate.analysis.estimated_input_tokens,
+              context_limit: gate.analysis.context_limit,
+              max_input_tokens: gate.analysis.max_input_tokens,
+              suggested_models: suggested,
+              stage3: stage3Result,
+            },
+          });
+        } else {
+          push({ type: "stage3_start", data: { model: chairModel } });
+          stage3Result = await stage3SynthesizeFinalStream(
+            content,
             stage1Results,
             stage2Results,
-            stage3Result,
-            {
-              label_to_model: labelToModel,
-              aggregate_rankings: aggregateRankings,
-            },
-            webFetchResult,
+            chairmanModel,
+            useWebSearch,
+            judgeWeights,
+            labelToModel,
+            (delta) => push({ type: "stage3_delta", data: { delta } }),
+            apiKey,
+            requestSignal,
           );
-        });
+          push({ type: "stage3_complete", data: stage3Result });
+
+          ensureNotAborted();
+          await withConversationLock(id, async () => {
+            await addAssistantMessage(
+              id,
+              stage1Results,
+              stage2Results,
+              stage3Result,
+              {
+                label_to_model: labelToModel,
+                aggregate_rankings: aggregateRankings,
+              },
+              webFetchResult,
+            );
+          });
+        }
         push({ type: "complete" });
       } catch (e) {
+        if (isAbortError(e)) return;
         push({
           type: "error",
           message: e instanceof Error ? e.message : String(e),
@@ -324,6 +431,8 @@ type RerunBody = {
   final_model?: string;
   judge_weights?: Record<string, number>;
   weights?: Record<string, number>;
+  /** 为 true 时跳过主席上下文检查并强制调用 Stage3（可能遭 API 截断或报错） */
+  skip_chairman_context_check?: boolean;
 };
 
 function parseMsgIndex(c: { req: { param: (k: string) => string } }): number {
@@ -337,6 +446,7 @@ app.post(
     const id = c.req.param("id");
     const msgIndex = parseMsgIndex(c);
     if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+    const apiKey = extractApiKey(c);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
     const model = body.model?.trim();
@@ -357,7 +467,7 @@ app.post(
       const res = await queryModel(
         model,
         [{ role: "user", content: userQuery }],
-        { useWebSearch: body.use_web_search },
+        { useWebSearch: body.use_web_search, apiKey },
       );
 
       const stage1 = [...msg.stage1];
@@ -402,6 +512,7 @@ app.post(
     const id = c.req.param("id");
     const msgIndex = parseMsgIndex(c);
     if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+    const apiKey = extractApiKey(c);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
 
@@ -432,6 +543,8 @@ app.post(
               unixSeconds: msg.webFetch.retrievedAtUnixSeconds ?? 0,
             }
           : undefined,
+        apiKey,
+        c.req.raw.signal,
       );
 
       msg.stage1 = stage1;
@@ -459,6 +572,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
   const id = c.req.param("id");
   const msgIndex = parseMsgIndex(c);
   if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+  const apiKey = extractApiKey(c);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const judgeWeights = parseJudgeWeights(body);
@@ -480,6 +594,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
       userQuery,
       msg.stage1,
       body.use_web_search,
+      apiKey,
     );
     const aggregate_rankings = calculateAggregateRankings(
       stage2,
@@ -524,6 +639,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
   const id = c.req.param("id");
   const msgIndex = parseMsgIndex(c);
   if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+  const apiKey = extractApiKey(c);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const judgeWeights = parseJudgeWeights(body);
@@ -541,6 +657,41 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
     if (!userQuery) return { error: "no preceding user message" as const };
 
     const labelToModel = labelToModelFromStage1(msg.stage1);
+    const skipCtx = Boolean(body.skip_chairman_context_check);
+    const gate = skipCtx
+      ? ({ proceed: true as const })
+      : gateChairmanStage3(
+          userQuery,
+          msg.stage1,
+          msg.stage2,
+          parseChairman(body),
+          judgeWeights,
+          labelToModel,
+        );
+
+    if (!gate.proceed) {
+      const candidates = [
+        ...COUNCIL_MODELS,
+        CHAIRMAN_MODEL,
+        gate.analysis.chairman_model,
+      ];
+      let suggested = suggestChairmanModelsThatFit(
+        gate.analysis.estimated_input_tokens,
+        candidates,
+      );
+      if (suggested.length === 0) {
+        suggested = [...new Set(candidates)].sort(
+          (a, b) =>
+            resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
+        );
+      }
+      return {
+        blocked: true as const,
+        chairman_context: gate.analysis,
+        suggested_models: suggested,
+      };
+    }
+
     const stage3 = await stage3SynthesizeFinal(
       userQuery,
       msg.stage1,
@@ -549,6 +700,7 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
       body.use_web_search,
       judgeWeights,
       labelToModel,
+      apiKey,
     );
 
     msg.stage3 = stage3;
@@ -569,6 +721,17 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
     return c.json({ detail: "message is not assistant" }, 400);
   if (result.error === "no preceding user message")
     return c.json({ detail: "no preceding user message" }, 400);
+
+  if ("blocked" in result && result.blocked) {
+    return c.json(
+      {
+        detail: "chairman_context_exceeded",
+        chairman_context: result.chairman_context,
+        suggested_models: result.suggested_models,
+      },
+      409,
+    );
+  }
 
   return c.json(result);
 });

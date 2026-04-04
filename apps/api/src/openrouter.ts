@@ -40,15 +40,15 @@ function parseUrlCitations(message: Record<string, unknown>): UrlCitationItem[] 
 export function getWebSearchTemporalContext(now: Date = new Date()) {
   const isoUtc = now.toISOString();
   const unixSeconds = Math.floor(now.getTime() / 1000);
-  const pluginSearchPrompt =
-    `A web search was conducted at ${isoUtc} (ISO 8601, UTC). ` +
+  const webSearchInstruction =
+    `When you use the OpenRouter web search tool, anchor retrieval time to ${isoUtc} (ISO 8601, UTC). ` +
     `Unix epoch seconds: ${unixSeconds}. Do not assume the end user's local timezone; use this UTC anchor only. ` +
     `Prefer sources that are current as of this instant or clearly published recently; ` +
     `treat undated, undiscoverable-publish-date, or obviously stale pages as weaker evidence when the user needs up-to-date facts. ` +
-    `Incorporate the following web search results into your response.\n\n` +
-    `IMPORTANT: Cite them using markdown links named using the domain of the source.\n` +
+    `Ground claims in the search results you obtain; do not invent URLs.\n\n` +
+    `IMPORTANT: Cite sources using markdown links named with the source domain.\n` +
     `Example: [nytimes.com](https://nytimes.com/some-page).`;
-  return { isoUtc, unixSeconds, pluginSearchPrompt };
+  return { isoUtc, unixSeconds, webSearchInstruction };
 }
 
 export type WebSearchTemporalContext = ReturnType<typeof getWebSearchTemporalContext>;
@@ -56,68 +56,125 @@ export type WebSearchTemporalContext = ReturnType<typeof getWebSearchTemporalCon
 export type QueryOptions = {
   timeoutMs?: number;
   useWebSearch?: boolean;
-  /** OpenRouter web plugin `max_results` (default 5) */
+  /** `openrouter:web_search` 的 `max_results`（默认 5） */
   webMaxResults?: number;
-  /** 与聊天提示词共用同一时间锚，避免 search_prompt 与 user 消息不一致 */
+  /** 与聊天提示词共用同一时间锚，与注入的 system 补充说明一致 */
   webSearchTemporalContext?: WebSearchTemporalContext;
+  /** 由前端传入的用户 API Key，优先于 .env 中的 OPENROUTER_API_KEY */
+  apiKey?: string;
+  /** 外部取消信号，例如客户端中止会话流时同步中断上游请求 */
+  signal?: AbortSignal;
 };
 
-/** `:online` 与 `plugins: [{ id: "web" }]` 等价；我们统一用插件并带 `max_results`，故去掉后缀避免重复触发联网。 */
+function abortError(): Error {
+  const err = new Error("Aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function createRequestSignal(
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onAbort);
+      }
+    },
+  };
+}
+
+/** `:online` 变体与显式联网二选一即可；去掉后缀避免与 `openrouter:web_search` 重复触发。 */
 function stripOnlineSuffix(model: string): string {
   return model.endsWith(":online") ? model.slice(0, -":online".length) : model;
 }
 
-/** OpenRouter：仅 OpenAI / Anthropic / Perplexity / xAI 走原生搜索；其余应走 Exa，否则部分模型（如 Google）会报错或无法附加检索。 */
-function webPluginPayload(
+/** OpenRouter：仅 OpenAI / Anthropic / Perplexity / xAI 适合 `native`/`auto`；其余强制 Exa，避免部分模型（如 Google）原生检索异常。 */
+function webSearchToolsPayload(
   model: string,
   maxResults: number,
-  temporal?: WebSearchTemporalContext,
 ): Array<Record<string, unknown>> {
-  const max = Math.min(20, Math.max(1, maxResults));
+  const max = Math.min(25, Math.max(1, maxResults));
   const m = stripOnlineSuffix(model).toLowerCase();
-  const plugin: Record<string, unknown> = { id: "web", max_results: max };
   const nativePrefix =
     m.startsWith("openai/") ||
     m.startsWith("anthropic/") ||
     m.startsWith("perplexity/") ||
     m.startsWith("x-ai/");
+  const parameters: Record<string, unknown> = { max_results: max };
   if (!nativePrefix) {
-    plugin.engine = "exa";
+    parameters.engine = "exa";
   }
+  return [{ type: "openrouter:web_search", parameters }];
+}
+
+/** 服务端工具无 `search_prompt`，将时区与引用规则写入 system（与首条 system 合并）。 */
+function withWebSearchSystemInstruction(
+  messages: ChatMessage[],
+  temporal?: WebSearchTemporalContext,
+): ChatMessage[] {
   const t = temporal ?? getWebSearchTemporalContext();
-  plugin.search_prompt = t.pluginSearchPrompt;
-  return [plugin];
+  const block = t.webSearchInstruction;
+  const first = messages[0];
+  if (first?.role === "system") {
+    return [
+      { role: "system", content: `${first.content}\n\n${block}` },
+      ...messages.slice(1),
+    ];
+  }
+  return [{ role: "system", content: block }, ...messages];
 }
 
 function chatRequestBody(
   model: string,
   messages: ChatMessage[],
-  plugins: Array<Record<string, unknown>> | undefined,
+  tools: Array<Record<string, unknown>> | undefined,
   stream: boolean,
 ): Record<string, unknown> {
   return {
     model,
     messages,
     stream,
-    ...(plugins && plugins.length > 0 ? { plugins } : {}),
+    ...(tools && tools.length > 0 ? { tools } : {}),
   };
+}
+
+function resolveApiKey(override?: string): string {
+  return override?.trim() || OPENROUTER_API_KEY;
 }
 
 async function doFetch(
   model: string,
   messages: ChatMessage[],
-  plugins: Array<Record<string, unknown>> | undefined,
+  tools: Array<Record<string, unknown>> | undefined,
   signal: AbortSignal,
+  apiKey?: string,
 ): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
   return fetch(OPENROUTER_API_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(chatRequestBody(model, messages, plugins, false)),
+    body: JSON.stringify(chatRequestBody(model, messages, tools, false)),
     signal,
   });
 }
@@ -125,18 +182,19 @@ async function doFetch(
 async function doFetchStream(
   model: string,
   messages: ChatMessage[],
-  plugins: Array<Record<string, unknown>> | undefined,
+  tools: Array<Record<string, unknown>> | undefined,
   signal: AbortSignal,
+  apiKey?: string,
 ): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
   return fetch(OPENROUTER_API_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(chatRequestBody(model, messages, plugins, true)),
+    body: JSON.stringify(chatRequestBody(model, messages, tools, true)),
     signal,
   });
 }
@@ -205,21 +263,22 @@ export async function queryModel(
     useWebSearch = false,
     webMaxResults = 5,
     webSearchTemporalContext,
+    apiKey,
+    signal,
   } = options;
 
   const effectiveModel =
     useWebSearch ? stripOnlineSuffix(model) : model;
 
-  const webPlugins = useWebSearch
-    ? webPluginPayload(
-        effectiveModel,
-        webMaxResults,
-        webSearchTemporalContext,
-      )
+  const payloadMessages = useWebSearch
+    ? withWebSearchSystemInstruction(messages, webSearchTemporalContext)
+    : messages;
+
+  const webTools = useWebSearch
+    ? webSearchToolsPayload(effectiveModel, webMaxResults)
     : undefined;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const request = createRequestSignal(timeoutMs, signal);
 
   const parseSuccess = async (
     res: Response,
@@ -252,8 +311,9 @@ export async function queryModel(
   };
 
   try {
+    throwIfAborted(signal);
     if (useWebSearch) {
-      let withPlugin: {
+      let withWebSearchTool: {
         content: string;
         reasoning_details?: unknown;
         citations?: UrlCitationItem[];
@@ -261,34 +321,36 @@ export async function queryModel(
       try {
         const resWith = await doFetch(
           effectiveModel,
-          messages,
-          webPlugins,
-          controller.signal,
+          payloadMessages,
+          webTools,
+          request.signal,
+          apiKey,
         );
-        withPlugin = await parseSuccess(resWith);
+        withWebSearchTool = await parseSuccess(resWith);
       } catch (e) {
         console.warn(
           `[OpenRouter] Web search request threw for ${effectiveModel}:`,
           e,
         );
       }
-      if (withPlugin) {
+      if (withWebSearchTool) {
         return {
-          content: withPlugin.content,
-          reasoning_details: withPlugin.reasoning_details,
-          citations: withPlugin.citations,
+          content: withWebSearchTool.content,
+          reasoning_details: withWebSearchTool.reasoning_details,
+          citations: withWebSearchTool.citations,
         };
       }
 
       console.warn(
-        `[OpenRouter] Web search request failed for ${effectiveModel}; retrying without web plugin.`,
+        `[OpenRouter] Web search request failed for ${effectiveModel}; retrying without web search tool.`,
       );
       try {
         const resNo = await doFetch(
           effectiveModel,
           messages,
           undefined,
-          controller.signal,
+          request.signal,
+          apiKey,
         );
         const fallback = await parseSuccess(resNo);
         if (fallback)
@@ -298,20 +360,27 @@ export async function queryModel(
           };
       } catch (e) {
         console.error(
-          `[OpenRouter] Fallback request without web failed for ${effectiveModel}:`,
+          `[OpenRouter] Fallback request without web search failed for ${effectiveModel}:`,
           e,
         );
       }
       return null;
     }
 
-    const res = await doFetch(effectiveModel, messages, undefined, controller.signal);
+    const res = await doFetch(
+      effectiveModel,
+      messages,
+      undefined,
+      request.signal,
+      apiKey,
+    );
     return parseSuccess(res);
   } catch (e) {
+    if ((e as { name?: string })?.name === "AbortError") throw e;
     console.error(`Error querying model ${model}:`, e);
     return null;
   } finally {
-    clearTimeout(timer);
+    request.cleanup();
   }
 }
 
@@ -321,7 +390,7 @@ export type QueryStreamOptions = QueryOptions & {
 
 /**
  * 流式调用模型（OpenRouter `stream: true`），通过 onDelta 推送正文增量。
- * 联网插件失败时会与非流式逻辑一致：重试无插件或整段回退到 queryModel。
+ * 联网失败时会与非流式逻辑一致：重试无 `openrouter:web_search` 或整段回退到 queryModel。
  */
 export async function queryModelStream(
   model: string,
@@ -339,6 +408,8 @@ export async function queryModelStream(
     useWebSearch = false,
     webMaxResults = 5,
     webSearchTemporalContext,
+    apiKey,
+    signal,
   } = options;
 
   const restQuery: QueryOptions = {
@@ -346,29 +417,31 @@ export async function queryModelStream(
     useWebSearch,
     webMaxResults,
     webSearchTemporalContext,
+    apiKey,
+    signal,
   };
 
   const effectiveModel = useWebSearch ? stripOnlineSuffix(model) : model;
-  const webPlugins = useWebSearch
-    ? webPluginPayload(
-        effectiveModel,
-        webMaxResults,
-        webSearchTemporalContext,
-      )
+  const payloadMessages = useWebSearch
+    ? withWebSearchSystemInstruction(messages, webSearchTemporalContext)
+    : messages;
+  const webTools = useWebSearch
+    ? webSearchToolsPayload(effectiveModel, webMaxResults)
     : undefined;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const request = createRequestSignal(timeoutMs, signal);
 
   const runStream = async (
-    plugins: Array<Record<string, unknown>> | undefined,
+    toSend: ChatMessage[],
+    tools: Array<Record<string, unknown>> | undefined,
   ): Promise<string | null> => {
     let accumulated = "";
     const res = await doFetchStream(
       effectiveModel,
-      messages,
-      plugins,
-      controller.signal,
+      toSend,
+      tools,
+      request.signal,
+      apiKey,
     );
     const ok = await consumeChatCompletionStream(res, (ch) => {
       accumulated += ch;
@@ -378,9 +451,10 @@ export async function queryModelStream(
   };
 
   try {
+    throwIfAborted(signal);
     if (useWebSearch) {
       try {
-        const acc = await runStream(webPlugins);
+        const acc = await runStream(payloadMessages, webTools);
         if (acc !== null) return { content: acc };
       } catch (e) {
         console.warn(
@@ -389,14 +463,14 @@ export async function queryModelStream(
         );
       }
       console.warn(
-        `[OpenRouter] Web search stream failed for ${effectiveModel}; retrying without web plugin.`,
+        `[OpenRouter] Web search stream failed for ${effectiveModel}; retrying without web search tool.`,
       );
       try {
-        const acc = await runStream(undefined);
+        const acc = await runStream(messages, undefined);
         if (acc !== null) return { content: acc, webSearchSkipped: true };
       } catch (e) {
         console.error(
-          `[OpenRouter] Stream without web failed for ${effectiveModel}:`,
+          `[OpenRouter] Stream without web search failed for ${effectiveModel}:`,
           e,
         );
       }
@@ -409,7 +483,7 @@ export async function queryModelStream(
     }
 
     try {
-      const acc = await runStream(undefined);
+      const acc = await runStream(messages, undefined);
       if (acc !== null) return { content: acc };
     } catch (e) {
       console.error(`[OpenRouter] Stream failed for ${effectiveModel}:`, e);
@@ -421,10 +495,11 @@ export async function queryModelStream(
     }
     return null;
   } catch (e) {
+    if ((e as { name?: string })?.name === "AbortError") throw e;
     console.error(`Error streaming model ${model}:`, e);
     return null;
   } finally {
-    clearTimeout(timer);
+    request.cleanup();
   }
 }
 

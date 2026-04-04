@@ -21,9 +21,8 @@ export const COUNCIL_MODELS: string[] = [
 ]
 
 /**
- * 适合搭配 OpenRouter `web` 插件 / `:online` 的模型（原生搜索或 Exa 等兜底）。
- * 文档亦提及可向 `openrouter:web_search` 服务端工具迁移；当前实现仍使用 `plugins: [{ id: "web" }]`。
- * @see https://openrouter.ai/docs/guides/features/plugins/web-search
+ * 适合搭配 OpenRouter `openrouter:web_search` 服务端工具 / `:online` 的模型（`auto` 原生或 Exa 等）。
+ * @see https://openrouter.ai/docs/guides/features/server-tools/web-search
  */
 export const WEB_SEARCH_MODELS: string[] = [
   'openai/gpt-5.1:online',
@@ -38,9 +37,34 @@ export const WEB_SEARCH_MODELS: string[] = [
 export const CHAIRMAN_MODEL =
   process.env.CHAIRMAN_MODEL ?? 'google/gemini-3.1-pro-preview'
 
+/**
+ * 各主席模型总上下文（tokens，近似值，用于 Stage3 输入预估）。
+ * 未列出的模型使用 DEFAULT_CHAIRMAN_CONTEXT_LIMIT；`:online` 等后缀会回退到去后缀 id。
+ */
+export const CHAIRMAN_CONTEXT_LIMITS: Record<string, number> = {
+  'openai/gpt-5.1': 272_000,
+  'google/gemini-3.1-pro-preview': 1_048_576,
+  'anthropic/claude-sonnet-4.5': 200_000,
+}
+
+export const DEFAULT_CHAIRMAN_CONTEXT_LIMIT = 128_000
+
+/** 为 Stage3 回答预留的 tokens，从总上下文中扣除后得到可用输入上限 */
+export const CHAIRMAN_OUTPUT_RESERVE_TOKENS = 16_384
+
+export function resolveChairmanContextLimit(modelId: string): number {
+  const m = modelId.trim()
+  if (CHAIRMAN_CONTEXT_LIMITS[m]) return CHAIRMAN_CONTEXT_LIMITS[m]
+  const base = m.replace(/:online$/i, '')
+  if (base !== m && CHAIRMAN_CONTEXT_LIMITS[base]) {
+    return CHAIRMAN_CONTEXT_LIMITS[base]
+  }
+  return DEFAULT_CHAIRMAN_CONTEXT_LIMIT
+}
+
 export const TITLE_MODEL = process.env.TITLE_MODEL ?? 'google/gemini-2.5-flash'
 
-/** 默认用 `:online`，与 OpenRouter web 插件等价且对 OpenAI 原生联网最稳；Gemini 无 `:online` 时需依赖 Exa（见 openrouter.ts `engine: "exa"`）。 */
+/** 默认用 `:online` 模型名；实现上会去掉后缀并显式启用 `openrouter:web_search`。OpenAI 等走 `auto` 原生检索；Gemini 等在 openrouter.ts 中强制 `engine: "exa"`。 */
 export const WEB_FETCH_MODEL =
   process.env.WEB_FETCH_MODEL ?? 'openai/gpt-5.1:online'
 
@@ -49,3 +73,8 @@ export const DATA_DIR = path.resolve(
 )
 
 export const API_PORT = Number(process.env.PORT ?? '8001')
+
+/** 供前端展示「已知上下文上限」的模型表（与 CHAIRMAN_CONTEXT_LIMITS 一致即可） */
+export function chairmanContextLimitsForApi(): Record<string, number> {
+  return { ...CHAIRMAN_CONTEXT_LIMITS }
+}
