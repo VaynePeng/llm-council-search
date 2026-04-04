@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+      target: app
+      args:
+        NEXT_PUBLIC_API_URL: ""
+    environment:
+      PORT: 8001
+      DATA_DIR: /app/data
+      ALLOWED_ORIGINS: http://localhost:3000
+      API_PROXY_TARGET: http://127.0.0.1:8001
+    ports:
+      - "3000:3000"
+    volumes:
+      - api_data:/app/data
+
+volumes:
+  api_data:

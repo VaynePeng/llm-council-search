@@ -9,7 +9,6 @@ const repoRoot = path.resolve(__dirname, '..', '..', '..')
 loadEnv({ path: path.join(repoRoot, '.env') })
 loadEnv({ path: path.join(repoRoot, 'apps', 'api', '.env'), override: true })
 
-export const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? ''
 export const OPENROUTER_API_URL =
   process.env.OPENROUTER_API_URL ??
   'https://openrouter.ai/api/v1/chat/completions'

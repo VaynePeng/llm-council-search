@@ -1,4 +1,4 @@
-import { OPENROUTER_API_KEY, OPENROUTER_API_URL } from "./config.js";
+import { OPENROUTER_API_URL } from "./config.js";
 
 export type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -60,7 +60,7 @@ export type QueryOptions = {
   webMaxResults?: number;
   /** 与聊天提示词共用同一时间锚，与注入的 system 补充说明一致 */
   webSearchTemporalContext?: WebSearchTemporalContext;
-  /** 由前端传入的用户 API Key，优先于 .env 中的 OPENROUTER_API_KEY */
+  /** 由前端传入的用户 API Key */
   apiKey?: string;
   /** 外部取消信号，例如客户端中止会话流时同步中断上游请求 */
   signal?: AbortSignal;
@@ -156,7 +156,11 @@ function chatRequestBody(
 }
 
 function resolveApiKey(override?: string): string {
-  return override?.trim() || OPENROUTER_API_KEY;
+  const key = override?.trim();
+  if (!key) {
+    throw new Error("OpenRouter API key required via X-OpenRouter-Key header");
+  }
+  return key;
 }
 
 async function doFetch(

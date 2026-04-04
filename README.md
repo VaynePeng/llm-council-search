@@ -38,7 +38,6 @@
 
 ```bash
 pnpm install
-cp .env.example .env   # 填入 OPENROUTER_API_KEY
 pnpm dev
 ```
 
@@ -47,10 +46,52 @@ pnpm dev
 
 单独启动：`pnpm dev:api` / `pnpm dev:web`。
 
+首次使用时，在网页里输入你的 OpenRouter API Key；前端会保存到浏览器本地 `localStorage`，并通过请求头发给 API。
+
+## Docker 一键启动
+
+仓库现已提供根目录 `compose.yaml` 与 `Dockerfile`。
+
+```bash
+docker compose up -d --build
+```
+
+启动后：
+
+- **Web**：<http://localhost:3000>
+
+停止：
+
+```bash
+docker compose down
+```
+
+如需连同会话数据卷一起删除：
+
+```bash
+docker compose down -v
+```
+
+说明：
+
+- 容器内同时运行 Web 与 API，对外只需要暴露 `3000`。
+- OpenRouter API Key 由用户在网页端输入，服务端不再依赖 `.env` 中的密钥。
+- Docker 默认把会话数据持久化到命名卷 `api_data`，容器重建后仍保留。
+- 前端通过同容器内代理转发 `/api/*` 到本地 Hono 服务，所以用户不需要再单独暴露 `8001`。
+
+如果你要发布成单镜像，用户启动命令可以简化为：
+
+```bash
+docker run -d \
+  --name llm-council-search \
+  -p 3000:3000 \
+  -v llm-council-search-data:/app/data \
+  <your-image>:latest
+```
+
 ### 环境变量
 
 1. **根目录 `.env`**（推荐，与 `.env.example` 一致）  
-   - 必填：`OPENROUTER_API_KEY`  
    - 可选：`CHAIRMAN_MODEL`、`TITLE_MODEL`、`PORT`（API，默认 `8001`）、`DATA_DIR`（会话目录绝对路径）、`ALLOWED_ORIGINS`（逗号分隔，允许访问 API 的前端来源）  
    - 勿将 `.env` 提交到 Git（已在 `.gitignore` 中忽略）。
 
@@ -67,7 +108,7 @@ pnpm dev
 
 | 现象 | 处理 |
 |------|------|
-| OpenRouter `401 Missing Authentication header` | 密钥必须写在 **本仓库根目录**（或 `apps/api/.env`），不是别的项目路径下的 `.env`；改后重启 `pnpm dev`。 |
+| OpenRouter `401 Missing Authentication header` 或 `OpenRouter API key required via X-OpenRouter-Key header` | 需要先在网页端输入 OpenRouter API Key；该 key 会保存在当前浏览器本地。 |
 | Web 启动报端口占用 | 结束占用 3000 的进程，或改 `next dev` 端口并在 `apps/api/src/index.ts` 的 CORS `origin` 中加入新前端地址。 |
 
 ## API 一览
