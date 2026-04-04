@@ -18,6 +18,10 @@ export type WebFetchSource = {
 export type WebFetchResult = {
   model: string;
   content: string;
+  webSearchMode?: "off" | "auto" | "on";
+  webSearchAction?: "skip" | "search" | "reuse";
+  webSearchReason?: string;
+  reusedFromPrevious?: boolean;
   webSearchSkipped?: boolean;
   /** ISO 8601 UTC，检索发起时刻；前端可用 dayjs 转本机时区展示 */
   retrievedAt?: string;
@@ -229,4 +233,11 @@ export function findPreviousUserQuery(messages: Message[], assistantIndex: numbe
     if (m.role === "user") return m.content;
   }
   return "";
+}
+
+export function messagesBeforeIndex(
+  messages: Message[],
+  endExclusive: number,
+): Message[] {
+  return messages.slice(0, Math.max(0, endExclusive));
 }

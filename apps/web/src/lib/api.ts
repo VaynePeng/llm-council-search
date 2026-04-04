@@ -36,6 +36,8 @@ export type Conversation = {
   messages: unknown[];
 };
 
+export type WebSearchMode = "off" | "auto" | "on";
+
 export type ApiConfig = {
   council_models: string[];
   /** 推荐用于 OpenRouter 联网（`openrouter:web_search`）的模型 ID */
@@ -87,6 +89,7 @@ export type SendOptions = {
   chairman_model?: string;
   web_fetch_model?: string;
   use_web_search?: boolean;
+  use_web_search_mode?: WebSearchMode;
   judge_weights?: Record<string, number>;
 };
 
@@ -105,6 +108,7 @@ export async function sendMessage(
         chairman_model: options?.chairman_model,
         web_fetch_model: options?.web_fetch_model,
         use_web_search: options?.use_web_search,
+        use_web_search_mode: options?.use_web_search_mode,
         judge_weights: options?.judge_weights,
       }),
     },
@@ -131,6 +135,7 @@ export async function sendMessageStream(
         chairman_model: options?.chairman_model,
         web_fetch_model: options?.web_fetch_model,
         use_web_search: options?.use_web_search,
+        use_web_search_mode: options?.use_web_search_mode,
         judge_weights: options?.judge_weights,
       }),
     },
@@ -166,6 +171,7 @@ export async function sendMessageStream(
 
 export type RerunOpts = {
   use_web_search?: boolean;
+  use_web_search_mode?: WebSearchMode;
   chairman_model?: string;
   judge_weights?: Record<string, number>;
   /** 跳过主席上下文检查并强制调用 Stage3 */
@@ -184,6 +190,7 @@ export async function rerunStage1(
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
+        use_web_search_mode: opts?.use_web_search_mode,
       }),
     },
   );
@@ -211,6 +218,7 @@ export async function rerunStage1Model(
       body: JSON.stringify({
         model,
         use_web_search: opts?.use_web_search,
+        use_web_search_mode: opts?.use_web_search_mode,
       }),
     },
   );
@@ -237,6 +245,7 @@ export async function rerunStage2(
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
+        use_web_search_mode: opts?.use_web_search_mode,
         judge_weights: opts?.judge_weights,
       }),
     },
@@ -275,6 +284,7 @@ export async function rerunStage3(
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         use_web_search: opts?.use_web_search,
+        use_web_search_mode: opts?.use_web_search_mode,
         chairman_model: opts?.chairman_model,
         judge_weights: opts?.judge_weights,
         skip_chairman_context_check: opts?.skip_chairman_context_check,

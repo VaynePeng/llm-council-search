@@ -64,6 +64,10 @@ export function resolveChairmanContextLimit(modelId: string): number {
 
 export const TITLE_MODEL = process.env.TITLE_MODEL ?? 'google/gemini-2.5-flash'
 
+/** 用于 `auto` 联网判定的轻量路由模型；仅做 skip/search/reuse 决策。 */
+export const WEB_SEARCH_ROUTER_MODEL =
+  process.env.WEB_SEARCH_ROUTER_MODEL ?? 'google/gemini-2.5-flash'
+
 /** 默认用 `:online` 模型名；实现上会去掉后缀并显式启用 `openrouter:web_search`。OpenAI 等走 `auto` 原生检索；Gemini 等在 openrouter.ts 中强制 `engine: "exa"`。 */
 export const WEB_FETCH_MODEL =
   process.env.WEB_FETCH_MODEL ?? 'openai/gpt-5.1:online'

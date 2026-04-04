@@ -14,9 +14,12 @@ import {
 } from "./config.js";
 import {
   calculateAggregateRankings,
+  composeEffectiveUserQuery,
+  decideWebSearchPlan,
   gateChairmanStage3,
   generateConversationTitle,
   labelToModelFromStage1,
+  parseWebSearchMode,
   runFullCouncil,
   stage1CollectResponses,
   stage2CollectRankings,
@@ -36,6 +39,7 @@ import {
   getConversation,
   isAssistantMessage,
   listConversations,
+  messagesBeforeIndex,
   saveConversation,
   updateConversationTitle,
   type Stage3Result,
@@ -104,6 +108,7 @@ type SendBody = {
   /** 与 `chairman_model` 同义（见项目重构 §5.4） */
   final_model?: string;
   use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
   /** 覆盖服务端 `WEB_FETCH_MODEL`，用于联网检索阶段 */
   web_fetch_model?: string;
   judge_weights?: Record<string, number>;
@@ -153,6 +158,17 @@ app.post("/api/conversations/:id/message", async (c) => {
     !conv.title?.trim() ||
     conv.title.trim() === "New Conversation";
   const judgeWeights = parseJudgeWeights(body);
+  const webSearchMode = parseWebSearchMode(
+    body.use_web_search_mode,
+    body.use_web_search,
+  );
+  const webSearchPlan = await decideWebSearchPlan(
+    content,
+    conv.messages,
+    webSearchMode,
+    apiKey,
+    c.req.raw.signal,
+  );
 
   await withConversationLock(id, async () => {
     await addUserMessage(id, content);
@@ -171,11 +187,14 @@ app.post("/api/conversations/:id/message", async (c) => {
 
   const [s1, s2, s3, meta, webFetch] = await runFullCouncil(content, {
     chairmanModel: parseChairman(body),
-    useWebSearch: body.use_web_search,
+    useWebSearch: webSearchPlan.action === "search",
+    webSearchMode,
     webFetchModel: parseWebFetchModel(body),
     judgeWeights,
     apiKey,
     signal: c.req.raw.signal,
+    historyMessages: conv.messages,
+    webSearchPlan,
   });
 
   await withConversationLock(id, async () => {
@@ -214,9 +233,19 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
     !conv.title?.trim() ||
     conv.title.trim() === "New Conversation";
   const chairmanModel = parseChairman(body);
-  const useWebSearch = body.use_web_search;
   const webFetchModel = parseWebFetchModel(body);
   const judgeWeights = parseJudgeWeights(body);
+  const webSearchMode = parseWebSearchMode(
+    body.use_web_search_mode,
+    body.use_web_search,
+  );
+  const webSearchPlan = await decideWebSearchPlan(
+    content,
+    conv.messages,
+    webSearchMode,
+    apiKey,
+    c.req.raw.signal,
+  );
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -258,15 +287,29 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           }
         })();
 
+        const effectiveQuery = composeEffectiveUserQuery(content, conv.messages);
         let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
         let webContext: string | undefined;
-        if (useWebSearch) {
+        if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
+          webFetchResult = {
+            ...webSearchPlan.previousWebFetch,
+            webSearchMode,
+            webSearchAction: "reuse",
+            webSearchReason: webSearchPlan.reason,
+            reusedFromPrevious: true,
+          };
+          push({ type: "web_fetch_complete", data: webFetchResult });
+          if (!webFetchResult.webSearchSkipped) {
+            webContext = webFetchResult.content;
+          }
+        } else if (webSearchPlan.action === "search") {
           push({ type: "web_fetch_start" });
           webFetchResult = await stageWebFetch(
-            content,
+            effectiveQuery,
             webFetchModel,
             apiKey,
             requestSignal,
+            webSearchPlan,
           );
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped) {
@@ -276,8 +319,8 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
         push({ type: "stage1_start" });
         const stage1Results = await stage1CollectResponses(
-          content,
-          useWebSearch,
+          effectiveQuery,
+          webSearchPlan.action === "search",
           webContext,
           webFetchResult?.retrievedAt != null && webContext
             ? {
@@ -292,9 +335,9 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
         push({ type: "stage2_start" });
         const [stage2Results, labelToModel] = await stage2CollectRankings(
-          content,
+          effectiveQuery,
           stage1Results,
-          useWebSearch,
+          webSearchPlan.action === "search",
           apiKey,
           requestSignal,
         );
@@ -314,7 +357,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
         const chairModel = chairmanModel?.trim() || CHAIRMAN_MODEL;
         const gate = gateChairmanStage3(
-          content,
+          effectiveQuery,
           stage1Results,
           stage2Results,
           chairmanModel,
@@ -374,11 +417,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         } else {
           push({ type: "stage3_start", data: { model: chairModel } });
           stage3Result = await stage3SynthesizeFinalStream(
-            content,
+            effectiveQuery,
             stage1Results,
             stage2Results,
             chairmanModel,
-            useWebSearch,
+            webSearchPlan.action === "search",
             judgeWeights,
             labelToModel,
             (delta) => push({ type: "stage3_delta", data: { delta } }),
@@ -427,6 +470,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 type RerunBody = {
   model?: string;
   use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
   chairman_model?: string;
   final_model?: string;
   judge_weights?: Record<string, number>;
@@ -463,11 +507,24 @@ app.post(
 
       const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
       if (!userQuery) return { error: "no preceding user message" as const };
+      const history = messagesBeforeIndex(conv.messages, msgIndex - 1);
+      const effectiveQuery = composeEffectiveUserQuery(userQuery, history);
+      const rerunMode = parseWebSearchMode(
+        body.use_web_search_mode,
+        body.use_web_search,
+      );
+      const rerunPlan = await decideWebSearchPlan(
+        userQuery,
+        history,
+        rerunMode,
+        apiKey,
+        c.req.raw.signal,
+      );
 
       const res = await queryModel(
         model,
-        [{ role: "user", content: userQuery }],
-        { useWebSearch: body.use_web_search, apiKey },
+        [{ role: "user", content: effectiveQuery }],
+        { useWebSearch: rerunPlan.action === "search", apiKey },
       );
 
       const stage1 = [...msg.stage1];
@@ -527,15 +584,38 @@ app.post(
 
       const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
       if (!userQuery) return { error: "no preceding user message" as const };
+      const history = messagesBeforeIndex(conv.messages, msgIndex - 1);
+      const effectiveQuery = composeEffectiveUserQuery(userQuery, history);
+      const rerunMode = parseWebSearchMode(
+        body.use_web_search_mode,
+        body.use_web_search,
+      );
+      const rerunPlan = await decideWebSearchPlan(
+        userQuery,
+        history,
+        rerunMode,
+        apiKey,
+        c.req.raw.signal,
+      );
 
       let webContext: string | undefined;
-      if (body.use_web_search && msg.webFetch && !msg.webFetch.webSearchSkipped) {
+      if (
+        rerunPlan.action === "reuse" &&
+        rerunPlan.previousWebFetch &&
+        !rerunPlan.previousWebFetch.webSearchSkipped
+      ) {
+        webContext = rerunPlan.previousWebFetch.content;
+      } else if (
+        rerunMode !== "off" &&
+        msg.webFetch &&
+        !msg.webFetch.webSearchSkipped
+      ) {
         webContext = msg.webFetch.content;
       }
 
       const stage1 = await stage1CollectResponses(
-        userQuery,
-        body.use_web_search,
+        effectiveQuery,
+        rerunPlan.action === "search",
         webContext,
         msg.webFetch?.retrievedAt != null
           ? {
@@ -589,11 +669,17 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
     const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
     if (!userQuery) return { error: "no preceding user message" as const };
     if (!msg.stage1.length) return { error: "empty stage1" as const };
+    const history = messagesBeforeIndex(conv.messages, msgIndex - 1);
+    const effectiveQuery = composeEffectiveUserQuery(userQuery, history);
+    const rerunMode = parseWebSearchMode(
+      body.use_web_search_mode,
+      body.use_web_search,
+    );
 
     const [stage2, labelToModel] = await stage2CollectRankings(
-      userQuery,
+      effectiveQuery,
       msg.stage1,
-      body.use_web_search,
+      rerunMode === "on",
       apiKey,
     );
     const aggregate_rankings = calculateAggregateRankings(
@@ -655,13 +741,19 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
 
     const userQuery = findPreviousUserQuery(conv.messages, msgIndex);
     if (!userQuery) return { error: "no preceding user message" as const };
+    const history = messagesBeforeIndex(conv.messages, msgIndex - 1);
+    const effectiveQuery = composeEffectiveUserQuery(userQuery, history);
+    const rerunMode = parseWebSearchMode(
+      body.use_web_search_mode,
+      body.use_web_search,
+    );
 
     const labelToModel = labelToModelFromStage1(msg.stage1);
     const skipCtx = Boolean(body.skip_chairman_context_check);
     const gate = skipCtx
       ? ({ proceed: true as const })
       : gateChairmanStage3(
-          userQuery,
+          effectiveQuery,
           msg.stage1,
           msg.stage2,
           parseChairman(body),
@@ -693,11 +785,11 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
     }
 
     const stage3 = await stage3SynthesizeFinal(
-      userQuery,
+      effectiveQuery,
       msg.stage1,
       msg.stage2,
       parseChairman(body),
-      body.use_web_search,
+      rerunMode === "on",
       judgeWeights,
       labelToModel,
       apiKey,

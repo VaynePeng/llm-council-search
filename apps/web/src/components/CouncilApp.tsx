@@ -41,7 +41,6 @@ import {
 } from "@/components/ui/sheet";
 import { Slider } from "@/components/ui/slider";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   createConversation,
@@ -59,6 +58,7 @@ import {
   type ApiConfig,
   type Conversation,
   type ConversationMeta,
+  type WebSearchMode,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import dayjs from "dayjs";
@@ -67,7 +67,7 @@ const WEIGHTS_STORAGE = "llm-council-search-judge-weights";
 const PREFS_STORAGE = "llm-council-search-ui-prefs";
 
 type StoredUiPrefs = {
-  useWebSearch?: boolean;
+  webSearchMode?: WebSearchMode;
   chairmanSelect?: string;
   chairmanCustom?: string;
   webFetchSelect?: string;
@@ -99,6 +99,10 @@ type WebFetchSource = {
 type WebFetchResult = {
   model: string;
   content: string;
+  webSearchMode?: WebSearchMode;
+  webSearchAction?: "skip" | "search" | "reuse";
+  webSearchReason?: string;
+  reusedFromPrevious?: boolean;
   webSearchSkipped?: boolean;
   retrievedAt?: string;
   retrievedAtUnixSeconds?: number;
@@ -199,25 +203,15 @@ function usePinnedBottomAutoscroll(
   }, [containerRef, trigger]);
 }
 
-function streamingAssistantShell(
-  useWebSearch: boolean,
-  webFetchModelId?: string,
-): AssistantMsg {
-  const modelLabel =
-    webFetchModelId?.trim() || "联网检索";
+function streamingAssistantShell(): AssistantMsg {
   return {
     role: "assistant",
-    webFetch: useWebSearch ? { model: modelLabel, content: "" } : null,
+    webFetch: null,
     stage1: null,
     stage2: null,
     stage3: null,
     metadata: null,
-    loading: {
-      webFetch: useWebSearch,
-      stage1: false,
-      stage2: false,
-      stage3: false,
-    },
+    loading: { ...DEFAULT_ASSISTANT_LOADING },
   };
 }
 
@@ -255,18 +249,24 @@ export default function CouncilApp() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loadingByConversation, setLoadingByConversation] = useState<
+    Record<string, boolean>
+  >({});
   const [chairmanSelect, setChairmanSelect] = useState<string>("");
   const [chairmanCustom, setChairmanCustom] = useState("");
   const [webFetchSelect, setWebFetchSelect] = useState<string>("");
   const [webFetchCustom, setWebFetchCustom] = useState("");
-  const [useWebSearch, setUseWebSearch] = useState(false);
+  const [webSearchMode, setWebSearchMode] = useState<WebSearchMode>("auto");
   const [judgeWeights, setJudgeWeights] = useState<Record<string, number>>({});
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [openrouterKey, setOpenrouterKey] = useState("");
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [hasRetry, setHasRetry] = useState(false);
+  const [actionErrorByConversation, setActionErrorByConversation] = useState<
+    Record<string, string | null>
+  >({});
+  const [hasRetryByConversation, setHasRetryByConversation] = useState<
+    Record<string, boolean>
+  >({});
   const [rerunBusy, setRerunBusy] = useState<string | null>(null);
   /** 主席 Stage3 因估算上下文不足被跳过时的引导弹窗 */
   const [chairmanContextPrompt, setChairmanContextPrompt] = useState<{
@@ -282,29 +282,63 @@ export default function CouncilApp() {
   const [chairmanDialogWorking, setChairmanDialogWorking] = useState(false);
 
   /** 发送失败后重试（流式中失败 reverted=false；fetch 失败 reverted=true） */
-  const failedSendRef = useRef<{
-    conversationId: string;
-    content: string;
-    reverted: boolean;
-  } | null>(null);
+  const failedSendRef = useRef<
+    Record<string, { content: string; reverted: boolean }>
+  >({});
   /** 重跑失败后重试 */
-  const rerunRetryRef = useRef<(() => Promise<void>) | null>(null);
+  const rerunRetryRef = useRef<Record<string, () => Promise<void>>>({});
 
   /** 避免异步 load 完成后把已切走的会话写回当前界面 */
   const currentIdRef = useRef<string | null>(null);
   /** 流式进行中且助手消息尚未落库时，按会话缓存完整 messages，切回该会话时与 GET 合并 */
-  const streamDraftRef = useRef<{
-    convId: string;
-    messages: Conversation["messages"];
-  } | null>(null);
+  const streamDraftRef = useRef<
+    Record<string, Conversation["messages"] | undefined>
+  >({});
   /** 每条流式请求内至多刷新一次列表（同步侧栏 message_count） */
   const streamSidebarRefreshRef = useRef(false);
   /** 当前流式请求的中断控制器 */
-  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamAbortRef = useRef<Record<string, AbortController | undefined>>({});
 
   useEffect(() => {
     currentIdRef.current = currentId;
   }, [currentId]);
+
+  const currentLoading = currentId ? (loadingByConversation[currentId] ?? false) : false;
+  const actionError = currentId ? (actionErrorByConversation[currentId] ?? null) : null;
+  const hasRetry = currentId ? (hasRetryByConversation[currentId] ?? false) : false;
+
+  const setConversationLoading = useCallback((convId: string, loading: boolean) => {
+    setLoadingByConversation((prev) => {
+      if (loading) {
+        if (prev[convId]) return prev;
+        return { ...prev, [convId]: true };
+      }
+      if (!(convId in prev)) return prev;
+      const next = { ...prev };
+      delete next[convId];
+      return next;
+    });
+  }, []);
+
+  const resetErrorState = useCallback((convId?: string | null) => {
+    const targetId = convId ?? currentIdRef.current;
+    if (!targetId) return;
+
+    setActionErrorByConversation((prev) => {
+      if (!(targetId in prev)) return prev;
+      const next = { ...prev };
+      delete next[targetId];
+      return next;
+    });
+    setHasRetryByConversation((prev) => {
+      if (!(targetId in prev)) return prev;
+      const next = { ...prev };
+      delete next[targetId];
+      return next;
+    });
+    delete failedSendRef.current[targetId];
+    delete rerunRetryRef.current[targetId];
+  }, []);
 
   useEffect(() => {
     setMounted(true);
@@ -336,22 +370,15 @@ export default function CouncilApp() {
     try {
       const c = await getConversation(id);
       if (currentIdRef.current !== id) return;
-      const draft = streamDraftRef.current;
-      if (draft?.convId === id) {
-        setConversation({ ...c, messages: draft.messages });
+      const draft = streamDraftRef.current[id];
+      if (draft) {
+        setConversation({ ...c, messages: draft });
       } else {
         setConversation(c);
       }
     } catch (e) {
       console.error(e);
     }
-  }, []);
-
-  const resetErrorState = useCallback(() => {
-    setActionError(null);
-    setHasRetry(false);
-    failedSendRef.current = null;
-    rerunRetryRef.current = null;
   }, []);
 
   const stopStreamingPreview = useCallback((convId: string) => {
@@ -369,10 +396,10 @@ export default function CouncilApp() {
       return next;
     };
 
-    const draft = streamDraftRef.current;
-    if (draft?.convId === convId) {
-      const next = stopTailAssistant(draft.messages);
-      streamDraftRef.current = null;
+    const draft = streamDraftRef.current[convId];
+    if (draft) {
+      const next = stopTailAssistant(draft);
+      delete streamDraftRef.current[convId];
       setConversation((prev) =>
         prev?.id === convId ? { ...prev, messages: next } : prev,
       );
@@ -384,11 +411,9 @@ export default function CouncilApp() {
       );
     }
 
-    setLoading(false);
-    setHasRetry(false);
-    setActionError(null);
-    failedSendRef.current = null;
-  }, []);
+    setConversationLoading(convId, false);
+    resetErrorState(convId);
+  }, [resetErrorState, setConversationLoading]);
 
   const isAbortError = useCallback((err: unknown) => {
     return (
@@ -399,26 +424,36 @@ export default function CouncilApp() {
 
   const armRerunRetry = useCallback(
     (key: string, fn: () => Promise<void>) => {
+      const convId = currentIdRef.current;
+      if (!convId) return;
       const attempt = async () => {
-        setActionError(null);
+        resetErrorState(convId);
         setRerunBusy(key);
         try {
           await fn();
-          if (currentId) await loadConversation(currentId);
-          rerunRetryRef.current = null;
-          setHasRetry(false);
+          if (currentIdRef.current === convId) await loadConversation(convId);
+          delete rerunRetryRef.current[convId];
+          setHasRetryByConversation((prev) => {
+            if (!(convId in prev)) return prev;
+            const next = { ...prev };
+            delete next[convId];
+            return next;
+          });
         } catch (e) {
-          setActionError(e instanceof Error ? e.message : String(e));
-          rerunRetryRef.current = attempt;
-          setHasRetry(true);
+          setActionErrorByConversation((prev) => ({
+            ...prev,
+            [convId]: e instanceof Error ? e.message : String(e),
+          }));
+          rerunRetryRef.current[convId] = attempt;
+          setHasRetryByConversation((prev) => ({ ...prev, [convId]: true }));
         } finally {
           setRerunBusy(null);
         }
       };
-      rerunRetryRef.current = attempt;
-      setHasRetry(true);
+      rerunRetryRef.current[convId] = attempt;
+      setHasRetryByConversation((prev) => ({ ...prev, [convId]: true }));
     },
-    [currentId, loadConversation],
+    [loadConversation, resetErrorState],
   );
 
   useEffect(() => {
@@ -429,7 +464,7 @@ export default function CouncilApp() {
         setApiConfig(cfg);
         const stored = loadStoredWeights();
         setJudgeWeights(buildJudgeWeights(cfg.council_models, stored));
-        setUseWebSearch(prefs.useWebSearch ?? false);
+        setWebSearchMode(prefs.webSearchMode ?? "auto");
         setChairmanSelect(
           prefs.chairmanSelect ?? cfg.chairman_model,
         );
@@ -457,7 +492,7 @@ export default function CouncilApp() {
       localStorage.setItem(
         PREFS_STORAGE,
         JSON.stringify({
-          useWebSearch,
+          webSearchMode,
           chairmanSelect,
           chairmanCustom,
           webFetchSelect,
@@ -469,7 +504,7 @@ export default function CouncilApp() {
     }
   }, [
     apiConfig,
-    useWebSearch,
+    webSearchMode,
     chairmanSelect,
     chairmanCustom,
     webFetchSelect,
@@ -521,17 +556,18 @@ export default function CouncilApp() {
     () => ({
       chairman_model: chairmanEffective || undefined,
       web_fetch_model: webFetchEffective || undefined,
-      use_web_search: useWebSearch,
+      use_web_search: webSearchMode !== "off",
+      use_web_search_mode: webSearchMode,
       judge_weights: judgeWeights,
     }),
-    [chairmanEffective, webFetchEffective, useWebSearch, judgeWeights],
+    [chairmanEffective, webFetchEffective, webSearchMode, judgeWeights],
   );
 
   const runStreamForContent = useCallback(
     async (convId: string, content: string) => {
       streamSidebarRefreshRef.current = false;
       const controller = new AbortController();
-      streamAbortRef.current = controller;
+      streamAbortRef.current[convId] = controller;
 
       const applyPatchToAssistantTail = (
         messages: Conversation["messages"],
@@ -546,10 +582,10 @@ export default function CouncilApp() {
       };
 
       const patchLastAssistant = (fn: (m: AssistantMsg) => AssistantMsg) => {
-        const d = streamDraftRef.current;
-        if (d?.convId === convId) {
-          const next = applyPatchToAssistantTail(d.messages, fn);
-          if (next) streamDraftRef.current = { convId, messages: next };
+        const draft = streamDraftRef.current[convId];
+        if (draft) {
+          const next = applyPatchToAssistantTail(draft, fn);
+          if (next) streamDraftRef.current[convId] = next;
         }
         setConversation((prev) => {
           if (!prev || prev.id !== convId) return prev;
@@ -572,6 +608,9 @@ export default function CouncilApp() {
             maybeRefreshSidebar();
             patchLastAssistant((m) => ({
               ...m,
+              webFetch:
+                m.webFetch ??
+                ({ model: webFetchEffective || apiConfig?.web_fetch_model || "联网检索", content: "" } as WebFetchResult),
               loading: { ...m.loading, webFetch: true },
             }));
             break;
@@ -680,54 +719,61 @@ export default function CouncilApp() {
             break;
           }
           case "complete":
-            if (streamDraftRef.current?.convId === convId) {
-              streamDraftRef.current = null;
-            }
+            delete streamDraftRef.current[convId];
             void loadConversations();
             if (currentIdRef.current === convId) {
               void loadConversation(convId);
             }
-            setLoading(false);
-            failedSendRef.current = null;
-            setHasRetry(false);
+            setConversationLoading(convId, false);
+            resetErrorState(convId);
             break;
           case "error":
-            if (streamDraftRef.current?.convId === convId) {
-              streamDraftRef.current = null;
-            }
-            setActionError(String(ev.message ?? "流式错误"));
-            setLoading(false);
-            setHasRetry(true);
+            delete streamDraftRef.current[convId];
+            setActionErrorByConversation((prev) => ({
+              ...prev,
+              [convId]: String(ev.message ?? "流式错误"),
+            }));
+            setConversationLoading(convId, false);
+            setHasRetryByConversation((prev) => ({ ...prev, [convId]: true }));
             break;
             default:
               break;
           }
         }, sendOpts(), controller.signal);
       } finally {
-        if (streamAbortRef.current === controller) {
-          streamAbortRef.current = null;
+        if (streamAbortRef.current[convId] === controller) {
+          delete streamAbortRef.current[convId];
         }
       }
     },
-    [loadConversations, loadConversation, sendOpts],
+    [
+      apiConfig?.web_fetch_model,
+      loadConversations,
+      loadConversation,
+      resetErrorState,
+      sendOpts,
+      setConversationLoading,
+      webFetchEffective,
+    ],
   );
 
   const handleStop = useCallback(() => {
-    if (!loading || !currentId) return;
-    streamAbortRef.current?.abort();
-    streamAbortRef.current = null;
+    if (!currentLoading || !currentId) return;
+    streamAbortRef.current[currentId]?.abort();
+    delete streamAbortRef.current[currentId];
     stopStreamingPreview(currentId);
-  }, [currentId, loading, stopStreamingPreview]);
+  }, [currentId, currentLoading, stopStreamingPreview]);
 
   const runChairmanRetryWithPick = useCallback(async () => {
     const p = chairmanContextPrompt;
     if (!p || !chairmanPromptPick.trim() || chairmanDialogWorking) return;
     const o = sendOpts();
     setChairmanDialogWorking(true);
-    setActionError(null);
+    resetErrorState(p.convId);
     try {
       await rerunStage3(p.convId, p.messageIndex, {
         use_web_search: o.use_web_search,
+        use_web_search_mode: o.use_web_search_mode,
         chairman_model: chairmanPromptPick.trim(),
         judge_weights: o.judge_weights,
       });
@@ -743,7 +789,10 @@ export default function CouncilApp() {
         await loadConversation(p.convId);
       }
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionErrorByConversation((prev) => ({
+        ...prev,
+        [p.convId]: e instanceof Error ? e.message : String(e),
+      }));
     } finally {
       setChairmanDialogWorking(false);
     }
@@ -754,6 +803,7 @@ export default function CouncilApp() {
     sendOpts,
     apiConfig?.council_models,
     loadConversation,
+    resetErrorState,
   ]);
 
   const runChairmanForceCurrent = useCallback(async () => {
@@ -761,10 +811,11 @@ export default function CouncilApp() {
     if (!p || chairmanDialogWorking) return;
     const o = sendOpts();
     setChairmanDialogWorking(true);
-    setActionError(null);
+    resetErrorState(p.convId);
     try {
       await rerunStage3(p.convId, p.messageIndex, {
         use_web_search: o.use_web_search,
+        use_web_search_mode: o.use_web_search_mode,
         chairman_model: p.chairman_model,
         judge_weights: o.judge_weights,
         skip_chairman_context_check: true,
@@ -774,29 +825,27 @@ export default function CouncilApp() {
         await loadConversation(p.convId);
       }
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setActionErrorByConversation((prev) => ({
+        ...prev,
+        [p.convId]: e instanceof Error ? e.message : String(e),
+      }));
     } finally {
       setChairmanDialogWorking(false);
     }
-  }, [chairmanContextPrompt, chairmanDialogWorking, sendOpts, loadConversation]);
+  }, [chairmanContextPrompt, chairmanDialogWorking, sendOpts, loadConversation, resetErrorState]);
 
   const handleRetrySend = useCallback(async () => {
-    const f = failedSendRef.current;
-    if (!f || f.conversationId !== currentId || loading) return;
-    setActionError(null);
-    setHasRetry(false);
-    setLoading(true);
-    failedSendRef.current = {
-      conversationId: f.conversationId,
+    if (!currentId || currentLoading) return;
+    const f = failedSendRef.current[currentId];
+    if (!f) return;
+    resetErrorState(currentId);
+    setConversationLoading(currentId, true);
+    failedSendRef.current[currentId] = {
       content: f.content,
       reverted: false,
     };
 
-    const o = sendOpts();
-    const assistantShell = streamingAssistantShell(
-      Boolean(o.use_web_search),
-      o.web_fetch_model ?? apiConfig?.web_fetch_model,
-    );
+    const assistantShell = streamingAssistantShell();
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -808,51 +857,43 @@ export default function CouncilApp() {
         msgs.push({ role: "user", content: f.content } as unknown as Conversation["messages"][number]);
       }
       msgs.push(assistantShell as unknown as Conversation["messages"][number]);
-      streamDraftRef.current = { convId: f.conversationId, messages: msgs };
+      streamDraftRef.current[currentId] = msgs;
       return { ...prev, messages: msgs };
     });
 
     try {
-      await runStreamForContent(f.conversationId, f.content);
+      await runStreamForContent(currentId, f.content);
     } catch (e) {
       if (isAbortError(e)) return;
       console.error(e);
-      if (streamDraftRef.current?.convId === f.conversationId) {
-        streamDraftRef.current = null;
-      }
+      delete streamDraftRef.current[currentId];
       setConversation((prev) =>
         prev ? { ...prev, messages: prev.messages.slice(0, -2) } : prev,
       );
-      setLoading(false);
-      failedSendRef.current = {
-        conversationId: f.conversationId,
+      setConversationLoading(currentId, false);
+      failedSendRef.current[currentId] = {
         content: f.content,
         reverted: true,
       };
-      setActionError("发送失败");
-      setHasRetry(true);
+      setActionErrorByConversation((prev) => ({ ...prev, [currentId]: "发送失败" }));
+      setHasRetryByConversation((prev) => ({ ...prev, [currentId]: true }));
     }
-  }, [currentId, isAbortError, loading, runStreamForContent, sendOpts, apiConfig?.web_fetch_model]);
+  }, [currentId, currentLoading, isAbortError, runStreamForContent, resetErrorState, setConversationLoading]);
 
   const handleSend = async () => {
-    if (!currentId || !input.trim() || loading) return;
+    if (!currentId || !input.trim() || currentLoading) return;
     const content = input.trim();
     setInput("");
-    setLoading(true);
-    resetErrorState();
+    setConversationLoading(currentId, true);
+    resetErrorState(currentId);
 
-    failedSendRef.current = {
-      conversationId: currentId,
+    failedSendRef.current[currentId] = {
       content,
       reverted: false,
     };
 
     const userMessage: UserMsg = { role: "user", content };
-    const o = sendOpts();
-    const assistantShell = streamingAssistantShell(
-      Boolean(o.use_web_search),
-      o.web_fetch_model ?? apiConfig?.web_fetch_model,
-    );
+    const assistantShell = streamingAssistantShell();
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -861,7 +902,7 @@ export default function CouncilApp() {
         userMessage as unknown as Conversation["messages"][number],
         assistantShell as unknown as Conversation["messages"][number],
       ];
-      streamDraftRef.current = { convId: currentId, messages };
+      streamDraftRef.current[currentId] = messages;
       return { ...prev, messages };
     });
 
@@ -870,20 +911,17 @@ export default function CouncilApp() {
     } catch (e) {
       if (isAbortError(e)) return;
       console.error(e);
-      if (streamDraftRef.current?.convId === currentId) {
-        streamDraftRef.current = null;
-      }
+      delete streamDraftRef.current[currentId];
       setConversation((prev) =>
         prev ? { ...prev, messages: prev.messages.slice(0, -2) } : prev,
       );
-      setLoading(false);
-      failedSendRef.current = {
-        conversationId: currentId,
+      setConversationLoading(currentId, false);
+      failedSendRef.current[currentId] = {
         content,
         reverted: true,
       };
-      setActionError("发送失败");
-      setHasRetry(true);
+      setActionErrorByConversation((prev) => ({ ...prev, [currentId]: "发送失败" }));
+      setHasRetryByConversation((prev) => ({ ...prev, [currentId]: true }));
     }
   };
 
@@ -986,11 +1024,11 @@ export default function CouncilApp() {
                   className="shrink-0"
                   onClick={() => {
                     if (
-                      failedSendRef.current?.conversationId === currentId
+                      currentId && failedSendRef.current[currentId]
                     ) {
                       void handleRetrySend();
-                    } else if (rerunRetryRef.current) {
-                      void rerunRetryRef.current();
+                    } else if (currentId && rerunRetryRef.current[currentId]) {
+                      void rerunRetryRef.current[currentId]();
                     }
                   }}
                 >
@@ -1002,7 +1040,7 @@ export default function CouncilApp() {
                 variant="ghost"
                 size="sm"
                 className="shrink-0 text-muted-foreground"
-                onClick={() => resetErrorState()}
+                onClick={() => resetErrorState(currentId)}
               >
                 清除
               </Button>
@@ -1053,21 +1091,27 @@ export default function CouncilApp() {
                     密钥仅保存在浏览器本地，不会上传至第三方。
                   </p>
                 </div>
-                <div className="flex items-center justify-between gap-4">
-                  <Label htmlFor="web">OpenRouter 联网（web_search 工具）</Label>
-                  <Switch
-                    id="web"
-                    checked={useWebSearch}
-                    onCheckedChange={setUseWebSearch}
-                  />
+                <div className="space-y-2">
+                  <Label htmlFor="web-mode">联网策略</Label>
+                  <Select
+                    value={webSearchMode}
+                    onValueChange={(v) => setWebSearchMode(v as WebSearchMode)}
+                  >
+                    <SelectTrigger id="web-mode" className="w-full">
+                      <SelectValue placeholder="选择联网策略" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="off">关闭</SelectItem>
+                      <SelectItem value="auto">自动判断</SelectItem>
+                      <SelectItem value="on">强制联网</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  若模型不支持联网，服务端会尝试去掉插件重试；费用见 OpenRouter 文档。
-                  {useWebSearch
-                    ? " 联网开关与本页选项会保存在本机浏览器。"
-                    : " 联网开关会保存在本机浏览器。"}
+                  `自动判断` 会结合当前问题和前文决定本轮是否联网、是否复用上一轮检索结果；`强制联网` 每轮都会重新联网检索。
+                  若模型不支持联网，服务端会尝试去掉插件重试；本页选项会保存在本机浏览器。
                 </p>
-                {useWebSearch ? (
+                {webSearchMode !== "off" ? (
                   <div className="space-y-2">
                     <Label>Web 抓取模型（仅联网阶段）</Label>
                     <Select
@@ -1222,8 +1266,13 @@ export default function CouncilApp() {
                     setBusyKey={setRerunBusy}
                     onReload={() => void loadConversation(currentId!)}
                     sendOpts={sendOpts}
-                    setActionError={setActionError}
-                    resetErrorState={resetErrorState}
+                    setActionError={(msg) =>
+                      setActionErrorByConversation((prev) => ({
+                        ...prev,
+                        [currentId]: msg,
+                      }))
+                    }
+                    resetErrorState={() => resetErrorState(currentId)}
                     armRerunRetry={armRerunRetry}
                   />
                 ),
@@ -1237,18 +1286,18 @@ export default function CouncilApp() {
             <Textarea
               rows={4}
               className="flex-1"
-              placeholder="输入问题… Enter 发送，Shift+Enter 换行"
+              placeholder="输入问题… Enter 换行，Command+Enter 发送"
               value={input}
               disabled={!currentId}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && e.metaKey) {
                   e.preventDefault();
-                  if (!loading) void handleSend();
+                  if (!currentLoading) void handleSend();
                 }
               }}
             />
-            {loading ? (
+            {currentLoading ? (
               <Button
                 type="button"
                 variant="destructive"
@@ -1452,6 +1501,7 @@ function CouncilAssistantCard({
     chairman_model?: string;
     web_fetch_model?: string;
     use_web_search?: boolean;
+    use_web_search_mode?: WebSearchMode;
     judge_weights?: Record<string, number>;
   };
   setActionError: (s: string | null) => void;
@@ -1534,6 +1584,11 @@ function CouncilAssistantCard({
           ) : null}
         </div>
       ) : null}
+      {m.webFetch?.webSearchReason ? (
+        <div className="mb-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-200">
+          {m.webFetch.webSearchReason}
+        </div>
+      ) : null}
       <div className="shrink-0">
         <StepperRow
           webFetchDone={webFetchDone}
@@ -1577,6 +1632,7 @@ function CouncilAssistantCard({
                 void run("s1-all", async () => {
                   await rerunStage1(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
+                    use_web_search_mode: opts.use_web_search_mode,
                   });
                 })
               }
@@ -1607,7 +1663,10 @@ function CouncilAssistantCard({
                       conversationId,
                       msgIndex,
                       it.model,
-                      { use_web_search: opts.use_web_search },
+                      {
+                        use_web_search: opts.use_web_search,
+                        use_web_search_mode: opts.use_web_search_mode,
+                      },
                     );
                   })
                 }
@@ -1649,6 +1708,7 @@ function CouncilAssistantCard({
                 void run("s2", async () => {
                   await rerunStage2(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
+                    use_web_search_mode: opts.use_web_search_mode,
                     judge_weights: opts.judge_weights,
                   });
                 })
@@ -1690,6 +1750,7 @@ function CouncilAssistantCard({
                 void run("s3", async () => {
                   await rerunStage3(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
+                    use_web_search_mode: opts.use_web_search_mode,
                     chairman_model: opts.chairman_model,
                     judge_weights: opts.judge_weights,
                   });
@@ -1759,7 +1820,16 @@ function WebFetchView({
         {data.webSearchSkipped ? (
           <Badge variant="warning" className="text-[10px]">联网已跳过</Badge>
         ) : null}
+        {data.webSearchAction === "reuse" ? (
+          <Badge variant="secondary" className="text-[10px]">复用上轮检索</Badge>
+        ) : null}
+        {data.webSearchAction === "search" && data.webSearchMode === "auto" ? (
+          <Badge variant="secondary" className="text-[10px]">自动联网</Badge>
+        ) : null}
       </div>
+      {data.webSearchReason ? (
+        <p className="mt-1 text-xs text-muted-foreground">{data.webSearchReason}</p>
+      ) : null}
       {data.retrievedAt ? (
         <p className="mt-1 text-xs text-muted-foreground">
           <span className="font-medium text-foreground/85">检索时刻（本机时区）</span>
