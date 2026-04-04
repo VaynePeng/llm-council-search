@@ -51,13 +51,17 @@ pnpm dev
 
 1. **根目录 `.env`**（推荐，与 `.env.example` 一致）  
    - 必填：`OPENROUTER_API_KEY`  
-   - 可选：`CHAIRMAN_MODEL`、`TITLE_MODEL`、`PORT`（API，默认 `8001`）、`DATA_DIR`（会话目录绝对路径）  
+   - 可选：`CHAIRMAN_MODEL`、`TITLE_MODEL`、`PORT`（API，默认 `8001`）、`DATA_DIR`（会话目录绝对路径）、`ALLOWED_ORIGINS`（逗号分隔，允许访问 API 的前端来源）  
    - 勿将 `.env` 提交到 Git（已在 `.gitignore` 中忽略）。
 
 2. **覆盖**：可在 `apps/api/.env` 再放一份，会覆盖根目录同名变量。
 
 3. **前端**（可选）：`apps/web/.env.local`，见 `apps/web/.env.example`  
    - `NEXT_PUBLIC_API_URL` 默认 `http://localhost:8001`（开发时直连 API，CORS 已允许 `localhost:3000` / `5173`）。
+
+4. **Vercel 跨域部署**  
+   - 若 Web 与 API 分别部署在不同域名，需在 API 环境变量配置 `ALLOWED_ORIGINS=https://your-web.vercel.app`。  
+   - 多个来源用英文逗号分隔，例如：`ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173,https://your-web.vercel.app`
 
 ### 常见问题
 

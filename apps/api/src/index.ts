@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import {
+  ALLOWED_ORIGINS,
   API_PORT,
   CHAIRMAN_MODEL,
   CHAIRMAN_OUTPUT_RESERVE_TOKENS,
@@ -46,11 +47,15 @@ import {
 } from "./storage.js";
 
 const app = new Hono();
+const allowedOrigins = new Set(ALLOWED_ORIGINS);
 
 app.use(
   "*",
   cors({
-    origin: ["http://localhost:3000", "http://localhost:5173"],
+    origin: (origin) => {
+      if (!origin) return "";
+      return allowedOrigins.has(origin) ? origin : "";
+    },
     allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowHeaders: ["*"],
     credentials: true,

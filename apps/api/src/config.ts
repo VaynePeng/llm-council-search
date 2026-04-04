@@ -78,6 +78,14 @@ export const DATA_DIR = path.resolve(
 
 export const API_PORT = Number(process.env.PORT ?? '8001')
 
+export const ALLOWED_ORIGINS: string[] = (
+  process.env.ALLOWED_ORIGINS ??
+  'http://localhost:3000,http://localhost:5173'
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+
 /** 供前端展示「已知上下文上限」的模型表（与 CHAIRMAN_CONTEXT_LIMITS 一致即可） */
 export function chairmanContextLimitsForApi(): Record<string, number> {
   return { ...CHAIRMAN_CONTEXT_LIMITS }
