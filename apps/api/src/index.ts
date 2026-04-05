@@ -442,16 +442,6 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             requestSignal,
             webContext,
           );
-          console.log("[followup_complete][conversation]", {
-            conversationId: id,
-            userContent: content,
-            model: followupResult.model,
-            responseLength: followupResult.response.length,
-            hasReasoningDetails: Array.isArray(followupResult.reasoning_details)
-              ? followupResult.reasoning_details.length > 0
-              : followupResult.reasoning_details != null,
-            responsePreview: followupResult.response.slice(0, 200),
-          });
           push({ type: "followup_complete", data: followupResult });
 
           ensureNotAborted();
@@ -1175,15 +1165,6 @@ app.post("/api/message/stateless/stream", async (c) => {
             requestSignal,
             webContext,
           );
-          console.log("[followup_complete][stateless]", {
-            userContent: content,
-            model: followupResult.model,
-            responseLength: followupResult.response.length,
-            hasReasoningDetails: Array.isArray(followupResult.reasoning_details)
-              ? followupResult.reasoning_details.length > 0
-              : followupResult.reasoning_details != null,
-            responsePreview: followupResult.response.slice(0, 200),
-          });
           push({ type: "followup_complete", data: followupResult });
           push({
             type: "complete",
