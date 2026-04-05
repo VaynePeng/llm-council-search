@@ -44,22 +44,34 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   createConversation,
+  createLocalConversation,
   deleteConversation,
+  deleteLocalConversation,
   fetchConfig,
   getConversation,
+  getLocalConversation,
   getStoredApiKey,
   listConversations,
+  listLocalConversations,
   rerunStage1,
   rerunStage1Model,
+  rerunStage1ModelStateless,
+  rerunStage1Stateless,
   rerunStage2,
+  rerunStage2Stateless,
   rerunStage3,
+  rerunStage3Stateless,
+  saveLocalConversation,
+  sendMessageStatelessStream,
   sendMessageStream,
   setStoredApiKey,
+  updateLocalConversationTitle,
   type ApiConfig,
   type Conversation,
   type ConversationMeta,
   type WebSearchMode,
 } from "@/lib/api";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import dayjs from "dayjs";
 
@@ -72,6 +84,7 @@ type StoredUiPrefs = {
   chairmanCustom?: string;
   webFetchSelect?: string;
   webFetchCustom?: string;
+  storageMode?: "server" | "local";
 };
 
 function loadUiPrefs(): StoredUiPrefs {
@@ -267,6 +280,7 @@ export default function CouncilApp() {
   const [webFetchSelect, setWebFetchSelect] = useState<string>("");
   const [webFetchCustom, setWebFetchCustom] = useState("");
   const [webSearchMode, setWebSearchMode] = useState<WebSearchMode>("auto");
+  const [storageMode, setStorageMode] = useState<"server" | "local">("server");
   const [judgeWeights, setJudgeWeights] = useState<Record<string, number>>({});
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -369,16 +383,17 @@ export default function CouncilApp() {
 
   const loadConversations = useCallback(async () => {
     try {
-      const list = await listConversations();
+      const list = storageMode === "local" ? listLocalConversations() : await listConversations();
       setConversations(list);
     } catch (e) {
       console.error(e);
     }
-  }, []);
+  }, [storageMode]);
 
   const loadConversation = useCallback(async (id: string) => {
     try {
-      const c = await getConversation(id);
+      const c = storageMode === "local" ? getLocalConversation(id) : await getConversation(id);
+      if (!c) return;
       if (currentIdRef.current !== id) return;
       const draft = streamDraftRef.current[id];
       if (draft) {
@@ -389,7 +404,7 @@ export default function CouncilApp() {
     } catch (e) {
       console.error(e);
     }
-  }, []);
+  }, [storageMode]);
 
   const stopStreamingPreview = useCallback((convId: string) => {
     const stopTailAssistant = (
@@ -490,6 +505,7 @@ export default function CouncilApp() {
           savedOk ? (savedWf ?? wfDefault) : wfDefault || wsModels[0] || "",
         );
         setWebFetchCustom(prefs.webFetchCustom ?? "");
+        setStorageMode(prefs.storageMode ?? "server");
       } catch (e) {
         console.error(e);
       }
@@ -507,6 +523,7 @@ export default function CouncilApp() {
           chairmanCustom,
           webFetchSelect,
           webFetchCustom,
+          storageMode,
         } satisfies StoredUiPrefs),
       );
     } catch {
@@ -519,6 +536,7 @@ export default function CouncilApp() {
     chairmanCustom,
     webFetchSelect,
     webFetchCustom,
+    storageMode,
   ]);
 
   useEffect(() => {
@@ -539,7 +557,7 @@ export default function CouncilApp() {
 
   const handleNew = async () => {
     try {
-      const c = await createConversation();
+      const c = storageMode === "local" ? createLocalConversation() : await createConversation();
       await loadConversations();
       setCurrentId(c.id);
       setMobileNavOpen(false);
@@ -551,7 +569,8 @@ export default function CouncilApp() {
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await deleteConversation(id);
+      if (storageMode === "local") deleteLocalConversation(id);
+      else await deleteConversation(id);
       await loadConversations();
       if (currentId === id) {
         setCurrentId(null);
@@ -615,7 +634,29 @@ export default function CouncilApp() {
       };
 
       try {
-        await sendMessageStream(convId, content, (type, ev) => {
+        const localHistoryMessages = storageMode === "local"
+          ? (getLocalConversation(convId)?.messages ?? [])
+          : null;
+
+        // Collected data for localStorage persistence in local mode
+        const localCollected: {
+          webFetch?: WebFetchResult;
+          stage1?: Stage1Item[];
+          stage2?: Stage2Item[];
+          stage3?: Stage3;
+          metadata?: AssistantMsg["metadata"];
+          title?: string;
+          chairmanContextMsgIndex?: number;
+          chairmanContextStage3?: Stage3;
+        } = {};
+
+        const streamFn = storageMode === "local"
+          ? (handler: (type: string, ev: Record<string, unknown>) => void, opts: ReturnType<typeof sendOpts>, signal: AbortSignal) =>
+              sendMessageStatelessStream(content, localHistoryMessages ?? [], handler, opts, signal)
+          : (handler: (type: string, ev: Record<string, unknown>) => void, opts: ReturnType<typeof sendOpts>, signal: AbortSignal) =>
+              sendMessageStream(convId, content, handler, opts, signal);
+
+        await streamFn((type, ev) => {
           switch (type) {
           case "web_fetch_start":
             maybeRefreshSidebar();
@@ -628,6 +669,7 @@ export default function CouncilApp() {
             }));
             break;
           case "web_fetch_complete":
+            if (storageMode === "local") localCollected.webFetch = ev.data as WebFetchResult;
             patchLastAssistantActive((m) => ({
               ...m,
               webFetch: ev.data as WebFetchResult,
@@ -642,6 +684,7 @@ export default function CouncilApp() {
             }));
             break;
           case "stage1_complete":
+            if (storageMode === "local") localCollected.stage1 = ev.data as Stage1Item[];
             patchLastAssistantActive((m) => ({
               ...m,
               stage1: ev.data as Stage1Item[],
@@ -656,6 +699,10 @@ export default function CouncilApp() {
             }));
             break;
           case "stage2_complete":
+            if (storageMode === "local") {
+              localCollected.stage2 = ev.data as Stage2Item[];
+              localCollected.metadata = (ev.metadata as AssistantMsg["metadata"]) ?? null;
+            }
             patchLastAssistantActive((m) => ({
               ...m,
               stage2: ev.data as Stage2Item[],
@@ -673,6 +720,10 @@ export default function CouncilApp() {
               suggested_models: string[];
               stage3: Stage3;
             };
+            if (storageMode === "local") {
+              localCollected.chairmanContextMsgIndex = d.message_index;
+              localCollected.chairmanContextStage3 = d.stage3;
+            }
             patchLastAssistantActive((m) => ({
               ...m,
               stage3: d.stage3,
@@ -715,6 +766,7 @@ export default function CouncilApp() {
             break;
           }
           case "stage3_complete":
+            if (storageMode === "local") localCollected.stage3 = ev.data as Stage3;
             patchLastAssistantActive((m) => ({
               ...m,
               stage3: ev.data as Stage3,
@@ -722,8 +774,12 @@ export default function CouncilApp() {
             }));
             break;
           case "title_complete": {
-            void loadConversations();
             const t = (ev as { data?: { title?: string } }).data?.title;
+            if (storageMode === "local" && t) {
+              localCollected.title = t;
+              updateLocalConversationTitle(convId, t);
+            }
+            void loadConversations();
             if (t && currentIdRef.current === convId) {
               setConversation((prev) =>
                 prev?.id === convId ? { ...prev, title: t } : prev,
@@ -731,7 +787,35 @@ export default function CouncilApp() {
             }
             break;
           }
-          case "complete":
+          case "complete": {
+            if (storageMode === "local") {
+              // Persist the completed conversation to localStorage
+              const existingConv = getLocalConversation(convId);
+              if (existingConv) {
+                const userMsg = { role: "user" as const, content };
+                const assistantMsg = {
+                  role: "assistant" as const,
+                  schemaVersion: 1,
+                  assistantMessageId: crypto.randomUUID(),
+                  ...(localCollected.webFetch ? { webFetch: localCollected.webFetch } : {}),
+                  stage1: localCollected.stage1 ?? [],
+                  stage2: localCollected.stage2 ?? [],
+                  stage3: localCollected.stage3 ?? { model: "unknown", response: "" },
+                  stale: { stage2: false, stage3: false },
+                  ...(localCollected.metadata ? { metadata: localCollected.metadata } : {}),
+                };
+                const updatedConv = {
+                  ...existingConv,
+                  ...(localCollected.title ? { title: localCollected.title } : {}),
+                  messages: [
+                    ...(existingConv.messages as unknown[]),
+                    userMsg,
+                    assistantMsg,
+                  ] as Conversation["messages"],
+                };
+                saveLocalConversation(updatedConv);
+              }
+            }
             delete streamDraftRef.current[convId];
             void loadConversations();
             if (currentIdRef.current === convId) {
@@ -740,6 +824,7 @@ export default function CouncilApp() {
             setConversationLoading(convId, false);
             resetErrorState(convId);
             break;
+          }
           case "error":
             delete streamDraftRef.current[convId];
             setActionErrorByConversation((prev) => ({
@@ -766,8 +851,122 @@ export default function CouncilApp() {
       resetErrorState,
       sendOpts,
       setConversationLoading,
+      storageMode,
       webFetchEffective,
     ],
+  );
+
+  // ─── Mode-aware rerun helpers ────────────────────────────────────────────────
+  // In local mode, we load the conversation from localStorage, build the params,
+  // call the stateless endpoint, persist the result, and return it in the same
+  // shape as the server rerun functions so CouncilAssistantCard stays unchanged.
+
+  const localRerunStage1 = useCallback(
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode }) => {
+      const conv = getLocalConversation(conversationId);
+      if (!conv) throw new Error("Conversation not found");
+      const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
+      const msg = msgs[msgIndex] as unknown as { role: string; webFetch?: unknown; stage1: unknown[]; stage2: unknown[]; stage3: unknown; stale?: unknown; metadata?: unknown };
+      let userQuery = "";
+      for (let i = msgIndex - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") { userQuery = msgs[i].content ?? ""; break; }
+      }
+      if (!userQuery) throw new Error("No preceding user message");
+      const history = msgs.slice(0, Math.max(0, msgIndex - 1));
+      const result = await rerunStage1Stateless({ user_query: userQuery, history_messages: history, web_fetch: msg.webFetch as never, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
+      const updatedMsgs = [...(conv.messages as unknown[])];
+      updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage1: result.stage1, stale: result.stale, metadata: undefined };
+      saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
+      return result;
+    },
+    [],
+  );
+
+  const localRerunStage1Model = useCallback(
+    async (conversationId: string, msgIndex: number, model: string, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode }) => {
+      const conv = getLocalConversation(conversationId);
+      if (!conv) throw new Error("Conversation not found");
+      const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
+      const msg = msgs[msgIndex] as unknown as { stage1: Array<{ model: string; response: string }> };
+      let userQuery = "";
+      for (let i = msgIndex - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") { userQuery = msgs[i].content ?? ""; break; }
+      }
+      if (!userQuery) throw new Error("No preceding user message");
+      const history = msgs.slice(0, Math.max(0, msgIndex - 1));
+      const result = await rerunStage1ModelStateless({ user_query: userQuery, history_messages: history, model, stage1: msg.stage1 ?? [], use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
+      const updatedMsgs = [...(conv.messages as unknown[])];
+      updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage1: result.stage1, stale: result.stale, metadata: undefined };
+      saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
+      return result;
+    },
+    [],
+  );
+
+  const localRerunStage2 = useCallback(
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; judge_weights?: Record<string, number> }) => {
+      const conv = getLocalConversation(conversationId);
+      if (!conv) throw new Error("Conversation not found");
+      const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
+      const msg = msgs[msgIndex] as unknown as { stage1: Array<{ model: string; response: string }> };
+      let userQuery = "";
+      for (let i = msgIndex - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") { userQuery = msgs[i].content ?? ""; break; }
+      }
+      if (!userQuery) throw new Error("No preceding user message");
+      const history = msgs.slice(0, Math.max(0, msgIndex - 1));
+      const result = await rerunStage2Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, judge_weights: opts?.judge_weights });
+      const updatedMsgs = [...(conv.messages as unknown[])];
+      updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage2: result.stage2, stale: result.stale, metadata: result.metadata };
+      saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
+      return result;
+    },
+    [],
+  );
+
+  const localRerunStage3 = useCallback(
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; chairman_model?: string; judge_weights?: Record<string, number>; skip_chairman_context_check?: boolean }) => {
+      const conv = getLocalConversation(conversationId);
+      if (!conv) throw new Error("Conversation not found");
+      const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
+      const msg = msgs[msgIndex] as unknown as { stage1: Array<{ model: string; response: string }>; stage2: Array<{ model: string; ranking: string; parsed_ranking: string[] }>; webFetch?: unknown };
+      let userQuery = "";
+      for (let i = msgIndex - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") { userQuery = msgs[i].content ?? ""; break; }
+      }
+      if (!userQuery) throw new Error("No preceding user message");
+      const history = msgs.slice(0, Math.max(0, msgIndex - 1));
+      const result = await rerunStage3Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], stage2: msg.stage2 ?? [], web_fetch: msg.webFetch as never, chairman_model: opts?.chairman_model, judge_weights: opts?.judge_weights, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, skip_chairman_context_check: opts?.skip_chairman_context_check });
+      const updatedMsgs = [...(conv.messages as unknown[])];
+      updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage3: result.stage3, stale: result.stale };
+      saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
+      return result;
+    },
+    [],
+  );
+
+  const rerunStage1Fn = useCallback(
+    (conversationId: string, msgIndex: number, opts?: Parameters<typeof rerunStage1>[2]) =>
+      storageMode === "local" ? localRerunStage1(conversationId, msgIndex, opts) : rerunStage1(conversationId, msgIndex, opts),
+    [storageMode, localRerunStage1],
+  );
+
+  const rerunStage1ModelFn = useCallback(
+    (conversationId: string, msgIndex: number, model: string, opts?: Parameters<typeof rerunStage1Model>[3]) =>
+      storageMode === "local" ? localRerunStage1Model(conversationId, msgIndex, model, opts) : rerunStage1Model(conversationId, msgIndex, model, opts),
+    [storageMode, localRerunStage1Model],
+  );
+
+  const rerunStage2Fn = useCallback(
+    (conversationId: string, msgIndex: number, opts?: Parameters<typeof rerunStage2>[2]) =>
+      storageMode === "local" ? localRerunStage2(conversationId, msgIndex, opts) : rerunStage2(conversationId, msgIndex, opts),
+    [storageMode, localRerunStage2],
+  );
+
+  const rerunStage3Fn = useCallback(
+    (conversationId: string, msgIndex: number, opts?: Parameters<typeof rerunStage3>[2]) =>
+      storageMode === "local" ? localRerunStage3(conversationId, msgIndex, opts) : rerunStage3(conversationId, msgIndex, opts),
+    [storageMode, localRerunStage3],
   );
 
   const handleStop = useCallback(() => {
@@ -784,7 +983,7 @@ export default function CouncilApp() {
     setChairmanDialogWorking(true);
     resetErrorState(p.convId);
     try {
-      await rerunStage3(p.convId, p.messageIndex, {
+      await rerunStage3Fn(p.convId, p.messageIndex, {
         use_web_search: o.use_web_search,
         use_web_search_mode: o.use_web_search_mode,
         chairman_model: chairmanPromptPick.trim(),
@@ -817,6 +1016,7 @@ export default function CouncilApp() {
     apiConfig?.council_models,
     loadConversation,
     resetErrorState,
+    rerunStage3Fn,
   ]);
 
   const runChairmanForceCurrent = useCallback(async () => {
@@ -826,7 +1026,7 @@ export default function CouncilApp() {
     setChairmanDialogWorking(true);
     resetErrorState(p.convId);
     try {
-      await rerunStage3(p.convId, p.messageIndex, {
+      await rerunStage3Fn(p.convId, p.messageIndex, {
         use_web_search: o.use_web_search,
         use_web_search_mode: o.use_web_search_mode,
         chairman_model: p.chairman_model,
@@ -845,7 +1045,7 @@ export default function CouncilApp() {
     } finally {
       setChairmanDialogWorking(false);
     }
-  }, [chairmanContextPrompt, chairmanDialogWorking, sendOpts, loadConversation, resetErrorState]);
+  }, [chairmanContextPrompt, chairmanDialogWorking, sendOpts, loadConversation, resetErrorState, rerunStage3Fn]);
 
   const handleRetrySend = useCallback(async () => {
     if (!currentId || currentLoading) return;
@@ -1089,6 +1289,25 @@ export default function CouncilApp() {
               </SheetHeader>
               <div className="mt-4 space-y-6">
                 <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="storage-mode">对话存储位置</Label>
+                    <Switch
+                      id="storage-mode"
+                      checked={storageMode === "local"}
+                      onCheckedChange={(checked) => {
+                        setStorageMode(checked ? "local" : "server");
+                        setCurrentId(null);
+                        setConversation(null);
+                      }}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {storageMode === "local"
+                      ? "本地模式：对话存储在浏览器 localStorage，仅当前浏览器可见，服务器不保存任何内容。"
+                      : "服务器模式：对话存储在服务器文件中，重启浏览器后仍可恢复。"}
+                  </p>
+                </div>
+                <div className="space-y-2">
                   <Label htmlFor="apiKey">OpenRouter API Key</Label>
                   <Input
                     id="apiKey"
@@ -1287,6 +1506,10 @@ export default function CouncilApp() {
                     }
                     resetErrorState={() => resetErrorState(currentId)}
                     armRerunRetry={armRerunRetry}
+                    rerunStage1Fn={rerunStage1Fn}
+                    rerunStage1ModelFn={rerunStage1ModelFn}
+                    rerunStage2Fn={rerunStage2Fn}
+                    rerunStage3Fn={rerunStage3Fn}
                   />
                 ),
               )}
@@ -1503,6 +1726,10 @@ function CouncilAssistantCard({
   setActionError,
   resetErrorState,
   armRerunRetry,
+  rerunStage1Fn,
+  rerunStage1ModelFn,
+  rerunStage2Fn,
+  rerunStage3Fn,
 }: {
   m: AssistantMsg;
   msgIndex: number;
@@ -1520,6 +1747,10 @@ function CouncilAssistantCard({
   setActionError: (s: string | null) => void;
   resetErrorState: () => void;
   armRerunRetry: (key: string, fn: () => Promise<void>) => void;
+  rerunStage1Fn: typeof rerunStage1;
+  rerunStage1ModelFn: typeof rerunStage1Model;
+  rerunStage2Fn: typeof rerunStage2;
+  rerunStage3Fn: typeof rerunStage3;
 }) {
   const loading = {
     ...DEFAULT_ASSISTANT_LOADING,
@@ -1700,7 +1931,7 @@ function CouncilAssistantCard({
               disabled={busyKey !== null}
               onClick={() =>
                 void run("s1-all", async () => {
-                  await rerunStage1(conversationId, msgIndex, {
+                  await rerunStage1Fn(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
                     use_web_search_mode: opts.use_web_search_mode,
                   });
@@ -1729,7 +1960,7 @@ function CouncilAssistantCard({
                 disabled={busyKey !== null}
                 onClick={() =>
                   void run(`s1-${it.model}`, async () => {
-                    await rerunStage1Model(
+                    await rerunStage1ModelFn(
                       conversationId,
                       msgIndex,
                       it.model,
@@ -1776,7 +2007,7 @@ function CouncilAssistantCard({
               disabled={busyKey !== null || !s1done}
               onClick={() =>
                 void run("s2", async () => {
-                  await rerunStage2(conversationId, msgIndex, {
+                  await rerunStage2Fn(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
                     use_web_search_mode: opts.use_web_search_mode,
                     judge_weights: opts.judge_weights,
@@ -1818,7 +2049,7 @@ function CouncilAssistantCard({
               disabled={busyKey !== null || !s2done}
               onClick={() =>
                 void run("s3", async () => {
-                  await rerunStage3(conversationId, msgIndex, {
+                  await rerunStage3Fn(conversationId, msgIndex, {
                     use_web_search: opts.use_web_search,
                     use_web_search_mode: opts.use_web_search_mode,
                     chairman_model: opts.chairman_model,

@@ -358,7 +358,8 @@ export async function decideWebSearchPlan(
       };
     }
   } catch (err) {
-    if ((err as { name?: string })?.name === "AbortError") throw err;
+    // 只有外部 signal 主动取消时才向上抛；本地超时触发的 AbortError 应 fallback 到规则
+    if ((err as { name?: string })?.name === "AbortError" && signal?.aborted) throw err;
     console.warn("[web-search-router] model decision failed, fallback to rules:", err);
   }
 

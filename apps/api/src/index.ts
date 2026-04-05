@@ -252,13 +252,6 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
     body.use_web_search_mode,
     body.use_web_search,
   );
-  const webSearchPlan = await decideWebSearchPlan(
-    content,
-    conv.messages,
-    webSearchMode,
-    apiKey,
-    c.req.raw.signal,
-  );
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -274,6 +267,15 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
       try {
         ensureNotAborted();
+        // 在流内决策，避免阻塞 HTTP 握手导致前端卡在初始骨架屏
+        const webSearchPlan = await decideWebSearchPlan(
+          content,
+          conv.messages,
+          webSearchMode,
+          apiKey,
+          requestSignal,
+        );
+
         await withConversationLock(id, async () => {
           await addUserMessage(id, content);
         });
@@ -874,6 +876,342 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
   }
 
   return c.json(result);
+});
+
+// ─── Stateless endpoints (no file storage) ───────────────────────────────────
+// Used by the frontend in "localStorage mode", where the client manages
+// conversation persistence. These endpoints accept full conversation history
+// in the request body and return results without reading/writing any files.
+
+type StatelessSendBody = {
+  content?: string;
+  messages?: unknown[];
+  chairman_model?: string;
+  final_model?: string;
+  use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
+  web_fetch_model?: string;
+  judge_weights?: Record<string, number>;
+  weights?: Record<string, number>;
+};
+
+app.post("/api/message/stateless/stream", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as StatelessSendBody;
+  const content = body.content?.trim();
+  if (!content) return c.json({ detail: "content required" }, 400);
+  const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+
+  const historyMessages = (body.messages ?? []) as import("./storage.js").Message[];
+  const isFirstMessage = historyMessages.filter((m) => m.role === "user").length === 0;
+  const chairmanModel = parseChairman(body);
+  const webFetchModel = parseWebFetchModel(body);
+  const judgeWeights = parseJudgeWeights(body);
+  const webSearchMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (obj: unknown) => controller.enqueue(sseLine(obj));
+      const requestSignal = c.req.raw.signal;
+      const ensureNotAborted = () => {
+        if (requestSignal.aborted) {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          throw err;
+        }
+      };
+
+      try {
+        ensureNotAborted();
+        const webSearchPlan = await decideWebSearchPlan(
+          content,
+          historyMessages,
+          webSearchMode,
+          apiKey,
+          requestSignal,
+        );
+
+        if (isFirstMessage) {
+          void (async () => {
+            try {
+              const title = await generateConversationTitle(content, apiKey, requestSignal);
+              ensureNotAborted();
+              push({ type: "title_complete", data: { title } });
+            } catch (err) {
+              console.error("generateConversationTitle (stateless):", err);
+            }
+          })();
+        }
+
+        const effectiveQuery = composeEffectiveUserQuery(content, historyMessages);
+        let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
+        let webContext: string | undefined;
+
+        if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
+          webFetchResult = {
+            ...webSearchPlan.previousWebFetch,
+            webSearchMode,
+            webSearchAction: "reuse",
+            webSearchReason: webSearchPlan.reason,
+            reusedFromPrevious: true,
+          };
+          push({ type: "web_fetch_complete", data: webFetchResult });
+          if (!webFetchResult.webSearchSkipped) webContext = webFetchResult.content;
+        } else if (webSearchPlan.action === "search") {
+          push({ type: "web_fetch_start" });
+          webFetchResult = await stageWebFetch(effectiveQuery, webFetchModel, apiKey, requestSignal, webSearchPlan);
+          push({ type: "web_fetch_complete", data: webFetchResult });
+          if (!webFetchResult.webSearchSkipped) webContext = webFetchResult.content;
+        }
+
+        push({ type: "stage1_start" });
+        const stage1Results = await stage1CollectResponses(
+          effectiveQuery,
+          webSearchPlan.action === "search",
+          webContext,
+          webFetchResult?.retrievedAt != null && webContext
+            ? { isoUtc: webFetchResult.retrievedAt, unixSeconds: webFetchResult.retrievedAtUnixSeconds ?? 0 }
+            : undefined,
+          apiKey,
+          requestSignal,
+        );
+        push({ type: "stage1_complete", data: stage1Results });
+
+        if (stage1Results.length === 0) {
+          const stage3Result: Stage3Result = { model: "error", response: STAGE1_FAILURE_MESSAGE };
+          push({ type: "stage3_complete", data: stage3Result });
+          push({ type: "complete", data: { webFetch: webFetchResult, stage1: [], stage2: [], stage3: stage3Result, metadata: { label_to_model: {}, aggregate_rankings: [] } } });
+          return;
+        }
+
+        push({ type: "stage2_start" });
+        const [stage2Results, labelToModel] = await stage2CollectRankings(
+          effectiveQuery,
+          stage1Results,
+          webSearchPlan.action === "search",
+          apiKey,
+          requestSignal,
+        );
+        const aggregateRankings = calculateAggregateRankings(stage2Results, labelToModel, judgeWeights);
+        push({ type: "stage2_complete", data: stage2Results, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } });
+
+        const chairModel = chairmanModel?.trim() || CHAIRMAN_MODEL;
+        const gate = gateChairmanStage3(
+          effectiveQuery, stage1Results, stage2Results, chairmanModel, judgeWeights, labelToModel, webFetchResult?.sources,
+        );
+
+        let stage3Result: Stage3Result;
+
+        if (!gate.proceed) {
+          stage3Result = gate.stage3;
+          const candidates = [...COUNCIL_MODELS, CHAIRMAN_MODEL, gate.analysis.chairman_model];
+          let suggested = suggestChairmanModelsThatFit(gate.analysis.estimated_input_tokens, candidates);
+          if (suggested.length === 0) {
+            suggested = [...new Set(candidates)].sort(
+              (a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
+            );
+          }
+          ensureNotAborted();
+          push({
+            type: "chairman_context_prompt",
+            data: {
+              message_index: historyMessages.length + 1,
+              chairman_model: gate.analysis.chairman_model,
+              estimated_input_tokens: gate.analysis.estimated_input_tokens,
+              context_limit: gate.analysis.context_limit,
+              max_input_tokens: gate.analysis.max_input_tokens,
+              suggested_models: suggested,
+              stage3: stage3Result,
+            },
+          });
+          push({ type: "complete", data: { webFetch: webFetchResult, stage1: stage1Results, stage2: stage2Results, stage3: stage3Result, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } } });
+        } else {
+          push({ type: "stage3_start", data: { model: chairModel } });
+          stage3Result = await stage3SynthesizeFinalStream(
+            effectiveQuery, stage1Results, stage2Results, chairmanModel,
+            webSearchPlan.action === "search", judgeWeights, labelToModel,
+            (delta) => push({ type: "stage3_delta", data: { delta } }),
+            apiKey, requestSignal, webFetchResult?.sources,
+          );
+          push({ type: "stage3_complete", data: stage3Result });
+          ensureNotAborted();
+          push({ type: "complete", data: { webFetch: webFetchResult, stage1: stage1Results, stage2: stage2Results, stage3: stage3Result, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } } });
+        }
+      } catch (e) {
+        if (isAbortError(e)) return;
+        push({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+  });
+});
+
+type StatelessRerunStage1Body = {
+  user_query?: string;
+  history_messages?: unknown[];
+  web_fetch?: import("./storage.js").WebFetchResult;
+  use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
+};
+
+app.post("/api/message/stateless/rerun-stage1", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as StatelessRerunStage1Body;
+  const userQuery = body.user_query?.trim();
+  if (!userQuery) return c.json({ detail: "user_query required" }, 400);
+  const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+
+  const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
+  const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
+  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+  const rerunPlan = await decideWebSearchPlan(userQuery, historyMessages, rerunMode, apiKey, c.req.raw.signal);
+
+  let webContext: string | undefined;
+  if (rerunPlan.action === "reuse" && rerunPlan.previousWebFetch && !rerunPlan.previousWebFetch.webSearchSkipped) {
+    webContext = rerunPlan.previousWebFetch.content;
+  } else if (rerunMode !== "off" && body.web_fetch && !body.web_fetch.webSearchSkipped) {
+    webContext = body.web_fetch.content;
+  }
+
+  const stage1 = await stage1CollectResponses(
+    effectiveQuery, rerunPlan.action === "search", webContext,
+    body.web_fetch?.retrievedAt != null
+      ? { isoUtc: body.web_fetch.retrievedAt, unixSeconds: body.web_fetch.retrievedAtUnixSeconds ?? 0 }
+      : undefined,
+    apiKey, c.req.raw.signal,
+  );
+
+  return c.json({ stage1, stale: { stage2: true, stage3: true } });
+});
+
+type StatelessRerunStage1ModelBody = StatelessRerunStage1Body & {
+  model?: string;
+  stage1?: import("./storage.js").Stage1Item[];
+};
+
+app.post("/api/message/stateless/rerun-stage1-model", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as StatelessRerunStage1ModelBody;
+  const userQuery = body.user_query?.trim();
+  const model = body.model?.trim();
+  if (!userQuery) return c.json({ detail: "user_query required" }, 400);
+  if (!model) return c.json({ detail: "model required" }, 400);
+  const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+
+  const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
+  const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
+  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+  const rerunPlan = await decideWebSearchPlan(userQuery, historyMessages, rerunMode, apiKey, c.req.raw.signal);
+
+  const res = await queryModel(model, [{ role: "user", content: effectiveQuery }], { useWebSearch: rerunPlan.action === "search", apiKey });
+
+  const currentStage1 = body.stage1 ?? [];
+  const ix = currentStage1.findIndex((s) => s.model === model);
+  if (ix === -1) return c.json({ detail: "model not in stage1" }, 400);
+
+  const stage1 = [...currentStage1];
+  stage1[ix] = { model, response: res?.content ?? "(request failed)" };
+
+  return c.json({ stage1, stale: { stage2: true, stage3: true }, webSearchSkipped: res?.webSearchSkipped });
+});
+
+type StatelessRerunStage2Body = {
+  user_query?: string;
+  history_messages?: unknown[];
+  stage1?: import("./storage.js").Stage1Item[];
+  use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
+  judge_weights?: Record<string, number>;
+  weights?: Record<string, number>;
+};
+
+app.post("/api/message/stateless/rerun-stage2", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as StatelessRerunStage2Body;
+  const userQuery = body.user_query?.trim();
+  if (!userQuery) return c.json({ detail: "user_query required" }, 400);
+  const stage1 = body.stage1;
+  if (!stage1?.length) return c.json({ detail: "stage1 required" }, 400);
+  const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+
+  const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
+  const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
+  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+  const judgeWeights = parseJudgeWeights(body);
+
+  const [stage2, labelToModel] = await stage2CollectRankings(effectiveQuery, stage1, rerunMode === "on", apiKey);
+  const aggregate_rankings = calculateAggregateRankings(stage2, labelToModel, judgeWeights);
+
+  return c.json({
+    stage2,
+    metadata: { label_to_model: labelToModel, aggregate_rankings },
+    stale: { stage2: false, stage3: true },
+  });
+});
+
+type StatelessRerunStage3Body = {
+  user_query?: string;
+  history_messages?: unknown[];
+  stage1?: import("./storage.js").Stage1Item[];
+  stage2?: import("./storage.js").Stage2Item[];
+  web_fetch?: import("./storage.js").WebFetchResult;
+  chairman_model?: string;
+  final_model?: string;
+  judge_weights?: Record<string, number>;
+  weights?: Record<string, number>;
+  use_web_search?: boolean;
+  use_web_search_mode?: "off" | "auto" | "on";
+  skip_chairman_context_check?: boolean;
+};
+
+app.post("/api/message/stateless/rerun-stage3", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as StatelessRerunStage3Body;
+  const userQuery = body.user_query?.trim();
+  if (!userQuery) return c.json({ detail: "user_query required" }, 400);
+  const stage1 = body.stage1;
+  const stage2 = body.stage2;
+  if (!stage1?.length) return c.json({ detail: "stage1 required" }, 400);
+  if (!stage2?.length) return c.json({ detail: "stage2 required" }, 400);
+  const apiKey = extractApiKey(c);
+  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+
+  const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
+  const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
+  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+  const chairmanModel = parseChairman(body);
+  const judgeWeights = parseJudgeWeights(body);
+  const labelToModel = labelToModelFromStage1(stage1);
+  const skipCtx = Boolean(body.skip_chairman_context_check);
+
+  const gate = skipCtx
+    ? ({ proceed: true as const })
+    : gateChairmanStage3(effectiveQuery, stage1, stage2, chairmanModel, judgeWeights, labelToModel, body.web_fetch?.sources);
+
+  if (!gate.proceed) {
+    const candidates = [...COUNCIL_MODELS, CHAIRMAN_MODEL, gate.analysis.chairman_model];
+    let suggested = suggestChairmanModelsThatFit(gate.analysis.estimated_input_tokens, candidates);
+    if (suggested.length === 0) {
+      suggested = [...new Set(candidates)].sort(
+        (a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
+      );
+    }
+    return c.json(
+      { detail: "chairman_context_exceeded", chairman_context: gate.analysis, suggested_models: suggested },
+      409,
+    );
+  }
+
+  const stage3 = await stage3SynthesizeFinal(
+    effectiveQuery, stage1, stage2, chairmanModel, rerunMode === "on", judgeWeights, labelToModel,
+    apiKey, undefined, body.web_fetch?.sources,
+  );
+
+  return c.json({ stage3, stale: { stage2: false, stage3: false } });
 });
 
 console.log(`Vela 助手 API listening on http://0.0.0.0:${API_PORT}`);
