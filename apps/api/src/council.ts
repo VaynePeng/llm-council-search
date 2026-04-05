@@ -32,6 +32,7 @@ function appendStructuredCitations(
 ): string {
   if (citations.length === 0) return body;
   const parts = citations.map((c, i) => {
+    const title = c.title?.trim();
     const snippet = c.content
       ? `\n   摘录：${
           c.content.length > 400
@@ -39,7 +40,9 @@ function appendStructuredCitations(
             : c.content
         }`
       : "";
-    return `${i + 1}. **${c.title ?? "(无标题)"}** — ${c.url}${snippet}`;
+    const head = title ? `**${title}**` : c.url;
+    const linkSuffix = title ? ` — ${c.url}` : "";
+    return `${i + 1}. ${head}${linkSuffix}${snippet}`;
   });
   return `${body}\n\n---\n### 检索系统返回的站点与摘录（结构化 URL 引用）\n\n以下条目来自 API 的 \`url_citation\` 标注，可与正文交叉核对。\n\n${parts.join("\n\n")}\n`;
 }
@@ -890,7 +893,7 @@ function buildChairmanUserContent(
   let webSourcesSection = "";
   if (webFetchSources?.length) {
     const sourceLines = webFetchSources.map((s, i) =>
-      `${i + 1}. [${s.title ?? s.url}](${s.url})${s.snippet ? ` — ${clipText(s.snippet, 200)}` : ""}`,
+      `${i + 1}. [${s.title?.trim() || s.url}](${s.url})${s.snippet ? ` — ${clipText(s.snippet, 200)}` : ""}`,
     );
     webSourcesSection = `\n\nWEB RETRIEVAL SOURCES (from the web search stage — use these URLs when citing):\n${sourceLines.join("\n")}`;
   }

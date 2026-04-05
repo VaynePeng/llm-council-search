@@ -323,8 +323,9 @@ function compareWebFetchSources(a: WebFetchSource, b: WebFetchSource): number {
 }
 
 function formatSourceLine(source: WebFetchSource): string {
+  const title = source.title?.trim();
   const bits = [
-    source.title ? `[${source.title}](${source.url})` : source.url,
+    title ? `[${title}](${source.url})` : source.url,
     source.sourceType,
     source.referenceWeight != null ? `参考权重 ${formatReferenceWeight(source.referenceWeight)}` : undefined,
     source.credibility ? `可信度 ${formatCredibilityLabel(source.credibility)}` : undefined,
@@ -334,8 +335,21 @@ function formatSourceLine(source: WebFetchSource): string {
   return `- ${bits.join(" | ")}`;
 }
 
-function markdownAnchor(id: string): string {
-  return `<a id="${id}"></a>`;
+function sanitizeMarkdownBlock(content: string): string {
+  return content
+    .replace(/\r\n/g, "\n")
+    .replace(/^[ \t]*<a id="[^"]+"><\/a>[ \t]*\n?/gim, "")
+    .replace(/^([ \t]*[-*+]?\s*\d*\.?\s*)\*\*\*\*\s+[—-]\s+(https?:\/\/\S+)\s*$/gim, "$1$2")
+    .trim();
+}
+
+function toMarkdownHeadingAnchor(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
 }
 
 function exportConversationMarkdown(conversation: Conversation): string {
@@ -346,25 +360,25 @@ function exportConversationMarkdown(conversation: Conversation): string {
   messages.forEach((message, index) => {
     const turn = Math.floor(index / 2) + 1;
     if (message.role === "user") {
-      const id = `user-${turn}`;
-      toc.push(`- [用户 ${turn}](#${id})`);
-      parts.push(markdownAnchor(id), `## 用户 ${turn}`, "", message.content, "");
+      const heading = `用户 ${turn}`;
+      toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+      parts.push(`## ${heading}`, "", sanitizeMarkdownBlock(message.content), "");
       return;
     }
 
     const responseMode = message.responseMode === "followup" ? "继续对话" : "Council";
-    const assistantId = `assistant-${turn}`;
-    toc.push(`- [助手 ${turn} (${responseMode})](#${assistantId})`);
-    parts.push(markdownAnchor(assistantId), `## 助手 ${turn} (${responseMode})`, "");
+    const assistantHeading = `助手 ${turn} (${responseMode})`;
+    toc.push(`- [${assistantHeading}](#${toMarkdownHeadingAnchor(assistantHeading)})`);
+    parts.push(`## ${assistantHeading}`, "");
 
     if (message.webFetch) {
-      const webFetchId = `assistant-${turn}-web-fetch`;
-      toc.push(`- [助手 ${turn} / Web 抓取](#${webFetchId})`);
-      parts.push(markdownAnchor(webFetchId), "### Web 抓取", "");
+      const heading = `助手 ${turn} Web 抓取`;
+      toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+      parts.push(`### ${heading}`, "");
       parts.push(`- 模型: ${message.webFetch.model}`);
       if (message.webFetch.webSearchReason) parts.push(`- 原因: ${message.webFetch.webSearchReason}`);
       if (message.webFetch.retrievedAt) parts.push(`- 检索时间: ${message.webFetch.retrievedAt}`);
-      parts.push("", message.webFetch.content, "");
+      parts.push("", sanitizeMarkdownBlock(message.webFetch.content), "");
       if (message.webFetch.sources?.length) {
         parts.push("#### 结构化来源", "");
         parts.push(...message.webFetch.sources.map(formatSourceLine), "");
@@ -373,35 +387,35 @@ function exportConversationMarkdown(conversation: Conversation): string {
 
     if (message.responseMode === "followup") {
       if (message.stage3) {
-        const followupId = `assistant-${turn}-followup`;
-        toc.push(`- [助手 ${turn} / 继续对话](#${followupId})`);
-        parts.push(markdownAnchor(followupId), "### 继续对话", "", `- 模型: ${message.stage3.model}`, "", message.stage3.response, "");
+        const heading = `助手 ${turn} 继续对话`;
+        toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+        parts.push(`### ${heading}`, "", `- 模型: ${message.stage3.model}`, "", sanitizeMarkdownBlock(message.stage3.response), "");
       }
       return;
     }
 
     if (message.stage1?.length) {
-      const stage1Id = `assistant-${turn}-stage-1`;
-      toc.push(`- [助手 ${turn} / Stage 1](#${stage1Id})`);
-      parts.push(markdownAnchor(stage1Id), "### Stage 1", "");
+      const heading = `助手 ${turn} Stage 1`;
+      toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+      parts.push(`### ${heading}`, "");
       message.stage1.forEach((item, i) => {
-        parts.push(`#### ${i + 1}. ${item.model}`, "", item.response, "");
+        parts.push(`#### ${i + 1}. ${item.model}`, "", sanitizeMarkdownBlock(item.response), "");
       });
     }
 
     if (message.stage2?.length) {
-      const stage2Id = `assistant-${turn}-stage-2`;
-      toc.push(`- [助手 ${turn} / Stage 2](#${stage2Id})`);
-      parts.push(markdownAnchor(stage2Id), "### Stage 2", "");
+      const heading = `助手 ${turn} Stage 2`;
+      toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+      parts.push(`### ${heading}`, "");
       message.stage2.forEach((item, i) => {
-        parts.push(`#### ${i + 1}. ${item.model}`, "", item.ranking, "");
+        parts.push(`#### ${i + 1}. ${item.model}`, "", sanitizeMarkdownBlock(item.ranking), "");
       });
     }
 
     if (message.stage3) {
-      const stage3Id = `assistant-${turn}-stage-3`;
-      toc.push(`- [助手 ${turn} / Stage 3](#${stage3Id})`);
-      parts.push(markdownAnchor(stage3Id), "### Stage 3", "", `- 模型: ${message.stage3.model}`, "", message.stage3.response, "");
+      const heading = `助手 ${turn} Stage 3`;
+      toc.push(`- [${heading}](#${toMarkdownHeadingAnchor(heading)})`);
+      parts.push(`### ${heading}`, "", `- 模型: ${message.stage3.model}`, "", sanitizeMarkdownBlock(message.stage3.response), "");
     }
   });
 
