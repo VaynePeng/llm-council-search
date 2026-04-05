@@ -13,6 +13,15 @@ export type WebFetchSource = {
   url: string;
   title?: string;
   snippet?: string;
+  sourceType?: string;
+  credibility?: "high" | "medium" | "low";
+  credibilityScore?: number;
+  /** 0-10 分制，供抓取阶段展示与后续模型参考；兼容历史数据时也可能读到旧的 0-100 值 */
+  referenceWeight?: number;
+  /** 历史兼容/调试字段，保留原始百分制权重 */
+  referenceWeightRaw?: number;
+  credibilityReason?: string;
+  filteredOut?: boolean;
 };
 
 export type WebFetchResult = {
@@ -21,6 +30,10 @@ export type WebFetchResult = {
   webSearchMode?: "off" | "auto" | "on";
   webSearchAction?: "skip" | "search" | "reuse";
   webSearchReason?: string;
+  /** 本轮联网结果是否拿到了可核验的结构化 URL 引用 */
+  webSearchVerified?: boolean;
+  /** 当联网结果未通过结构化来源校验时，给前端展示原因 */
+  webSearchWarning?: string;
   reusedFromPrevious?: boolean;
   webSearchSkipped?: boolean;
   /** ISO 8601 UTC，检索发起时刻；前端可用 dayjs 转本机时区展示 */
@@ -33,6 +46,8 @@ export type WebFetchResult = {
 export type Stage1Item = {
   model: string;
   response: string;
+  failed?: boolean;
+  error?: string;
   webSearchSkipped?: boolean;
 };
 export type Stage2Item = {
@@ -40,7 +55,12 @@ export type Stage2Item = {
   ranking: string;
   parsed_ranking: string[];
 };
-export type Stage3Result = { model: string; response: string };
+export type Stage3Result = {
+  model: string;
+  response: string;
+  reasoning_details?: unknown;
+};
+export type AssistantResponseMode = "council" | "followup";
 
 export type UserMessage = { role: "user"; content: string };
 
@@ -48,6 +68,7 @@ export type AssistantMessage = {
   role: "assistant";
   schemaVersion?: number;
   assistantMessageId: string;
+  responseMode?: AssistantResponseMode;
   webFetch?: WebFetchResult;
   stage1: Stage1Item[];
   stage2: Stage2Item[];
@@ -92,7 +113,11 @@ function migrateConversationInPlace(c: Conversation): boolean {
       dirty = true;
     }
     if (a.schemaVersion == null) {
-      a.schemaVersion = 1;
+      a.schemaVersion = 2;
+      dirty = true;
+    }
+    if (!a.responseMode) {
+      a.responseMode = "council";
       dirty = true;
     }
   }
@@ -186,13 +211,15 @@ export async function addAssistantMessage(
   stage3: Stage3Result,
   metadata?: AssistantMessage["metadata"],
   webFetch?: WebFetchResult,
+  responseMode: AssistantResponseMode = "council",
 ): Promise<void> {
   const c = await getConversation(conversationId);
   if (!c) throw new Error(`Conversation ${conversationId} not found`);
   const msg: AssistantMessage = {
     role: "assistant",
-    schemaVersion: 1,
+    schemaVersion: 2,
     assistantMessageId: randomUUID(),
+    responseMode,
     ...(webFetch ? { webFetch } : {}),
     stage1,
     stage2,

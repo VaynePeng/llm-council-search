@@ -39,10 +39,17 @@ export type Conversation = {
 export type WebSearchMode = "off" | "auto" | "on";
 
 export type ApiConfig = {
+  featured_model_groups?: Array<{
+    key: string;
+    label: string;
+    latest: string[];
+    free: string[];
+  }>;
   council_models: string[];
   /** 推荐用于 OpenRouter 联网（`openrouter:web_search`）的模型 ID */
   web_search_models?: string[];
   chairman_model: string;
+  followup_model?: string;
   title_model: string;
   web_fetch_model?: string;
   /** 已知模型的大致上下文上限（tokens），用于主席阶段预估 */
@@ -87,9 +94,13 @@ export async function deleteConversation(id: string): Promise<void> {
 
 export type SendOptions = {
   chairman_model?: string;
+  followup_model?: string;
   web_fetch_model?: string;
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: WebSearchMode;
+  continue_use_web_search?: boolean;
+  filter_untrusted_sources?: boolean;
   judge_weights?: Record<string, number>;
 };
 
@@ -106,9 +117,13 @@ export async function sendMessage(
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
+        followup_model: options?.followup_model,
         web_fetch_model: options?.web_fetch_model,
+        council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
+        continue_use_web_search: options?.continue_use_web_search,
+        filter_untrusted_sources: options?.filter_untrusted_sources,
         judge_weights: options?.judge_weights,
       }),
     },
@@ -133,9 +148,13 @@ export async function sendMessageStream(
       body: JSON.stringify({
         content,
         chairman_model: options?.chairman_model,
+        followup_model: options?.followup_model,
         web_fetch_model: options?.web_fetch_model,
+        council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
+        continue_use_web_search: options?.continue_use_web_search,
+        filter_untrusted_sources: options?.filter_untrusted_sources,
         judge_weights: options?.judge_weights,
       }),
     },
@@ -173,6 +192,7 @@ export type RerunOpts = {
   use_web_search?: boolean;
   use_web_search_mode?: WebSearchMode;
   chairman_model?: string;
+  council_models?: string[];
   judge_weights?: Record<string, number>;
   /** 跳过主席上下文检查并强制调用 Stage3 */
   skip_chairman_context_check?: boolean;
@@ -189,6 +209,7 @@ export async function rerunStage1(
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
+        council_models: opts?.council_models,
         use_web_search: opts?.use_web_search,
         use_web_search_mode: opts?.use_web_search_mode,
       }),
@@ -199,7 +220,7 @@ export async function rerunStage1(
     throw new Error(j.detail ?? "Rerun stage1 failed");
   }
   return res.json() as Promise<{
-    stage1: Array<{ model: string; response: string; webSearchSkipped?: boolean }>;
+    stage1: Array<{ model: string; response: string; failed?: boolean; error?: string; webSearchSkipped?: boolean }>;
     stale: { stage2: boolean; stage3: boolean };
   }>;
 }
@@ -217,6 +238,7 @@ export async function rerunStage1Model(
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         model,
+        council_models: opts?.council_models,
         use_web_search: opts?.use_web_search,
         use_web_search_mode: opts?.use_web_search_mode,
       }),
@@ -227,7 +249,7 @@ export async function rerunStage1Model(
     throw new Error(j.detail ?? "Rerun stage1 failed");
   }
   return res.json() as Promise<{
-    stage1: Array<{ model: string; response: string }>;
+    stage1: Array<{ model: string; response: string; failed?: boolean; error?: string; webSearchSkipped?: boolean }>;
     stale: { stage2: boolean; stage3: boolean };
     webSearchSkipped?: boolean;
   }>;
@@ -244,6 +266,7 @@ export async function rerunStage2(
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
+        council_models: opts?.council_models,
         use_web_search: opts?.use_web_search,
         use_web_search_mode: opts?.use_web_search_mode,
         judge_weights: opts?.judge_weights,
@@ -282,6 +305,7 @@ export type StoredMessage =
       role: "assistant";
       schemaVersion?: number;
       assistantMessageId: string;
+      responseMode?: "council" | "followup";
       webFetch?: unknown;
       stage1: unknown[];
       stage2: unknown[];
@@ -289,6 +313,12 @@ export type StoredMessage =
       stale?: { stage2: boolean; stage3: boolean };
       metadata?: unknown;
     };
+
+export type Stage3Payload = {
+  model: string;
+  response: string;
+  reasoning_details?: unknown;
+};
 
 export type StoredConversation = {
   id: string;
@@ -383,9 +413,13 @@ export async function sendMessageStatelessStream(
       content,
       messages,
       chairman_model: options?.chairman_model,
+      followup_model: options?.followup_model,
       web_fetch_model: options?.web_fetch_model,
+      council_models: options?.council_models,
       use_web_search: options?.use_web_search,
       use_web_search_mode: options?.use_web_search_mode,
+      continue_use_web_search: options?.continue_use_web_search,
+      filter_untrusted_sources: options?.filter_untrusted_sources,
       judge_weights: options?.judge_weights,
     }),
   });
@@ -426,6 +460,7 @@ type StatelessRerunBase = {
 export async function rerunStage1Stateless(
   params: StatelessRerunBase & {
     web_fetch?: unknown;
+    council_models?: string[];
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
   },
@@ -449,6 +484,7 @@ export async function rerunStage1ModelStateless(
   params: StatelessRerunBase & {
     model: string;
     stage1: Array<{ model: string; response: string }>;
+    council_models?: string[];
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
   },
@@ -472,6 +508,7 @@ export async function rerunStage1ModelStateless(
 export async function rerunStage2Stateless(
   params: StatelessRerunBase & {
     stage1: Array<{ model: string; response: string }>;
+    council_models?: string[];
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
     judge_weights?: Record<string, number>;
@@ -499,6 +536,7 @@ export async function rerunStage3Stateless(
     stage2: Array<{ model: string; ranking: string; parsed_ranking: string[] }>;
     web_fetch?: unknown;
     chairman_model?: string;
+    council_models?: string[];
     judge_weights?: Record<string, number>;
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
@@ -533,7 +571,7 @@ export async function rerunStage3Stateless(
     throw new Error(j.detail ?? "Rerun stage3 failed");
   }
   return res.json() as Promise<{
-    stage3: { model: string; response: string };
+    stage3: Stage3Payload;
     stale: { stage2: boolean; stage3: boolean };
   }>;
 }
@@ -552,6 +590,7 @@ export async function rerunStage3(
         use_web_search: opts?.use_web_search,
         use_web_search_mode: opts?.use_web_search_mode,
         chairman_model: opts?.chairman_model,
+        council_models: opts?.council_models,
         judge_weights: opts?.judge_weights,
         skip_chairman_context_check: opts?.skip_chairman_context_check,
       }),
@@ -580,7 +619,7 @@ export async function rerunStage3(
     throw new Error(j.detail ?? "Rerun stage3 failed");
   }
   return res.json() as Promise<{
-    stage3: { model: string; response: string };
+    stage3: Stage3Payload;
     stale: { stage2: boolean; stage3: boolean };
   }>;
 }

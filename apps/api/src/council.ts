@@ -2,6 +2,7 @@ import {
   CHAIRMAN_MODEL,
   COUNCIL_MODELS,
   CHAIRMAN_OUTPUT_RESERVE_TOKENS,
+  FOLLOWUP_MODEL,
   TITLE_MODEL,
   WEB_FETCH_MODEL,
   WEB_SEARCH_ROUTER_MODEL,
@@ -43,10 +44,20 @@ function appendStructuredCitations(
   return `${body}\n\n---\n### 检索系统返回的站点与摘录（结构化 URL 引用）\n\n以下条目来自 API 的 \`url_citation\` 标注，可与正文交叉核对。\n\n${parts.join("\n\n")}\n`;
 }
 
+export function hasVerifiedWebFetchSources(
+  webFetch?: Pick<WebFetchResult, "sources" | "webSearchVerified">,
+): boolean {
+  if (!webFetch) return false;
+  if (webFetch.webSearchVerified === false) return false;
+  return Boolean(webFetch.sources?.length);
+}
+
 export type CouncilRunOptions = {
   chairmanModel?: string;
   useWebSearch?: boolean;
   webSearchMode?: WebSearchMode;
+  /** Override Stage1/Stage2 judge models */
+  councilModels?: string[];
   /** Override `WEB_FETCH_MODEL` for the web research stage */
   webFetchModel?: string;
   /** Weight of each judge model's vote in Stage2 aggregate (default 1) */
@@ -56,6 +67,7 @@ export type CouncilRunOptions = {
   signal?: AbortSignal;
   historyMessages?: Message[];
   webSearchPlan?: WebSearchPlan;
+  filterUntrustedSources?: boolean;
 };
 
 export type WebSearchMode = "off" | "auto" | "on";
@@ -91,6 +103,156 @@ function normalizeForIntent(text: string): string {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function sourceHostname(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function classifySourceType(url: string, title?: string): {
+  sourceType: string;
+  credibility: "high" | "medium" | "low";
+  credibilityScore: number;
+  referenceWeight: number;
+  referenceWeightRaw: number;
+  credibilityReason: string;
+} {
+  const host = sourceHostname(url);
+  const text = `${host} ${title ?? ""}`.toLowerCase();
+
+  if (
+    /(^|\.)gov(\.|$)|(^|\.)edu(\.|$)|(^|\.)mil(\.|$)/.test(host) ||
+    /docs|developer|documentation|manual|reference|api/.test(text)
+  ) {
+    return {
+      sourceType: "官方/文档",
+      credibility: "high",
+      credibilityScore: 0.95,
+      referenceWeight: 9.5,
+      referenceWeightRaw: 95,
+      credibilityReason: "官方站点、政府/教育机构或正式文档，通常可直接作为一手来源。",
+    };
+  }
+
+  if (/(wikipedia|wiktionary)\.org$/.test(host)) {
+    return {
+      sourceType: "百科",
+      credibility: "medium",
+      credibilityScore: 0.62,
+      referenceWeight: 6.2,
+      referenceWeightRaw: 62,
+      credibilityReason: "可作线索，但通常不是最终采信的一手来源。",
+    };
+  }
+
+  if (
+    /(reddit\.com|x\.com|twitter\.com|weibo\.com|quora\.com|zhihu\.com|news\.ycombinator\.com|stack(over|exchange)\.com|v2ex\.com|lobste\.rs|discuss|forum|community|bbs)/.test(
+      text,
+    )
+  ) {
+    return {
+      sourceType: "论坛/社区",
+      credibility: "low",
+      credibilityScore: 0.2,
+      referenceWeight: 2,
+      referenceWeightRaw: 20,
+      credibilityReason: "社区讨论或评论内容缺少稳定审校流程，适合补充线索，不宜直接采信。",
+    };
+  }
+
+  if (
+    /(reuters\.com|apnews\.com|bloomberg\.com|ft\.com|wsj\.com|nytimes\.com|theverge\.com|techcrunch\.com|bbc\.)/.test(
+      host,
+    )
+  ) {
+    return {
+      sourceType: "媒体",
+      credibility: "high",
+      credibilityScore: 0.82,
+      referenceWeight: 8.2,
+      referenceWeightRaw: 82,
+      credibilityReason: "成熟媒体有编辑流程，但仍属二手来源，应优先与一手来源交叉核对。",
+    };
+  }
+
+  if (/(blog|medium\.com|substack\.com|ghost\.io)/.test(text)) {
+    return {
+      sourceType: "博客",
+      credibility: "medium",
+      credibilityScore: 0.48,
+      referenceWeight: 4.8,
+      referenceWeightRaw: 48,
+      credibilityReason: "博客通常缺少正式审校，应结合一手来源核验。",
+    };
+  }
+
+  return {
+    sourceType: "网页",
+    credibility: "medium",
+    credibilityScore: 0.6,
+    referenceWeight: 6,
+    referenceWeightRaw: 60,
+    credibilityReason: "普通网页来源可信度中等，需要结合具体内容与出处判断。",
+  };
+}
+
+function normalizeReferenceWeight(weight?: number): number | undefined {
+  if (weight == null || !Number.isFinite(weight)) return undefined;
+  const normalized = weight > 10 ? weight / 10 : weight;
+  return Math.round(normalized * 10) / 10;
+}
+
+function formatReferenceWeight(weight?: number): string {
+  const normalized = normalizeReferenceWeight(weight);
+  if (normalized == null) return "?/10";
+  return `${Number.isInteger(normalized) ? normalized.toFixed(0) : normalized.toFixed(1)}/10`;
+}
+
+function enrichAndSortSources(
+  sources: WebFetchSource[],
+  filterUntrustedSources = false,
+): WebFetchSource[] {
+  const enriched = sources.map((source) => {
+    const meta = classifySourceType(source.url, source.title);
+    const filteredOut =
+      filterUntrustedSources &&
+      (meta.credibility === "low" || meta.sourceType === "论坛/社区");
+    return {
+      ...source,
+      ...meta,
+      referenceWeight: normalizeReferenceWeight(
+        source.referenceWeight ?? meta.referenceWeight,
+      ),
+      filteredOut,
+    } satisfies WebFetchSource;
+  });
+
+  enriched.sort(
+    (a, b) => (b.credibilityScore ?? 0) - (a.credibilityScore ?? 0),
+  );
+
+  return filterUntrustedSources
+    ? enriched.filter((source) => !source.filteredOut)
+    : enriched;
+}
+
+function formatCredibilityForPrompt(sources: WebFetchSource[]): string {
+  if (sources.length === 0) return "";
+  const lines = sources.map((source, index) => {
+    return `${index + 1}. ${source.title ?? source.url} | ${source.sourceType ?? "网页"} | 参考权重 ${formatReferenceWeight(source.referenceWeight)} | 可信度 ${source.credibility ?? "medium"} | ${source.url} | ${source.credibilityReason ?? ""}`;
+  });
+  return [
+    "### 结构化来源可信度（供后续模型判断优先级）",
+    "",
+    "以下可信度是服务端基于来源类型的启发式排序，采用 0-10 分制，目的是帮助你优先参考官方/一手来源，避免论坛评论等低可信材料：",
+    "",
+    ...lines,
+    "",
+  ].join("\n");
+}
+
 function extractConversationRounds(messages: Message[]) {
   const rounds: Array<{ user: string; assistant?: string }> = [];
   let pendingUser: string | null = null;
@@ -110,6 +272,14 @@ function extractConversationRounds(messages: Message[]) {
 
   if (pendingUser) rounds.push({ user: pendingUser });
   return rounds;
+}
+
+function recentConversationMessages(messages: Message[]): Message[] {
+  const picked = messages.slice(-(MAX_CONTEXT_ROUNDS * 2));
+  return picked.filter((msg) => {
+    if (msg.role === "user") return Boolean(msg.content?.trim());
+    return Boolean(msg.stage3?.response?.trim());
+  });
 }
 
 export function buildConversationContext(messages: Message[]): string | undefined {
@@ -154,7 +324,7 @@ function latestWebFetch(messages: Message[]): WebFetchResult | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role !== "assistant") continue;
-    if (msg.webFetch?.content?.trim()) return msg.webFetch;
+    if (msg.webFetch?.content?.trim() && hasVerifiedWebFetchSources(msg.webFetch)) return msg.webFetch;
   }
   return undefined;
 }
@@ -292,7 +462,7 @@ function normalizePlannedAction(
   const action = raw.trim().toLowerCase();
   if (action === "skip" || action === "search") return action;
   if (action === "reuse") {
-    return previous && !previous.webSearchSkipped ? "reuse" : "search";
+    return previous && !previous.webSearchSkipped && hasVerifiedWebFetchSources(previous) ? "reuse" : "search";
   }
   return null;
 }
@@ -376,6 +546,7 @@ export async function stageWebFetch(
   apiKey?: string,
   signal?: AbortSignal,
   plan?: WebSearchPlan,
+  filterUntrustedSources = false,
 ): Promise<WebFetchResult> {
   const model = modelOverride?.trim() || WEB_FETCH_MODEL;
   const t = getWebSearchTemporalContext();
@@ -392,7 +563,10 @@ Rules:
 - Do not output your private planning or chain-of-thought. Only output the retrieval dossier.
 - Use the search tool; do not invent URLs, quotes, or publication dates.
 - Every important claim should be traceable to a real page/domain you saw in search results or API citations.
-- Source notes must stay descriptive, not prescriptive. It is acceptable to mark a source as official documentation, regulator page, company blog, press report, forum post, archived page, or undated page. It is acceptable to note visible recency or missing dates. Do not assign weights/scores.
+- Source notes must stay descriptive, not prescriptive. It is acceptable to mark a source as official documentation, regulator page, company blog, press report, forum post, archived page, or undated page.
+- Prefer official docs, regulators, primary-source announcements, and well-edited reporting. Treat forum posts, comment threads, social posts, and unverified aggregators as weak evidence.
+- If a source is obviously a forum/community/comment page, explicitly say it is low-confidence material and avoid relying on it unless necessary.
+- ${filterUntrustedSources ? "The caller has enabled unreliable-source filtering. Do not rely on forums, comment threads, social posts, or low-trust aggregators except to mention that they were excluded." : "You may mention lower-confidence sources only as secondary context and you must label them clearly as weak evidence."}
 - If results conflict, report the conflict neutrally and cite both sides. Do not decide the winner for later models.
 - Match the user's language: if the question is in Chinese, write in Simplified Chinese; otherwise mirror the question's language.
 - Use Markdown. Use real markdown links [site or title](full_url) in 参考来源 where you have URLs.
@@ -465,19 +639,33 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
 
   const sources: WebFetchSource[] | undefined =
     citations.length > 0
-      ? citations.map((c) => ({
+      ? enrichAndSortSources(
+          citations.map((c) => ({
           url: c.url,
           title: c.title,
           snippet: c.content,
-        }))
+          })),
+          filterUntrustedSources,
+        )
       : undefined;
+
+  const credibilityBlock = sources?.length
+      ? formatCredibilityForPrompt(sources)
+      : "";
+
+  const verified = Boolean(sources?.length);
+  const warning = verified
+    ? undefined
+    : "OpenRouter 本次未返回可核验的结构化 url_citation；以下正文仅为模型生成的检索摘要，不能作为已验证来源，也不会传给后续阶段。";
 
   return {
     model,
-    content,
+    content: `${content}${credibilityBlock ? `\n\n---\n${credibilityBlock}` : ""}`,
     webSearchMode: plan?.requestedMode,
     webSearchAction: plan?.action ?? "search",
     webSearchReason: plan?.reason,
+    webSearchVerified: verified,
+    ...(warning ? { webSearchWarning: warning } : {}),
     webSearchSkipped: response.webSearchSkipped,
     retrievedAt: t.isoUtc,
     retrievedAtUnixSeconds: t.unixSeconds,
@@ -494,6 +682,7 @@ export async function stage1CollectResponses(
   webRetrievalMeta?: WebRetrievalMeta,
   apiKey?: string,
   signal?: AbortSignal,
+  councilModels: string[] = COUNCIL_MODELS,
 ): Promise<Stage1Item[]> {
   let userContent = userQuery;
   if (webContext) {
@@ -539,7 +728,7 @@ ${userQuery}`;
 
   const messages: ChatMessage[] = [{ role: "user", content: userContent }];
   const opts = webContext ? { apiKey, signal } : { ...queryOpts(useWebSearch, apiKey), signal };
-  const responses = await queryModelsParallel(COUNCIL_MODELS, messages, opts);
+  const responses = await queryModelsParallel(councilModels, messages, opts);
 
   const stage1: Stage1Item[] = [];
   for (const [model, response] of responses) {
@@ -549,9 +738,21 @@ ${userQuery}`;
         response: response.content ?? "",
         webSearchSkipped: response.webSearchSkipped,
       });
+      continue;
     }
+
+    stage1.push({
+      model,
+      response: "(request failed)",
+      failed: true,
+      error: "This model failed to respond. Please retry this model.",
+    });
   }
   return stage1;
+}
+
+export function successfulStage1Items(stage1Results: Stage1Item[]): Stage1Item[] {
+  return stage1Results.filter((item) => !item.failed);
 }
 
 export async function stage2CollectRankings(
@@ -560,15 +761,17 @@ export async function stage2CollectRankings(
   useWebSearch?: boolean,
   apiKey?: string,
   signal?: AbortSignal,
+  councilModels: string[] = COUNCIL_MODELS,
 ): Promise<[Stage2Item[], Record<string, string>]> {
-  const labels = stage1Results.map((_, i) => String.fromCharCode(65 + i));
+  const successfulStage1 = successfulStage1Items(stage1Results);
+  const labels = successfulStage1.map((_, i) => String.fromCharCode(65 + i));
 
   const labelToModel: Record<string, string> = {};
   for (let i = 0; i < labels.length; i++) {
-    labelToModel[`Response ${labels[i]}`] = stage1Results[i].model;
+    labelToModel[`Response ${labels[i]}`] = successfulStage1[i].model;
   }
 
-  const responsesText = stage1Results
+  const responsesText = successfulStage1
     .map(
       (r, i) =>
         `Response ${labels[i]}:\n${r.response}`,
@@ -610,7 +813,7 @@ Now provide your evaluation and ranking:`;
 
   const messages: ChatMessage[] = [{ role: "user", content: rankingPrompt }];
   const responses = await queryModelsParallel(
-    COUNCIL_MODELS,
+    councilModels,
     messages,
     { ...queryOpts(useWebSearch, apiKey), signal },
   );
@@ -931,6 +1134,100 @@ export async function stage3SynthesizeFinalStream(
   };
 }
 
+function buildFollowUpMessages(
+  userQuery: string,
+  historyMessages: Message[],
+  webContext?: string,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: [
+        "你正在继续同一段多轮对话。",
+        "请结合已有上下文直接回答当前追问，不要把历史消息重新改写成摘要。",
+        "若历史中存在 assistant 消息里的 reasoning 上下文，请保留其连续性，不要丢弃此前推理状态。",
+        webContext
+          ? "如果你使用本轮联网检索材料，必须在正文中用 Markdown 链接给出来源名称和精确 URL，并在末尾列出 `## 参考来源`。"
+          : "本轮未执行联网检索。若无必要，不要臆造外部来源。",
+      ].join("\n"),
+    },
+  ];
+
+  for (const msg of recentConversationMessages(historyMessages)) {
+    if (msg.role === "user") {
+      messages.push({ role: "user", content: msg.content });
+      continue;
+    }
+    const assistantMessage: ChatMessage = {
+      role: "assistant",
+      content: msg.stage3.response,
+    };
+    if (msg.stage3.reasoning_details !== undefined) {
+      assistantMessage.reasoning_details = msg.stage3.reasoning_details;
+    }
+    messages.push(assistantMessage);
+  }
+
+  if (webContext) {
+    messages.push({
+      role: "system",
+      content: [
+        "补充联网检索材料：",
+        "以下内容是本轮追问专门执行的网页抓取结果，不是第一次搜索阶段的投票/主席流程。",
+        webContext,
+      ].join("\n\n"),
+    });
+  }
+
+  messages.push({ role: "user", content: userQuery });
+  return messages;
+}
+
+export async function synthesizeFollowUpAnswer(
+  userQuery: string,
+  historyMessages: Message[],
+  followupModel: string | undefined,
+  apiKey?: string,
+  signal?: AbortSignal,
+  webContext?: string,
+): Promise<Stage3Result> {
+  const model = followupModel?.trim() || FOLLOWUP_MODEL;
+  const response = await queryModel(
+    model,
+    buildFollowUpMessages(userQuery, historyMessages, webContext),
+    { apiKey, signal },
+  );
+
+  return {
+    model,
+    response: response?.content ?? "Error: Unable to generate follow-up answer.",
+    reasoning_details: response?.reasoning_details,
+  };
+}
+
+export async function synthesizeFollowUpAnswerStream(
+  userQuery: string,
+  historyMessages: Message[],
+  followupModel: string | undefined,
+  onDelta: (chunk: string) => void,
+  apiKey?: string,
+  signal?: AbortSignal,
+  webContext?: string,
+): Promise<Stage3Result> {
+  const model = followupModel?.trim() || FOLLOWUP_MODEL;
+  const response = await queryModelStream(
+    model,
+    buildFollowUpMessages(userQuery, historyMessages, webContext),
+    { apiKey, signal, onDelta },
+  );
+
+  return {
+    model,
+    response: response?.content ?? "Error: Unable to generate follow-up answer.",
+    reasoning_details: response?.reasoning_details,
+  };
+}
+
 export function parseRankingFromText(rankingText: string): string[] {
   if (rankingText.includes("FINAL RANKING:")) {
     const parts = rankingText.split("FINAL RANKING:");
@@ -1025,10 +1322,11 @@ Title:`;
 export function labelToModelFromStage1(
   stage1Results: Stage1Item[],
 ): Record<string, string> {
-  const labels = stage1Results.map((_, i) => String.fromCharCode(65 + i));
+  const successfulStage1 = successfulStage1Items(stage1Results);
+  const labels = successfulStage1.map((_, i) => String.fromCharCode(65 + i));
   const m: Record<string, string> = {};
-  for (let i = 0; i < stage1Results.length; i++) {
-    m[`Response ${labels[i]}`] = stage1Results[i].model;
+  for (let i = 0; i < successfulStage1.length; i++) {
+    m[`Response ${labels[i]}`] = successfulStage1[i].model;
   }
   return m;
 }
@@ -1047,12 +1345,14 @@ export async function runFullCouncil(
     chairmanModel,
     useWebSearch,
     webSearchMode,
+    councilModels = COUNCIL_MODELS,
     judgeWeights,
     webFetchModel,
     apiKey,
     signal,
     historyMessages = [],
     webSearchPlan,
+    filterUntrustedSources = false,
   } = options;
 
   const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
@@ -1076,7 +1376,7 @@ export async function runFullCouncil(
       webSearchReason: plan.reason,
       reusedFromPrevious: true,
     };
-    if (!webFetchResult.webSearchSkipped) {
+    if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
       webContext = webFetchResult.content;
     }
   } else if (plan.action === "search") {
@@ -1086,8 +1386,9 @@ export async function runFullCouncil(
       apiKey,
       signal,
       plan,
+      filterUntrustedSources,
     );
-    if (!webFetchResult.webSearchSkipped) {
+    if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
       webContext = webFetchResult.content;
     }
   }
@@ -1104,10 +1405,11 @@ export async function runFullCouncil(
       : undefined,
     apiKey,
     signal,
+    councilModels,
   );
-  if (stage1Results.length === 0) {
+  if (successfulStage1Items(stage1Results).length === 0) {
     return [
-      [],
+      stage1Results,
       [],
       {
         model: "error",
@@ -1124,6 +1426,7 @@ export async function runFullCouncil(
     plan.action === "search",
     apiKey,
     signal,
+    councilModels,
   );
   const aggregateRankings = calculateAggregateRankings(
     stage2Results,

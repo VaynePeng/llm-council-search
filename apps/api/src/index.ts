@@ -7,6 +7,7 @@ import {
   CHAIRMAN_MODEL,
   CHAIRMAN_OUTPUT_RESERVE_TOKENS,
   COUNCIL_MODELS,
+  FOLLOWUP_MODEL,
   TITLE_MODEL,
   WEB_FETCH_MODEL,
   WEB_SEARCH_MODELS,
@@ -19,6 +20,7 @@ import {
   decideWebSearchPlan,
   gateChairmanStage3,
   generateConversationTitle,
+  hasVerifiedWebFetchSources,
   labelToModelFromStage1,
   parseWebSearchMode,
   runFullCouncil,
@@ -27,10 +29,13 @@ import {
   stage3SynthesizeFinal,
   stage3SynthesizeFinalStream,
   stageWebFetch,
-  suggestChairmanModelsThatFit,
+  successfulStage1Items,
+  synthesizeFollowUpAnswer,
+  synthesizeFollowUpAnswerStream,
 } from "./council.js";
 import { withConversationLock } from "./lock.js";
 import { queryModel } from "./openrouter.js";
+import { getFeaturedModelGroups } from "./openrouter-models.js";
 import {
   addAssistantMessage,
   addUserMessage,
@@ -66,17 +71,26 @@ app.get("/", (c) =>
   c.json({ status: "ok", service: "Vela 助手 API (Hono)" }),
 );
 
-app.get("/api/config", (c) =>
-  c.json({
+app.get("/api/config", async (c) => {
+  let featured_model_groups: Awaited<ReturnType<typeof getFeaturedModelGroups>> = [];
+  try {
+    featured_model_groups = await getFeaturedModelGroups();
+  } catch (err) {
+    console.error("[config] failed to load OpenRouter model catalog:", err);
+  }
+
+  return c.json({
     council_models: COUNCIL_MODELS,
     web_search_models: WEB_SEARCH_MODELS,
     chairman_model: CHAIRMAN_MODEL,
+    followup_model: FOLLOWUP_MODEL,
     title_model: TITLE_MODEL,
     web_fetch_model: WEB_FETCH_MODEL,
     chairman_context_limits: chairmanContextLimitsForApi(),
     chairman_output_reserve_tokens: CHAIRMAN_OUTPUT_RESERVE_TOKENS,
-  }),
-);
+    featured_model_groups,
+  });
+});
 
 app.get("/api/conversations", async (c) => {
   const list = await listConversations();
@@ -113,13 +127,23 @@ const MISSING_API_KEY_DETAIL =
 const STAGE1_FAILURE_MESSAGE =
   "All Stage 1 model requests failed. Check your OpenRouter API key, account credits, model availability, or server logs for the upstream error.";
 
+function topChairmanModelsByContext(models: string[], limit = 5): string[] {
+  return [...new Set(models.filter(Boolean))]
+    .sort((a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a))
+    .slice(0, limit);
+}
+
 type SendBody = {
   content?: string;
   chairman_model?: string;
+  followup_model?: string;
   /** 与 `chairman_model` 同义（见项目重构 §5.4） */
   final_model?: string;
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: "off" | "auto" | "on";
+  continue_use_web_search?: boolean;
+  filter_untrusted_sources?: boolean;
   /** 覆盖服务端 `WEB_FETCH_MODEL`，用于联网检索阶段 */
   web_fetch_model?: string;
   judge_weights?: Record<string, number>;
@@ -150,6 +174,25 @@ function parseWebFetchModel(body: { web_fetch_model?: string }): string | undefi
   return v || undefined;
 }
 
+function parseFollowupModel(body: { followup_model?: string }): string | undefined {
+  const v = body.followup_model?.trim();
+  return v || undefined;
+}
+
+function parseCouncilModels(body: {
+  council_models?: string[];
+}): { models?: string[]; error?: string } {
+  if (body.council_models == null) return {};
+  if (!Array.isArray(body.council_models)) {
+    return { error: "council_models must be an array" };
+  }
+  const models = [...new Set(body.council_models.map((v) => String(v ?? "").trim()).filter(Boolean))];
+  if (models.length < 2) {
+    return { error: "council_models must contain at least 2 models" };
+  }
+  return { models };
+}
+
 function isAbortError(err: unknown): boolean {
   return (err as { name?: string })?.name === "AbortError";
 }
@@ -159,6 +202,8 @@ app.post("/api/conversations/:id/message", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
@@ -169,18 +214,13 @@ app.post("/api/conversations/:id/message", async (c) => {
     conv.messages.length === 0 ||
     !conv.title?.trim() ||
     conv.title.trim() === "New Conversation";
+  const isFollowup = conv.messages.some((message) => message.role === "assistant");
   const judgeWeights = parseJudgeWeights(body);
   const webSearchMode = parseWebSearchMode(
     body.use_web_search_mode,
     body.use_web_search,
   );
-  const webSearchPlan = await decideWebSearchPlan(
-    content,
-    conv.messages,
-    webSearchMode,
-    apiKey,
-    c.req.raw.signal,
-  );
+  const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
 
   await withConversationLock(id, async () => {
     await addUserMessage(id, content);
@@ -197,23 +237,88 @@ app.post("/api/conversations/:id/message", async (c) => {
     });
   }
 
+  if (isFollowup) {
+    const continueUseWebSearch = Boolean(body.continue_use_web_search);
+    const effectiveQuery = composeEffectiveUserQuery(content, conv.messages);
+    const webFetch = continueUseWebSearch
+      ? await stageWebFetch(
+          effectiveQuery,
+          parseWebFetchModel(body),
+          apiKey,
+          c.req.raw.signal,
+          {
+            requestedMode: "on",
+            action: "search",
+            reason: "继续对话已开启联网搜索。",
+          },
+          filterUntrustedSources,
+        )
+      : undefined;
+    const stage3 = await synthesizeFollowUpAnswer(
+      content,
+      conv.messages,
+      parseFollowupModel(body),
+      apiKey,
+      c.req.raw.signal,
+      webFetch?.content,
+    );
+
+    await withConversationLock(id, async () => {
+      await addAssistantMessage(
+        id,
+        [],
+        [],
+        stage3,
+        { label_to_model: {}, aggregate_rankings: [] },
+        webFetch,
+        "followup",
+      );
+    });
+
+    return c.json({
+      webFetch,
+      stage1: [],
+      stage2: [],
+      stage3,
+      metadata: { label_to_model: {}, aggregate_rankings: [] },
+      responseMode: "followup",
+    });
+  }
+
+  const webSearchPlan = await decideWebSearchPlan(
+    content,
+    conv.messages,
+    webSearchMode,
+    apiKey,
+    c.req.raw.signal,
+  );
   const [s1, s2, s3, meta, webFetch] = await runFullCouncil(content, {
     chairmanModel: parseChairman(body),
     useWebSearch: webSearchPlan.action === "search",
     webSearchMode,
+    councilModels: councilModels.models,
     webFetchModel: parseWebFetchModel(body),
     judgeWeights,
     apiKey,
     signal: c.req.raw.signal,
     historyMessages: conv.messages,
     webSearchPlan,
+    filterUntrustedSources,
   });
 
   await withConversationLock(id, async () => {
-    await addAssistantMessage(id, s1, s2, s3, {
-      label_to_model: meta.label_to_model,
-      aggregate_rankings: meta.aggregate_rankings,
-    }, webFetch);
+    await addAssistantMessage(
+      id,
+      s1,
+      s2,
+      s3,
+      {
+        label_to_model: meta.label_to_model,
+        aggregate_rankings: meta.aggregate_rankings,
+      },
+      webFetch,
+      "council",
+    );
   });
 
   return c.json({
@@ -222,6 +327,7 @@ app.post("/api/conversations/:id/message", async (c) => {
     stage2: s2,
     stage3: s3,
     metadata: meta,
+    responseMode: "council",
   });
 });
 
@@ -235,6 +341,8 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
@@ -245,13 +353,18 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
     conv.messages.length === 0 ||
     !conv.title?.trim() ||
     conv.title.trim() === "New Conversation";
+  const isFollowup = conv.messages.some((message) => message.role === "assistant");
   const chairmanModel = parseChairman(body);
+  const followupModel = parseFollowupModel(body);
   const webFetchModel = parseWebFetchModel(body);
   const judgeWeights = parseJudgeWeights(body);
   const webSearchMode = parseWebSearchMode(
     body.use_web_search_mode,
     body.use_web_search,
   );
+  const continueUseWebSearch = Boolean(body.continue_use_web_search);
+  const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
+  const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -267,14 +380,6 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
       try {
         ensureNotAborted();
-        // 在流内决策，避免阻塞 HTTP 握手导致前端卡在初始骨架屏
-        const webSearchPlan = await decideWebSearchPlan(
-          content,
-          conv.messages,
-          webSearchMode,
-          apiKey,
-          requestSignal,
-        );
 
         await withConversationLock(id, async () => {
           await addUserMessage(id, content);
@@ -305,6 +410,85 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         const effectiveQuery = composeEffectiveUserQuery(content, conv.messages);
         let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
         let webContext: string | undefined;
+
+        if (isFollowup) {
+          if (continueUseWebSearch) {
+            push({ type: "web_fetch_start" });
+            webFetchResult = await stageWebFetch(
+              effectiveQuery,
+              webFetchModel,
+              apiKey,
+              requestSignal,
+              {
+                requestedMode: "on",
+                action: "search",
+                reason: "继续对话已开启联网搜索。",
+              },
+              filterUntrustedSources,
+            );
+            push({ type: "web_fetch_complete", data: webFetchResult });
+            if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
+              webContext = webFetchResult.content;
+            }
+          }
+
+          push({ type: "followup_start", data: { model: followupModel?.trim() || FOLLOWUP_MODEL } });
+          const followupResult = await synthesizeFollowUpAnswerStream(
+            content,
+            conv.messages,
+            followupModel,
+            (delta) => push({ type: "followup_delta", data: { delta } }),
+            apiKey,
+            requestSignal,
+            webContext,
+          );
+          console.log("[followup_complete][conversation]", {
+            conversationId: id,
+            userContent: content,
+            model: followupResult.model,
+            responseLength: followupResult.response.length,
+            hasReasoningDetails: Array.isArray(followupResult.reasoning_details)
+              ? followupResult.reasoning_details.length > 0
+              : followupResult.reasoning_details != null,
+            responsePreview: followupResult.response.slice(0, 200),
+          });
+          push({ type: "followup_complete", data: followupResult });
+
+          ensureNotAborted();
+          await withConversationLock(id, async () => {
+            await addAssistantMessage(
+              id,
+              [],
+              [],
+              followupResult,
+              { label_to_model: {}, aggregate_rankings: [] },
+              webFetchResult,
+              "followup",
+            );
+          });
+          push({
+            type: "complete",
+            data: {
+              responseMode: "followup",
+              webFetch: webFetchResult,
+              stage1: [],
+              stage2: [],
+              stage3: followupResult,
+              metadata: { label_to_model: {}, aggregate_rankings: [] },
+            },
+          });
+          return;
+        }
+
+        // 在流内决策，避免阻塞 HTTP 握手导致前端卡在初始骨架屏
+        const webSearchPlan = await decideWebSearchPlan(
+          content,
+          conv.messages,
+          webSearchMode,
+          apiKey,
+          requestSignal,
+        );
+
         if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
           webFetchResult = {
             ...webSearchPlan.previousWebFetch,
@@ -314,7 +498,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             reusedFromPrevious: true,
           };
           push({ type: "web_fetch_complete", data: webFetchResult });
-          if (!webFetchResult.webSearchSkipped) {
+          if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
             webContext = webFetchResult.content;
           }
         } else if (webSearchPlan.action === "search") {
@@ -325,9 +509,10 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             apiKey,
             requestSignal,
             webSearchPlan,
+            filterUntrustedSources,
           );
           push({ type: "web_fetch_complete", data: webFetchResult });
-          if (!webFetchResult.webSearchSkipped) {
+          if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
             webContext = webFetchResult.content;
           }
         }
@@ -345,10 +530,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             : undefined,
           apiKey,
           requestSignal,
+          effectiveCouncilModels,
         );
         push({ type: "stage1_complete", data: stage1Results });
 
-        if (stage1Results.length === 0) {
+        if (successfulStage1Items(stage1Results).length === 0) {
           const stage3Result: Stage3Result = {
             model: "error",
             response: STAGE1_FAILURE_MESSAGE,
@@ -358,7 +544,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           await withConversationLock(id, async () => {
             await addAssistantMessage(
               id,
-              [],
+              stage1Results,
               [],
               stage3Result,
               {
@@ -366,6 +552,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
                 aggregate_rankings: [],
               },
               webFetchResult,
+              "council",
             );
           });
 
@@ -381,6 +568,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           webSearchPlan.action === "search",
           apiKey,
           requestSignal,
+          effectiveCouncilModels,
         );
         const aggregateRankings = calculateAggregateRankings(
           stage2Results,
@@ -412,20 +600,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         if (!gate.proceed) {
           stage3Result = gate.stage3;
           const candidates = [
-            ...COUNCIL_MODELS,
+            ...effectiveCouncilModels,
             CHAIRMAN_MODEL,
             gate.analysis.chairman_model,
           ];
-          let suggested = suggestChairmanModelsThatFit(
-            gate.analysis.estimated_input_tokens,
-            candidates,
-          );
-          if (suggested.length === 0) {
-            suggested = [...new Set(candidates)].sort(
-              (a, b) =>
-                resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
-            );
-          }
+          const suggested = topChairmanModelsByContext(candidates, 5);
 
           ensureNotAborted();
           await withConversationLock(id, async () => {
@@ -439,6 +618,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
                 aggregate_rankings: aggregateRankings,
               },
               webFetchResult,
+              "council",
             );
           });
 
@@ -512,6 +692,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
 
 type RerunBody = {
   model?: string;
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: "off" | "auto" | "on";
   chairman_model?: string;
@@ -537,6 +718,8 @@ app.post(
     if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+    const councilModels = parseCouncilModels(body);
+    if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
     const model = body.model?.trim();
     if (!model) return c.json({ detail: "model required" }, 400);
 
@@ -578,6 +761,11 @@ app.post(
       stage1[ix] = {
         model,
         response: res?.content ?? "(request failed)",
+        failed: res == null,
+        ...(res == null
+          ? { error: "This model failed to respond. Please retry this model." }
+          : {}),
+        webSearchSkipped: res?.webSearchSkipped,
       };
       msg.stage1 = stage1;
       msg.stale = { stage2: true, stage3: true };
@@ -617,6 +805,8 @@ app.post(
     if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+    const councilModels = parseCouncilModels(body);
+    if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
 
     const result = await withConversationLock(id, async () => {
       const conv = await getConversation(id);
@@ -647,13 +837,15 @@ app.post(
       if (
         rerunPlan.action === "reuse" &&
         rerunPlan.previousWebFetch &&
-        !rerunPlan.previousWebFetch.webSearchSkipped
+        !rerunPlan.previousWebFetch.webSearchSkipped &&
+        hasVerifiedWebFetchSources(rerunPlan.previousWebFetch)
       ) {
         webContext = rerunPlan.previousWebFetch.content;
       } else if (
         rerunMode !== "off" &&
         msg.webFetch &&
-        !msg.webFetch.webSearchSkipped
+        !msg.webFetch.webSearchSkipped &&
+        hasVerifiedWebFetchSources(msg.webFetch)
       ) {
         webContext = msg.webFetch.content;
       }
@@ -670,7 +862,11 @@ app.post(
           : undefined,
         apiKey,
         c.req.raw.signal,
+        councilModels.models ?? COUNCIL_MODELS,
       );
+      if (successfulStage1Items(stage1).length === 0) {
+        return { error: "all stage1 models failed" as const };
+      }
 
       msg.stage1 = stage1;
       msg.stale = { stage2: true, stage3: true };
@@ -688,6 +884,8 @@ app.post(
       return c.json({ detail: "message is not assistant" }, 400);
     if (result.error === "no preceding user message")
       return c.json({ detail: "no preceding user message" }, 400);
+    if (result.error === "all stage1 models failed")
+      return c.json({ detail: STAGE1_FAILURE_MESSAGE }, 502);
 
     return c.json(result);
   },
@@ -701,6 +899,8 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const judgeWeights = parseJudgeWeights(body);
 
   const result = await withConversationLock(id, async () => {
@@ -727,6 +927,8 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
       msg.stage1,
       rerunMode === "on",
       apiKey,
+      undefined,
+      councilModels.models ?? COUNCIL_MODELS,
     );
     const aggregate_rankings = calculateAggregateRankings(
       stage2,
@@ -775,6 +977,8 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const judgeWeights = parseJudgeWeights(body);
 
   const result = await withConversationLock(id, async () => {
@@ -811,20 +1015,11 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
 
     if (!gate.proceed) {
       const candidates = [
-        ...COUNCIL_MODELS,
+        ...(councilModels.models ?? COUNCIL_MODELS),
         CHAIRMAN_MODEL,
         gate.analysis.chairman_model,
       ];
-      let suggested = suggestChairmanModelsThatFit(
-        gate.analysis.estimated_input_tokens,
-        candidates,
-      );
-      if (suggested.length === 0) {
-        suggested = [...new Set(candidates)].sort(
-          (a, b) =>
-            resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
-        );
-      }
+      const suggested = topChairmanModelsByContext(candidates, 5);
       return {
         blocked: true as const,
         chairman_context: gate.analysis,
@@ -887,9 +1082,13 @@ type StatelessSendBody = {
   content?: string;
   messages?: unknown[];
   chairman_model?: string;
+  followup_model?: string;
   final_model?: string;
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: "off" | "auto" | "on";
+  continue_use_web_search?: boolean;
+  filter_untrusted_sources?: boolean;
   web_fetch_model?: string;
   judge_weights?: Record<string, number>;
   weights?: Record<string, number>;
@@ -899,15 +1098,22 @@ app.post("/api/message/stateless/stream", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as StatelessSendBody;
   const content = body.content?.trim();
   if (!content) return c.json({ detail: "content required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
   const historyMessages = (body.messages ?? []) as import("./storage.js").Message[];
   const isFirstMessage = historyMessages.filter((m) => m.role === "user").length === 0;
+  const isFollowup = historyMessages.some((m) => m.role === "assistant");
   const chairmanModel = parseChairman(body);
+  const followupModel = parseFollowupModel(body);
   const webFetchModel = parseWebFetchModel(body);
   const judgeWeights = parseJudgeWeights(body);
   const webSearchMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
+  const continueUseWebSearch = Boolean(body.continue_use_web_search);
+  const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
+  const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -923,13 +1129,6 @@ app.post("/api/message/stateless/stream", async (c) => {
 
       try {
         ensureNotAborted();
-        const webSearchPlan = await decideWebSearchPlan(
-          content,
-          historyMessages,
-          webSearchMode,
-          apiKey,
-          requestSignal,
-        );
 
         if (isFirstMessage) {
           void (async () => {
@@ -947,6 +1146,67 @@ app.post("/api/message/stateless/stream", async (c) => {
         let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
         let webContext: string | undefined;
 
+        if (isFollowup) {
+          if (continueUseWebSearch) {
+            push({ type: "web_fetch_start" });
+            webFetchResult = await stageWebFetch(
+              effectiveQuery,
+              webFetchModel,
+              apiKey,
+              requestSignal,
+              {
+                requestedMode: "on",
+                action: "search",
+                reason: "继续对话已开启联网搜索。",
+              },
+              filterUntrustedSources,
+            );
+            push({ type: "web_fetch_complete", data: webFetchResult });
+            if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
+          }
+
+          push({ type: "followup_start", data: { model: followupModel?.trim() || FOLLOWUP_MODEL } });
+          const followupResult = await synthesizeFollowUpAnswerStream(
+            content,
+            historyMessages,
+            followupModel,
+            (delta) => push({ type: "followup_delta", data: { delta } }),
+            apiKey,
+            requestSignal,
+            webContext,
+          );
+          console.log("[followup_complete][stateless]", {
+            userContent: content,
+            model: followupResult.model,
+            responseLength: followupResult.response.length,
+            hasReasoningDetails: Array.isArray(followupResult.reasoning_details)
+              ? followupResult.reasoning_details.length > 0
+              : followupResult.reasoning_details != null,
+            responsePreview: followupResult.response.slice(0, 200),
+          });
+          push({ type: "followup_complete", data: followupResult });
+          push({
+            type: "complete",
+            data: {
+              responseMode: "followup",
+              webFetch: webFetchResult,
+              stage1: [],
+              stage2: [],
+              stage3: followupResult,
+              metadata: { label_to_model: {}, aggregate_rankings: [] },
+            },
+          });
+          return;
+        }
+
+        const webSearchPlan = await decideWebSearchPlan(
+          content,
+          historyMessages,
+          webSearchMode,
+          apiKey,
+          requestSignal,
+        );
+
         if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
           webFetchResult = {
             ...webSearchPlan.previousWebFetch,
@@ -956,12 +1216,12 @@ app.post("/api/message/stateless/stream", async (c) => {
             reusedFromPrevious: true,
           };
           push({ type: "web_fetch_complete", data: webFetchResult });
-          if (!webFetchResult.webSearchSkipped) webContext = webFetchResult.content;
+          if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         } else if (webSearchPlan.action === "search") {
           push({ type: "web_fetch_start" });
-          webFetchResult = await stageWebFetch(effectiveQuery, webFetchModel, apiKey, requestSignal, webSearchPlan);
+          webFetchResult = await stageWebFetch(effectiveQuery, webFetchModel, apiKey, requestSignal, webSearchPlan, filterUntrustedSources);
           push({ type: "web_fetch_complete", data: webFetchResult });
-          if (!webFetchResult.webSearchSkipped) webContext = webFetchResult.content;
+          if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         }
 
         push({ type: "stage1_start" });
@@ -974,13 +1234,14 @@ app.post("/api/message/stateless/stream", async (c) => {
             : undefined,
           apiKey,
           requestSignal,
+          effectiveCouncilModels,
         );
         push({ type: "stage1_complete", data: stage1Results });
 
-        if (stage1Results.length === 0) {
+        if (successfulStage1Items(stage1Results).length === 0) {
           const stage3Result: Stage3Result = { model: "error", response: STAGE1_FAILURE_MESSAGE };
           push({ type: "stage3_complete", data: stage3Result });
-          push({ type: "complete", data: { webFetch: webFetchResult, stage1: [], stage2: [], stage3: stage3Result, metadata: { label_to_model: {}, aggregate_rankings: [] } } });
+          push({ type: "complete", data: { webFetch: webFetchResult, stage1: stage1Results, stage2: [], stage3: stage3Result, metadata: { label_to_model: {}, aggregate_rankings: [] } } });
           return;
         }
 
@@ -991,6 +1252,7 @@ app.post("/api/message/stateless/stream", async (c) => {
           webSearchPlan.action === "search",
           apiKey,
           requestSignal,
+          effectiveCouncilModels,
         );
         const aggregateRankings = calculateAggregateRankings(stage2Results, labelToModel, judgeWeights);
         push({ type: "stage2_complete", data: stage2Results, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } });
@@ -1004,13 +1266,8 @@ app.post("/api/message/stateless/stream", async (c) => {
 
         if (!gate.proceed) {
           stage3Result = gate.stage3;
-          const candidates = [...COUNCIL_MODELS, CHAIRMAN_MODEL, gate.analysis.chairman_model];
-          let suggested = suggestChairmanModelsThatFit(gate.analysis.estimated_input_tokens, candidates);
-          if (suggested.length === 0) {
-            suggested = [...new Set(candidates)].sort(
-              (a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
-            );
-          }
+          const candidates = [...effectiveCouncilModels, CHAIRMAN_MODEL, gate.analysis.chairman_model];
+          const suggested = topChairmanModelsByContext(candidates, 5);
           ensureNotAborted();
           push({
             type: "chairman_context_prompt",
@@ -1055,6 +1312,7 @@ type StatelessRerunStage1Body = {
   user_query?: string;
   history_messages?: unknown[];
   web_fetch?: import("./storage.js").WebFetchResult;
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: "off" | "auto" | "on";
 };
@@ -1063,6 +1321,8 @@ app.post("/api/message/stateless/rerun-stage1", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as StatelessRerunStage1Body;
   const userQuery = body.user_query?.trim();
   if (!userQuery) return c.json({ detail: "user_query required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
@@ -1072,9 +1332,9 @@ app.post("/api/message/stateless/rerun-stage1", async (c) => {
   const rerunPlan = await decideWebSearchPlan(userQuery, historyMessages, rerunMode, apiKey, c.req.raw.signal);
 
   let webContext: string | undefined;
-  if (rerunPlan.action === "reuse" && rerunPlan.previousWebFetch && !rerunPlan.previousWebFetch.webSearchSkipped) {
+  if (rerunPlan.action === "reuse" && rerunPlan.previousWebFetch && !rerunPlan.previousWebFetch.webSearchSkipped && hasVerifiedWebFetchSources(rerunPlan.previousWebFetch)) {
     webContext = rerunPlan.previousWebFetch.content;
-  } else if (rerunMode !== "off" && body.web_fetch && !body.web_fetch.webSearchSkipped) {
+  } else if (rerunMode !== "off" && body.web_fetch && !body.web_fetch.webSearchSkipped && hasVerifiedWebFetchSources(body.web_fetch)) {
     webContext = body.web_fetch.content;
   }
 
@@ -1083,7 +1343,7 @@ app.post("/api/message/stateless/rerun-stage1", async (c) => {
     body.web_fetch?.retrievedAt != null
       ? { isoUtc: body.web_fetch.retrievedAt, unixSeconds: body.web_fetch.retrievedAtUnixSeconds ?? 0 }
       : undefined,
-    apiKey, c.req.raw.signal,
+    apiKey, c.req.raw.signal, councilModels.models ?? COUNCIL_MODELS,
   );
 
   return c.json({ stage1, stale: { stage2: true, stage3: true } });
@@ -1115,7 +1375,15 @@ app.post("/api/message/stateless/rerun-stage1-model", async (c) => {
   if (ix === -1) return c.json({ detail: "model not in stage1" }, 400);
 
   const stage1 = [...currentStage1];
-  stage1[ix] = { model, response: res?.content ?? "(request failed)" };
+  stage1[ix] = {
+    model,
+    response: res?.content ?? "(request failed)",
+    failed: res == null,
+    ...(res == null
+      ? { error: "This model failed to respond. Please retry this model." }
+      : {}),
+    webSearchSkipped: res?.webSearchSkipped,
+  };
 
   return c.json({ stage1, stale: { stage2: true, stage3: true }, webSearchSkipped: res?.webSearchSkipped });
 });
@@ -1124,6 +1392,7 @@ type StatelessRerunStage2Body = {
   user_query?: string;
   history_messages?: unknown[];
   stage1?: import("./storage.js").Stage1Item[];
+  council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: "off" | "auto" | "on";
   judge_weights?: Record<string, number>;
@@ -1136,6 +1405,8 @@ app.post("/api/message/stateless/rerun-stage2", async (c) => {
   if (!userQuery) return c.json({ detail: "user_query required" }, 400);
   const stage1 = body.stage1;
   if (!stage1?.length) return c.json({ detail: "stage1 required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
@@ -1144,7 +1415,14 @@ app.post("/api/message/stateless/rerun-stage2", async (c) => {
   const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const judgeWeights = parseJudgeWeights(body);
 
-  const [stage2, labelToModel] = await stage2CollectRankings(effectiveQuery, stage1, rerunMode === "on", apiKey);
+  const [stage2, labelToModel] = await stage2CollectRankings(
+    effectiveQuery,
+    stage1,
+    rerunMode === "on",
+    apiKey,
+    undefined,
+    councilModels.models ?? COUNCIL_MODELS,
+  );
   const aggregate_rankings = calculateAggregateRankings(stage2, labelToModel, judgeWeights);
 
   return c.json({
@@ -1162,6 +1440,7 @@ type StatelessRerunStage3Body = {
   web_fetch?: import("./storage.js").WebFetchResult;
   chairman_model?: string;
   final_model?: string;
+  council_models?: string[];
   judge_weights?: Record<string, number>;
   weights?: Record<string, number>;
   use_web_search?: boolean;
@@ -1177,6 +1456,8 @@ app.post("/api/message/stateless/rerun-stage3", async (c) => {
   const stage2 = body.stage2;
   if (!stage1?.length) return c.json({ detail: "stage1 required" }, 400);
   if (!stage2?.length) return c.json({ detail: "stage2 required" }, 400);
+  const councilModels = parseCouncilModels(body);
+  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
 
@@ -1193,13 +1474,8 @@ app.post("/api/message/stateless/rerun-stage3", async (c) => {
     : gateChairmanStage3(effectiveQuery, stage1, stage2, chairmanModel, judgeWeights, labelToModel, body.web_fetch?.sources);
 
   if (!gate.proceed) {
-    const candidates = [...COUNCIL_MODELS, CHAIRMAN_MODEL, gate.analysis.chairman_model];
-    let suggested = suggestChairmanModelsThatFit(gate.analysis.estimated_input_tokens, candidates);
-    if (suggested.length === 0) {
-      suggested = [...new Set(candidates)].sort(
-        (a, b) => resolveChairmanContextLimit(b) - resolveChairmanContextLimit(a),
-      );
-    }
+    const candidates = [...(councilModels.models ?? COUNCIL_MODELS), CHAIRMAN_MODEL, gate.analysis.chairman_model];
+    const suggested = topChairmanModelsByContext(candidates, 5);
     return c.json(
       { detail: "chairman_context_exceeded", chairman_context: gate.analysis, suggested_models: suggested },
       409,

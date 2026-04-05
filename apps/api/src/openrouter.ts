@@ -3,6 +3,7 @@ import { OPENROUTER_API_URL } from "./config.js";
 export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
+  reasoning_details?: unknown;
 };
 
 /** OpenRouter 对 web 结果的 `url_citation` 标注（与 Chat Completions message 对齐） */
@@ -208,17 +209,18 @@ async function doFetchStream(
 async function consumeChatCompletionStream(
   res: Response,
   onDelta: (chunk: string) => void,
-): Promise<boolean> {
+): Promise<{ ok: boolean; reasoning_details?: unknown[] }> {
   if (!res.ok) {
     const text = await res.text();
     console.error("OpenRouter stream HTTP error:", res.status, text);
-    return false;
+    return { ok: false };
   }
   const reader = res.body?.getReader();
-  if (!reader) return false;
+  if (!reader) return { ok: false };
 
   const decoder = new TextDecoder();
   let buffer = "";
+  const reasoningDetails: unknown[] = [];
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -235,7 +237,10 @@ async function consumeChatCompletionStream(
       try {
         const j = JSON.parse(raw) as {
           choices?: Array<{
-            delta?: { content?: string | null };
+            delta?: {
+              content?: string | null;
+              reasoning_details?: unknown;
+            };
           }>;
           error?: { message?: string };
         };
@@ -243,14 +248,20 @@ async function consumeChatCompletionStream(
           console.error("OpenRouter stream chunk error:", j.error.message);
           continue;
         }
-        const piece = j.choices?.[0]?.delta?.content;
+        const delta = j.choices?.[0]?.delta;
+        const piece = delta?.content;
         if (typeof piece === "string" && piece.length > 0) onDelta(piece);
+        if (Array.isArray(delta?.reasoning_details)) {
+          reasoningDetails.push(...delta.reasoning_details);
+        }
       } catch {
         /* 忽略单行解析失败 */
       }
     }
   }
-  return true;
+  return reasoningDetails.length > 0
+    ? { ok: true, reasoning_details: reasoningDetails }
+    : { ok: true };
 }
 
 export async function queryModel(
@@ -439,7 +450,7 @@ export async function queryModelStream(
   const runStream = async (
     toSend: ChatMessage[],
     tools: Array<Record<string, unknown>> | undefined,
-  ): Promise<string | null> => {
+  ): Promise<{ content: string; reasoning_details?: unknown } | null> => {
     let accumulated = "";
     const res = await doFetchStream(
       effectiveModel,
@@ -448,11 +459,21 @@ export async function queryModelStream(
       request.signal,
       apiKey,
     );
-    const ok = await consumeChatCompletionStream(res, (ch) => {
+    const streamed = await consumeChatCompletionStream(res, (ch) => {
       accumulated += ch;
       onDelta(ch);
     });
-    return ok ? accumulated : null;
+    if (!streamed.ok) return null;
+    // Some reasoning-capable models can finish a valid stream without any
+    // user-visible `delta.content`. Treat that as a soft failure so we can
+    // retry with the non-streaming path and recover the final answer.
+    if (accumulated.trim().length === 0) return null;
+    return {
+      content: accumulated,
+      ...(streamed.reasoning_details
+        ? { reasoning_details: streamed.reasoning_details }
+        : {}),
+    };
   };
 
   try {
@@ -460,7 +481,7 @@ export async function queryModelStream(
     if (useWebSearch) {
       try {
         const acc = await runStream(payloadMessages, webTools);
-        if (acc !== null) return { content: acc };
+        if (acc !== null) return acc;
       } catch (e) {
         console.warn(
           `[OpenRouter] Web search stream threw for ${effectiveModel}:`,
@@ -472,7 +493,7 @@ export async function queryModelStream(
       );
       try {
         const acc = await runStream(messages, undefined);
-        if (acc !== null) return { content: acc, webSearchSkipped: true };
+        if (acc !== null) return { ...acc, webSearchSkipped: true };
       } catch (e) {
         console.error(
           `[OpenRouter] Stream without web search failed for ${effectiveModel}:`,
@@ -489,7 +510,7 @@ export async function queryModelStream(
 
     try {
       const acc = await runStream(messages, undefined);
-      if (acc !== null) return { content: acc };
+      if (acc !== null) return acc;
     } catch (e) {
       console.error(`[OpenRouter] Stream failed for ${effectiveModel}:`, e);
     }

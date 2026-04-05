@@ -62,6 +62,8 @@ export function resolveChairmanContextLimit(modelId: string): number {
 }
 
 export const TITLE_MODEL = process.env.TITLE_MODEL ?? 'google/gemini-2.5-flash'
+export const FOLLOWUP_MODEL =
+  process.env.FOLLOWUP_MODEL ?? 'qwen/qwen3.6-plus:free'
 
 /** 用于 `auto` 联网判定的轻量路由模型；仅做 skip/search/reuse 决策。 */
 export const WEB_SEARCH_ROUTER_MODEL =

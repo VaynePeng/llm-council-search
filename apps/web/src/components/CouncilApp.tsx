@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -12,6 +13,7 @@ import { useTheme } from "next-themes";
 import ReactMarkdown from "react-markdown";
 import {
   Check,
+  Download,
   Loader2,
   Menu,
   Moon,
@@ -27,7 +29,10 @@ import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -77,14 +82,20 @@ import dayjs from "dayjs";
 
 const WEIGHTS_STORAGE = "llm-council-search-judge-weights";
 const PREFS_STORAGE = "llm-council-search-ui-prefs";
+const MIN_STAGE2_MODELS = 2;
 
 type StoredUiPrefs = {
+  councilModels?: string[];
   webSearchMode?: WebSearchMode;
   chairmanSelect?: string;
   chairmanCustom?: string;
+  followupSelect?: string;
+  followupCustom?: string;
   webFetchSelect?: string;
   webFetchCustom?: string;
   storageMode?: "server" | "local";
+  filterUntrustedSources?: boolean;
+  continueUseWebSearch?: boolean;
 };
 
 function loadUiPrefs(): StoredUiPrefs {
@@ -103,6 +114,304 @@ function modelShortName(model: string): string {
   return p && p.length > 0 ? p : model;
 }
 
+function formatContextLimit(limit?: number): string | null {
+  if (limit == null || !Number.isFinite(limit) || limit <= 0) return null;
+  if (limit >= 1_000_000) return `${(limit / 1_000_000).toFixed(limit % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (limit >= 1_000) return `${Math.round(limit / 1_000)}k`;
+  return String(limit);
+}
+
+function modelTitleWithContext(
+  model: string,
+  contextLimits?: Record<string, number>,
+): string {
+  const formatted = formatContextLimit(contextLimits?.[model]);
+  return formatted ? `${model} · 上下文 ${formatted}` : model;
+}
+
+type ModelSelectSection = {
+  key: string;
+  label: string;
+  items: Array<{
+    key: string;
+    value: string;
+    label: string;
+    disabled?: boolean;
+  }>;
+};
+
+function buildModelSelectSections(
+  baseSections: Array<{ key: string; label: string; models: string[] }>,
+  featuredProviders: NonNullable<ApiConfig["featured_model_groups"]>,
+  contextLimits?: Record<string, number>,
+): ModelSelectSection[] {
+  const seen = new Set<string>();
+  const sections: ModelSelectSection[] = [];
+
+  for (const section of baseSections) {
+    const models = section.models.filter((model, index, list) => {
+      if (!model || list.indexOf(model) !== index || seen.has(model)) return false;
+      seen.add(model);
+      return true;
+    });
+    if (!models.length) continue;
+    sections.push({
+      key: section.key,
+      label: section.label,
+      items: models.map((model) => ({
+        key: `${section.key}-${model}`,
+        value: model,
+        label: modelTitleWithContext(model, contextLimits),
+      })),
+    });
+  }
+
+  for (const provider of featuredProviders) {
+    const latest = provider.latest.filter((model) => {
+      if (seen.has(model)) return false;
+      seen.add(model);
+      return true;
+    });
+    const free = provider.free.filter((model) => {
+      if (seen.has(model)) return false;
+      seen.add(model);
+      return true;
+    });
+
+    sections.push({
+      key: provider.key,
+      label: provider.label,
+      items: [
+        ...latest.map((model, index) => ({
+          key: `${provider.key}-latest-${model}`,
+          value: model,
+          label: `最新 ${index + 1} · ${modelTitleWithContext(model, contextLimits)}`,
+        })),
+        ...(free.length
+          ? free.map((model, index) => ({
+              key: `${provider.key}-free-${model}`,
+              value: model,
+              label: `免费 ${index + 1} · ${modelTitleWithContext(model, contextLimits)}`,
+            }))
+          : [
+              {
+                key: `${provider.key}-free-empty`,
+                value: `__${provider.key}-free-empty__`,
+                label: "免费 · 暂无",
+                disabled: true,
+              },
+            ]),
+      ],
+    });
+  }
+
+  return sections;
+}
+
+function buildWebFetchModelSections(
+  webSearchModels: string[],
+  webFetchModel: string | undefined,
+  featuredProviders: NonNullable<ApiConfig["featured_model_groups"]>,
+  contextLimits?: Record<string, number>,
+): ModelSelectSection[] {
+  const recommended = [...new Set([...webSearchModels, webFetchModel ?? ""])].filter(Boolean);
+  const sections = buildModelSelectSections(
+    [
+      {
+        key: "web-fetch-recommended",
+        label: "推荐联网模型",
+        models: recommended,
+      },
+    ],
+    featuredProviders,
+    contextLimits,
+  );
+
+  return sections.map((section) => ({
+    ...section,
+    items: section.items.map((item, index) => {
+      const isDefault = item.value === webFetchModel && Boolean(webFetchModel);
+      const prefix = [
+        "推荐",
+        isDefault ? "默认" : null,
+        section.key === "web-fetch-recommended" ? `${index + 1}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return {
+        ...item,
+        label: section.key === "web-fetch-recommended"
+          ? `${prefix} · ${item.label}`
+          : item.label,
+      };
+    }),
+  }));
+}
+
+function renderModelSelectSections(sections: ModelSelectSection[]) {
+  return sections.map((section, index) => (
+    <Fragment key={section.key}>
+      <SelectGroup>
+        <SelectLabel>{section.label}</SelectLabel>
+        {section.items.map((item) => (
+          <SelectItem key={item.key} value={item.value} disabled={item.disabled}>
+            {item.label}
+          </SelectItem>
+        ))}
+      </SelectGroup>
+      {index < sections.length - 1 ? <SelectSeparator /> : null}
+    </Fragment>
+  ));
+}
+
+function formatCredibilityLabel(credibility?: "high" | "medium" | "low"): string | undefined {
+  if (!credibility) return undefined;
+  if (credibility === "high") return "高可信";
+  if (credibility === "medium") return "中可信";
+  return "低可信";
+}
+
+function credibilityBadgeVariant(
+  credibility?: "high" | "medium" | "low",
+): "secondary" | "outline" | "warning" {
+  if (credibility === "high") return "secondary";
+  if (credibility === "low") return "warning";
+  return "outline";
+}
+
+function formatCredibilityScore(score?: number): string | undefined {
+  if (score == null || !Number.isFinite(score)) return undefined;
+  return `${(score * 10).toFixed(1)}/10`;
+}
+
+function summarizeCredibility(sources: WebFetchSource[]): string {
+  const counts = { high: 0, medium: 0, low: 0 };
+  sources.forEach((source) => {
+    if (source.credibility === "high") counts.high += 1;
+    else if (source.credibility === "low") counts.low += 1;
+    else counts.medium += 1;
+  });
+
+  const parts: string[] = [];
+  if (counts.high) parts.push(`高可信 ${counts.high}`);
+  if (counts.medium) parts.push(`中可信 ${counts.medium}`);
+  if (counts.low) parts.push(`低可信 ${counts.low}`);
+  return parts.length ? parts.join(" · ") : `共 ${sources.length} 条来源`;
+}
+
+function sourceHostnameLabel(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function compareWebFetchSources(a: WebFetchSource, b: WebFetchSource): number {
+  const scoreDelta = (b.credibilityScore ?? -1) - (a.credibilityScore ?? -1);
+  if (scoreDelta !== 0) return scoreDelta;
+
+  const bWeight = normalizeReferenceWeight(b.referenceWeight ?? b.referenceWeightRaw) ?? -1;
+  const aWeight = normalizeReferenceWeight(a.referenceWeight ?? a.referenceWeightRaw) ?? -1;
+  const weightDelta = bWeight - aWeight;
+  if (weightDelta !== 0) return weightDelta;
+
+  const hostDelta = sourceHostnameLabel(a.url).localeCompare(sourceHostnameLabel(b.url));
+  if (hostDelta !== 0) return hostDelta;
+
+  return (a.title ?? a.url).localeCompare(b.title ?? b.url);
+}
+
+function formatSourceLine(source: WebFetchSource): string {
+  const bits = [
+    source.title ? `[${source.title}](${source.url})` : source.url,
+    source.sourceType,
+    source.referenceWeight != null ? `参考权重 ${formatReferenceWeight(source.referenceWeight)}` : undefined,
+    source.credibility ? `可信度 ${formatCredibilityLabel(source.credibility)}` : undefined,
+    source.credibilityScore != null ? `分数 ${formatCredibilityScore(source.credibilityScore)}` : undefined,
+    source.credibilityReason,
+  ].filter(Boolean);
+  return `- ${bits.join(" | ")}`;
+}
+
+function markdownAnchor(id: string): string {
+  return `<a id="${id}"></a>`;
+}
+
+function exportConversationMarkdown(conversation: Conversation): string {
+  const messages = conversation.messages as unknown as (UserMsg | AssistantMsg)[];
+  const toc: string[] = [];
+  const parts = [`# ${conversation.title}`, "", `- 会话 ID: ${conversation.id}`, `- 创建时间: ${conversation.created_at}`, ""];
+
+  messages.forEach((message, index) => {
+    const turn = Math.floor(index / 2) + 1;
+    if (message.role === "user") {
+      const id = `user-${turn}`;
+      toc.push(`- [用户 ${turn}](#${id})`);
+      parts.push(markdownAnchor(id), `## 用户 ${turn}`, "", message.content, "");
+      return;
+    }
+
+    const responseMode = message.responseMode === "followup" ? "继续对话" : "Council";
+    const assistantId = `assistant-${turn}`;
+    toc.push(`- [助手 ${turn} (${responseMode})](#${assistantId})`);
+    parts.push(markdownAnchor(assistantId), `## 助手 ${turn} (${responseMode})`, "");
+
+    if (message.webFetch) {
+      const webFetchId = `assistant-${turn}-web-fetch`;
+      toc.push(`- [助手 ${turn} / Web 抓取](#${webFetchId})`);
+      parts.push(markdownAnchor(webFetchId), "### Web 抓取", "");
+      parts.push(`- 模型: ${message.webFetch.model}`);
+      if (message.webFetch.webSearchReason) parts.push(`- 原因: ${message.webFetch.webSearchReason}`);
+      if (message.webFetch.retrievedAt) parts.push(`- 检索时间: ${message.webFetch.retrievedAt}`);
+      parts.push("", message.webFetch.content, "");
+      if (message.webFetch.sources?.length) {
+        parts.push("#### 结构化来源", "");
+        parts.push(...message.webFetch.sources.map(formatSourceLine), "");
+      }
+    }
+
+    if (message.responseMode === "followup") {
+      if (message.stage3) {
+        const followupId = `assistant-${turn}-followup`;
+        toc.push(`- [助手 ${turn} / 继续对话](#${followupId})`);
+        parts.push(markdownAnchor(followupId), "### 继续对话", "", `- 模型: ${message.stage3.model}`, "", message.stage3.response, "");
+      }
+      return;
+    }
+
+    if (message.stage1?.length) {
+      const stage1Id = `assistant-${turn}-stage-1`;
+      toc.push(`- [助手 ${turn} / Stage 1](#${stage1Id})`);
+      parts.push(markdownAnchor(stage1Id), "### Stage 1", "");
+      message.stage1.forEach((item, i) => {
+        parts.push(`#### ${i + 1}. ${item.model}`, "", item.response, "");
+      });
+    }
+
+    if (message.stage2?.length) {
+      const stage2Id = `assistant-${turn}-stage-2`;
+      toc.push(`- [助手 ${turn} / Stage 2](#${stage2Id})`);
+      parts.push(markdownAnchor(stage2Id), "### Stage 2", "");
+      message.stage2.forEach((item, i) => {
+        parts.push(`#### ${i + 1}. ${item.model}`, "", item.ranking, "");
+      });
+    }
+
+    if (message.stage3) {
+      const stage3Id = `assistant-${turn}-stage-3`;
+      toc.push(`- [助手 ${turn} / Stage 3](#${stage3Id})`);
+      parts.push(markdownAnchor(stage3Id), "### Stage 3", "", `- 模型: ${message.stage3.model}`, "", message.stage3.response, "");
+    }
+  });
+
+  if (toc.length) {
+    parts.splice(4, 0, "## 目录", "", ...toc, "");
+  }
+
+  return `${parts.join("\n").trim()}\n`;
+}
+
 const markdownComponents: Record<string, React.ComponentType<React.AnchorHTMLAttributes<HTMLAnchorElement>>> = {
   a: ({ children, ...props }) => (
     <a {...props} target="_blank" rel="noopener noreferrer">
@@ -115,6 +424,13 @@ type WebFetchSource = {
   url: string;
   title?: string;
   snippet?: string;
+  sourceType?: string;
+  credibility?: "high" | "medium" | "low";
+  credibilityScore?: number;
+  referenceWeight?: number;
+  referenceWeightRaw?: number;
+  credibilityReason?: string;
+  filteredOut?: boolean;
 };
 
 type WebFetchResult = {
@@ -123,6 +439,8 @@ type WebFetchResult = {
   webSearchMode?: WebSearchMode;
   webSearchAction?: "skip" | "search" | "reuse";
   webSearchReason?: string;
+  webSearchVerified?: boolean;
+  webSearchWarning?: string;
   reusedFromPrevious?: boolean;
   webSearchSkipped?: boolean;
   retrievedAt?: string;
@@ -133,6 +451,8 @@ type WebFetchResult = {
 type Stage1Item = {
   model: string;
   response: string;
+  failed?: boolean;
+  error?: string;
   webSearchSkipped?: boolean;
 };
 type Stage2Item = {
@@ -140,10 +460,12 @@ type Stage2Item = {
   ranking: string;
   parsed_ranking: string[];
 };
-type Stage3 = { model: string; response: string };
+type Stage3 = { model: string; response: string; reasoning_details?: unknown };
 
 type AssistantMsg = {
   role: "assistant";
+  assistantMessageId?: string;
+  responseMode?: "council" | "followup";
   pending?: boolean;
   webFetch?: WebFetchResult | null;
   stage1: Stage1Item[] | null;
@@ -165,6 +487,18 @@ type AssistantMsg = {
   };
   stale?: { stage2: boolean; stage3: boolean };
 };
+
+function normalizeReferenceWeight(weight?: number): number | undefined {
+  if (weight == null || !Number.isFinite(weight)) return undefined;
+  const normalized = weight > 10 ? weight / 10 : weight;
+  return Math.round(normalized * 10) / 10;
+}
+
+function formatReferenceWeight(weight?: number): string {
+  const normalized = normalizeReferenceWeight(weight);
+  if (normalized == null) return "?/10";
+  return `${Number.isInteger(normalized) ? normalized.toFixed(0) : normalized.toFixed(1)}/10`;
+}
 
 const DEFAULT_ASSISTANT_LOADING: AssistantMsg["loading"] = {
   webFetch: false,
@@ -225,16 +559,36 @@ function usePinnedBottomAutoscroll(
   }, [containerRef, trigger]);
 }
 
-function streamingAssistantShell(pending = false): AssistantMsg {
+function streamingAssistantShell({
+  pending = false,
+  responseMode = "council",
+  assistantMessageId = crypto.randomUUID(),
+  stage3Model,
+  stage3Loading = false,
+}: {
+  pending?: boolean;
+  responseMode?: AssistantMsg["responseMode"];
+  assistantMessageId?: string;
+  stage3Model?: string;
+  stage3Loading?: boolean;
+} = {}): AssistantMsg {
   return {
     role: "assistant",
+    assistantMessageId,
+    responseMode,
     pending,
     webFetch: null,
     stage1: null,
     stage2: null,
-    stage3: null,
+    stage3:
+      responseMode === "followup"
+        ? { model: stage3Model || "…", response: "" }
+        : null,
     metadata: null,
-    loading: { ...DEFAULT_ASSISTANT_LOADING },
+    loading: {
+      ...DEFAULT_ASSISTANT_LOADING,
+      stage3: stage3Loading,
+    },
   };
 }
 
@@ -264,6 +618,16 @@ function buildJudgeWeights(
   return out;
 }
 
+function normalizeCouncilModels(
+  models: string[] | undefined,
+  fallback: string[],
+): string[] {
+  const raw = (models ?? []).map((model) => model.trim());
+  const cleaned = [...new Set(raw.filter(Boolean))];
+  if (raw.length >= MIN_STAGE2_MODELS) return raw;
+  return cleaned.length >= MIN_STAGE2_MODELS ? cleaned : fallback;
+}
+
 export default function CouncilApp() {
   const { setTheme, resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
@@ -272,14 +636,22 @@ export default function CouncilApp() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [input, setInput] = useState("");
+  const [councilModels, setCouncilModels] = useState<string[]>([]);
+  const [editingCouncilModelIndex, setEditingCouncilModelIndex] = useState<number | null>(null);
+  const [editingCouncilModelCustom, setEditingCouncilModelCustom] = useState("");
+  const [councilModelsError, setCouncilModelsError] = useState<string | null>(null);
   const [loadingByConversation, setLoadingByConversation] = useState<
     Record<string, boolean>
   >({});
   const [chairmanSelect, setChairmanSelect] = useState<string>("");
   const [chairmanCustom, setChairmanCustom] = useState("");
+  const [followupSelect, setFollowupSelect] = useState<string>("");
+  const [followupCustom, setFollowupCustom] = useState("");
   const [webFetchSelect, setWebFetchSelect] = useState<string>("");
   const [webFetchCustom, setWebFetchCustom] = useState("");
   const [webSearchMode, setWebSearchMode] = useState<WebSearchMode>("auto");
+  const [continueUseWebSearch, setContinueUseWebSearch] = useState(false);
+  const [filterUntrustedSources, setFilterUntrustedSources] = useState(true);
   const [storageMode, setStorageMode] = useState<"server" | "local">("server");
   const [judgeWeights, setJudgeWeights] = useState<Record<string, number>>({});
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -380,6 +752,127 @@ export default function CouncilApp() {
     if (webFetchSelect) return webFetchSelect;
     return "";
   }, [webFetchSelect, webFetchCustom]);
+
+  const followupEffective = useMemo(() => {
+    if (followupSelect === "__custom__") return followupCustom.trim();
+    if (followupSelect) return followupSelect;
+    return "";
+  }, [followupCustom, followupSelect]);
+
+  const effectiveCouncilModels = useMemo(
+    () => normalizeCouncilModels(councilModels, apiConfig?.council_models ?? []),
+    [apiConfig?.council_models, councilModels],
+  );
+  const validCouncilModels = useMemo(() => {
+    const cleaned = effectiveCouncilModels.map((model) => model.trim());
+    if (cleaned.length < MIN_STAGE2_MODELS) return null;
+    if (cleaned.some((model) => !model)) return null;
+    if (new Set(cleaned).size !== cleaned.length) return null;
+    return cleaned;
+  }, [effectiveCouncilModels]);
+
+  const webFetchModelSections = useMemo(
+    () =>
+      buildWebFetchModelSections(
+        apiConfig?.web_search_models ?? [],
+        apiConfig?.web_fetch_model,
+        apiConfig?.featured_model_groups ?? [],
+        apiConfig?.chairman_context_limits,
+      ),
+    [
+      apiConfig?.chairman_context_limits,
+      apiConfig?.featured_model_groups,
+      apiConfig?.web_fetch_model,
+      apiConfig?.web_search_models,
+    ],
+  );
+
+  const chairmanModelSections = useMemo(
+    () =>
+      buildModelSelectSections([
+        {
+          key: "chairman-defaults",
+          label: "当前 Council 配置",
+          models: [
+            ...(apiConfig?.council_models ?? []),
+            ...effectiveCouncilModels,
+            apiConfig?.chairman_model ?? "",
+          ],
+        },
+      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+    [
+      apiConfig?.chairman_model,
+      apiConfig?.chairman_context_limits,
+      apiConfig?.council_models,
+      effectiveCouncilModels,
+      apiConfig?.featured_model_groups,
+    ],
+  );
+
+  const followupModelSections = useMemo(
+    () =>
+      buildModelSelectSections([
+        {
+          key: "followup-defaults",
+          label: "当前继续对话配置",
+          models: [
+            apiConfig?.followup_model ?? "",
+            "qwen/qwen3.6-plus:free",
+            ...effectiveCouncilModels,
+          ],
+        },
+      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+    [
+      apiConfig?.chairman_context_limits,
+      effectiveCouncilModels,
+      apiConfig?.featured_model_groups,
+      apiConfig?.followup_model,
+    ],
+  );
+
+  const buildStage2ModelSectionsFor = useCallback(
+    (currentModel?: string) =>
+      buildModelSelectSections([
+        {
+          key: "stage2-current",
+          label: "当前模型",
+          models: currentModel ? [currentModel] : [],
+        },
+        {
+          key: "stage2-defaults",
+          label: "可选模型",
+          models: [
+            ...(apiConfig?.council_models ?? []),
+            apiConfig?.chairman_model ?? "",
+            apiConfig?.followup_model ?? "",
+          ].filter((model) => {
+            if (!model) return false;
+            if (model === currentModel) return true;
+            return !effectiveCouncilModels.filter(Boolean).includes(model);
+          }),
+        },
+      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+    [
+      apiConfig?.chairman_model,
+      apiConfig?.chairman_context_limits,
+      apiConfig?.council_models,
+      apiConfig?.featured_model_groups,
+      apiConfig?.followup_model,
+      effectiveCouncilModels,
+    ],
+  );
+
+  const chairmanPromptSections = useMemo(
+    () =>
+      buildModelSelectSections([
+        {
+          key: "chairman-suggested",
+          label: "推荐的 5 个最大上下文模型",
+          models: chairmanContextPrompt?.suggested_models ?? [],
+        },
+      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+    [apiConfig?.chairman_context_limits, apiConfig?.featured_model_groups, chairmanContextPrompt?.suggested_models],
+  );
 
   const loadConversations = useCallback(async () => {
     try {
@@ -488,24 +981,31 @@ export default function CouncilApp() {
         const prefs = loadUiPrefs();
         setApiConfig(cfg);
         const stored = loadStoredWeights();
-        setJudgeWeights(buildJudgeWeights(cfg.council_models, stored));
+        const initialCouncilModels = normalizeCouncilModels(
+          prefs.councilModels,
+          cfg.council_models,
+        );
+        setCouncilModels(initialCouncilModels);
+        setJudgeWeights(buildJudgeWeights(initialCouncilModels.filter(Boolean), stored));
         setWebSearchMode(prefs.webSearchMode ?? "auto");
         setChairmanSelect(
           prefs.chairmanSelect ?? cfg.chairman_model,
         );
         setChairmanCustom(prefs.chairmanCustom ?? "");
+        setFollowupSelect(
+          prefs.followupSelect ?? cfg.followup_model ?? "qwen/qwen3.6-plus:free",
+        );
+        setFollowupCustom(prefs.followupCustom ?? "");
         const wfDefault = cfg.web_fetch_model?.trim() ?? "";
         const wsModels = cfg.web_search_models ?? [];
         const savedWf = prefs.webFetchSelect;
-        const savedOk =
-          savedWf === "__custom__" ||
-          (savedWf &&
-            (wsModels.includes(savedWf) || savedWf === wfDefault));
         setWebFetchSelect(
-          savedOk ? (savedWf ?? wfDefault) : wfDefault || wsModels[0] || "",
+          savedWf ?? (wfDefault || wsModels[0] || ""),
         );
         setWebFetchCustom(prefs.webFetchCustom ?? "");
         setStorageMode(prefs.storageMode ?? "server");
+        setFilterUntrustedSources(prefs.filterUntrustedSources ?? true);
+        setContinueUseWebSearch(prefs.continueUseWebSearch ?? false);
       } catch (e) {
         console.error(e);
       }
@@ -518,12 +1018,17 @@ export default function CouncilApp() {
       localStorage.setItem(
         PREFS_STORAGE,
         JSON.stringify({
+          councilModels: effectiveCouncilModels,
           webSearchMode,
           chairmanSelect,
           chairmanCustom,
+          followupSelect,
+          followupCustom,
           webFetchSelect,
           webFetchCustom,
           storageMode,
+          filterUntrustedSources,
+          continueUseWebSearch,
         } satisfies StoredUiPrefs),
       );
     } catch {
@@ -531,13 +1036,27 @@ export default function CouncilApp() {
     }
   }, [
     apiConfig,
+    effectiveCouncilModels,
     webSearchMode,
     chairmanSelect,
     chairmanCustom,
+    followupSelect,
+    followupCustom,
     webFetchSelect,
     webFetchCustom,
     storageMode,
+    filterUntrustedSources,
+    continueUseWebSearch,
   ]);
+
+  useEffect(() => {
+    if (!apiConfig || !validCouncilModels?.length) return;
+    setJudgeWeights((prev) => {
+      const next = buildJudgeWeights(validCouncilModels, prev);
+      persistWeights(next);
+      return next;
+    });
+  }, [apiConfig, validCouncilModels]);
 
   useEffect(() => {
     void loadConversations();
@@ -581,15 +1100,44 @@ export default function CouncilApp() {
     }
   };
 
+  const handleExportMarkdown = useCallback(() => {
+    if (!conversation || typeof window === "undefined") return;
+    const markdown = exportConversationMarkdown(conversation);
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeTitle = (conversation.title || "conversation")
+      .replace(/[^\w\u4e00-\u9fa5-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    a.href = url;
+    a.download = `${safeTitle || "conversation"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [conversation]);
+
   const sendOpts = useCallback(
-    () => ({
+    (isFollowup: boolean) => ({
       chairman_model: chairmanEffective || undefined,
+      followup_model: followupEffective || undefined,
       web_fetch_model: webFetchEffective || undefined,
+      council_models: validCouncilModels ?? undefined,
       use_web_search: webSearchMode !== "off",
       use_web_search_mode: webSearchMode,
+      continue_use_web_search: isFollowup ? continueUseWebSearch : undefined,
+      filter_untrusted_sources: filterUntrustedSources,
       judge_weights: judgeWeights,
     }),
-    [chairmanEffective, webFetchEffective, webSearchMode, judgeWeights],
+    [
+      chairmanEffective,
+      continueUseWebSearch,
+      validCouncilModels,
+      filterUntrustedSources,
+      followupEffective,
+      webFetchEffective,
+      webSearchMode,
+      judgeWeights,
+    ],
   );
 
   const runStreamForContent = useCallback(
@@ -637,6 +1185,9 @@ export default function CouncilApp() {
         const localHistoryMessages = storageMode === "local"
           ? (getLocalConversation(convId)?.messages ?? [])
           : null;
+        const isFollowup = (localHistoryMessages ?? conversation?.messages ?? []).some(
+          (message) => (message as { role?: string }).role === "assistant",
+        );
 
         // Collected data for localStorage persistence in local mode
         const localCollected: {
@@ -646,6 +1197,7 @@ export default function CouncilApp() {
           stage3?: Stage3;
           metadata?: AssistantMsg["metadata"];
           title?: string;
+          responseMode?: "council" | "followup";
           chairmanContextMsgIndex?: number;
           chairmanContextStage3?: Stage3;
         } = {};
@@ -662,6 +1214,7 @@ export default function CouncilApp() {
             maybeRefreshSidebar();
             patchLastAssistantActive((m) => ({
               ...m,
+              responseMode: isFollowup ? "followup" : "council",
               webFetch:
                 m.webFetch ??
                 ({ model: webFetchEffective || apiConfig?.web_fetch_model || "联网检索", content: "" } as WebFetchResult),
@@ -680,6 +1233,7 @@ export default function CouncilApp() {
             maybeRefreshSidebar();
             patchLastAssistantActive((m) => ({
               ...m,
+              responseMode: "council",
               loading: { ...m.loading, stage1: true },
             }));
             break;
@@ -743,10 +1297,48 @@ export default function CouncilApp() {
             );
             break;
           }
+          case "followup_start": {
+            const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
+            if (storageMode === "local") localCollected.responseMode = "followup";
+            patchLastAssistantActive((m) => ({
+              ...m,
+              responseMode: "followup",
+              loading: { ...m.loading, stage3: true },
+              stage3: { model: sm || "…", response: "" },
+            }));
+            break;
+          }
+          case "followup_delta": {
+            const delta = String(
+              (ev as { data?: { delta?: string } }).data?.delta ?? "",
+            );
+            if (!delta) break;
+            patchLastAssistantActive((m) => ({
+              ...m,
+              responseMode: "followup",
+              stage3: m.stage3
+                ? { ...m.stage3, response: m.stage3.response + delta }
+                : { model: "", response: delta },
+            }));
+            break;
+          }
+          case "followup_complete":
+            if (storageMode === "local") {
+              localCollected.stage3 = ev.data as Stage3;
+              localCollected.responseMode = "followup";
+            }
+            patchLastAssistantActive((m) => ({
+              ...m,
+              responseMode: "followup",
+              stage3: ev.data as Stage3,
+              loading: { ...m.loading, stage3: false },
+            }));
+            break;
           case "stage3_start": {
             const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
             patchLastAssistantActive((m) => ({
               ...m,
+              responseMode: "council",
               loading: { ...m.loading, stage3: true },
               stage3: { model: sm || "…", response: "" },
             }));
@@ -795,8 +1387,11 @@ export default function CouncilApp() {
                 const userMsg = { role: "user" as const, content };
                 const assistantMsg = {
                   role: "assistant" as const,
-                  schemaVersion: 1,
+                  schemaVersion: 2,
                   assistantMessageId: crypto.randomUUID(),
+                  responseMode:
+                    localCollected.responseMode ??
+                    (isFollowup ? "followup" : "council"),
                   ...(localCollected.webFetch ? { webFetch: localCollected.webFetch } : {}),
                   stage1: localCollected.stage1 ?? [],
                   stage2: localCollected.stage2 ?? [],
@@ -837,7 +1432,7 @@ export default function CouncilApp() {
             default:
               break;
           }
-        }, sendOpts(), controller.signal);
+        }, sendOpts(isFollowup), controller.signal);
       } finally {
         if (streamAbortRef.current[convId] === controller) {
           delete streamAbortRef.current[convId];
@@ -853,6 +1448,7 @@ export default function CouncilApp() {
       setConversationLoading,
       storageMode,
       webFetchEffective,
+      conversation?.messages,
     ],
   );
 
@@ -862,7 +1458,7 @@ export default function CouncilApp() {
   // shape as the server rerun functions so CouncilAssistantCard stays unchanged.
 
   const localRerunStage1 = useCallback(
-    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode }) => {
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; council_models?: string[] }) => {
       const conv = getLocalConversation(conversationId);
       if (!conv) throw new Error("Conversation not found");
       const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
@@ -873,7 +1469,7 @@ export default function CouncilApp() {
       }
       if (!userQuery) throw new Error("No preceding user message");
       const history = msgs.slice(0, Math.max(0, msgIndex - 1));
-      const result = await rerunStage1Stateless({ user_query: userQuery, history_messages: history, web_fetch: msg.webFetch as never, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
+      const result = await rerunStage1Stateless({ user_query: userQuery, history_messages: history, web_fetch: msg.webFetch as never, council_models: opts?.council_models, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
       const updatedMsgs = [...(conv.messages as unknown[])];
       updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage1: result.stage1, stale: result.stale, metadata: undefined };
       saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
@@ -883,7 +1479,7 @@ export default function CouncilApp() {
   );
 
   const localRerunStage1Model = useCallback(
-    async (conversationId: string, msgIndex: number, model: string, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode }) => {
+    async (conversationId: string, msgIndex: number, model: string, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; council_models?: string[] }) => {
       const conv = getLocalConversation(conversationId);
       if (!conv) throw new Error("Conversation not found");
       const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
@@ -894,7 +1490,7 @@ export default function CouncilApp() {
       }
       if (!userQuery) throw new Error("No preceding user message");
       const history = msgs.slice(0, Math.max(0, msgIndex - 1));
-      const result = await rerunStage1ModelStateless({ user_query: userQuery, history_messages: history, model, stage1: msg.stage1 ?? [], use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
+      const result = await rerunStage1ModelStateless({ user_query: userQuery, history_messages: history, model, stage1: msg.stage1 ?? [], council_models: opts?.council_models, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode });
       const updatedMsgs = [...(conv.messages as unknown[])];
       updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage1: result.stage1, stale: result.stale, metadata: undefined };
       saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
@@ -904,7 +1500,7 @@ export default function CouncilApp() {
   );
 
   const localRerunStage2 = useCallback(
-    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; judge_weights?: Record<string, number> }) => {
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; council_models?: string[]; judge_weights?: Record<string, number> }) => {
       const conv = getLocalConversation(conversationId);
       if (!conv) throw new Error("Conversation not found");
       const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
@@ -915,7 +1511,7 @@ export default function CouncilApp() {
       }
       if (!userQuery) throw new Error("No preceding user message");
       const history = msgs.slice(0, Math.max(0, msgIndex - 1));
-      const result = await rerunStage2Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, judge_weights: opts?.judge_weights });
+      const result = await rerunStage2Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], council_models: opts?.council_models, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, judge_weights: opts?.judge_weights });
       const updatedMsgs = [...(conv.messages as unknown[])];
       updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage2: result.stage2, stale: result.stale, metadata: result.metadata };
       saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
@@ -925,7 +1521,7 @@ export default function CouncilApp() {
   );
 
   const localRerunStage3 = useCallback(
-    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; chairman_model?: string; judge_weights?: Record<string, number>; skip_chairman_context_check?: boolean }) => {
+    async (conversationId: string, msgIndex: number, opts?: { use_web_search?: boolean; use_web_search_mode?: WebSearchMode; chairman_model?: string; council_models?: string[]; judge_weights?: Record<string, number>; skip_chairman_context_check?: boolean }) => {
       const conv = getLocalConversation(conversationId);
       if (!conv) throw new Error("Conversation not found");
       const msgs = conv.messages as unknown as Array<{ role: string; content?: string }>;
@@ -936,7 +1532,7 @@ export default function CouncilApp() {
       }
       if (!userQuery) throw new Error("No preceding user message");
       const history = msgs.slice(0, Math.max(0, msgIndex - 1));
-      const result = await rerunStage3Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], stage2: msg.stage2 ?? [], web_fetch: msg.webFetch as never, chairman_model: opts?.chairman_model, judge_weights: opts?.judge_weights, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, skip_chairman_context_check: opts?.skip_chairman_context_check });
+      const result = await rerunStage3Stateless({ user_query: userQuery, history_messages: history, stage1: msg.stage1 ?? [], stage2: msg.stage2 ?? [], web_fetch: msg.webFetch as never, chairman_model: opts?.chairman_model, council_models: opts?.council_models, judge_weights: opts?.judge_weights, use_web_search: opts?.use_web_search, use_web_search_mode: opts?.use_web_search_mode, skip_chairman_context_check: opts?.skip_chairman_context_check });
       const updatedMsgs = [...(conv.messages as unknown[])];
       updatedMsgs[msgIndex] = { ...(updatedMsgs[msgIndex] as object), stage3: result.stage3, stale: result.stale };
       saveLocalConversation({ ...conv, messages: updatedMsgs as Conversation["messages"] });
@@ -979,7 +1575,7 @@ export default function CouncilApp() {
   const runChairmanRetryWithPick = useCallback(async () => {
     const p = chairmanContextPrompt;
     if (!p || !chairmanPromptPick.trim() || chairmanDialogWorking) return;
-    const o = sendOpts();
+    const o = sendOpts(false);
     setChairmanDialogWorking(true);
     resetErrorState(p.convId);
     try {
@@ -987,10 +1583,11 @@ export default function CouncilApp() {
         use_web_search: o.use_web_search,
         use_web_search_mode: o.use_web_search_mode,
         chairman_model: chairmanPromptPick.trim(),
+        council_models: o.council_models,
         judge_weights: o.judge_weights,
       });
       const pick = chairmanPromptPick.trim();
-      if (apiConfig?.council_models.includes(pick)) {
+      if (effectiveCouncilModels.includes(pick)) {
         setChairmanSelect(pick);
       } else {
         setChairmanSelect("__custom__");
@@ -1013,7 +1610,7 @@ export default function CouncilApp() {
     chairmanPromptPick,
     chairmanDialogWorking,
     sendOpts,
-    apiConfig?.council_models,
+    effectiveCouncilModels,
     loadConversation,
     resetErrorState,
     rerunStage3Fn,
@@ -1022,7 +1619,7 @@ export default function CouncilApp() {
   const runChairmanForceCurrent = useCallback(async () => {
     const p = chairmanContextPrompt;
     if (!p || chairmanDialogWorking) return;
-    const o = sendOpts();
+    const o = sendOpts(false);
     setChairmanDialogWorking(true);
     resetErrorState(p.convId);
     try {
@@ -1030,6 +1627,7 @@ export default function CouncilApp() {
         use_web_search: o.use_web_search,
         use_web_search_mode: o.use_web_search_mode,
         chairman_model: p.chairman_model,
+        council_models: o.council_models,
         judge_weights: o.judge_weights,
         skip_chairman_context_check: true,
       });
@@ -1058,7 +1656,17 @@ export default function CouncilApp() {
       reverted: false,
     };
 
-    const assistantShell = streamingAssistantShell(true);
+    const isFollowupRetry = Boolean(
+      (conversation?.messages as Array<{ role?: string }> | undefined)?.some(
+        (message) => message.role === "assistant",
+      ),
+    );
+    const assistantShell = isFollowupRetry
+      ? streamingAssistantShell({
+          responseMode: "followup",
+          stage3Model: followupEffective || apiConfig?.followup_model || "…",
+        })
+      : streamingAssistantShell({ pending: true });
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -1091,7 +1699,17 @@ export default function CouncilApp() {
       setActionErrorByConversation((prev) => ({ ...prev, [currentId]: "发送失败" }));
       setHasRetryByConversation((prev) => ({ ...prev, [currentId]: true }));
     }
-  }, [currentId, currentLoading, isAbortError, runStreamForContent, resetErrorState, setConversationLoading]);
+  }, [
+    apiConfig?.followup_model,
+    conversation?.messages,
+    currentId,
+    currentLoading,
+    followupEffective,
+    isAbortError,
+    runStreamForContent,
+    resetErrorState,
+    setConversationLoading,
+  ]);
 
   const handleSend = async () => {
     if (!currentId || !input.trim() || currentLoading) return;
@@ -1106,7 +1724,13 @@ export default function CouncilApp() {
     };
 
     const userMessage: UserMsg = { role: "user", content };
-    const assistantShell = streamingAssistantShell(true);
+    const isFollowupSend = messages.some((message) => message.role === "assistant");
+    const assistantShell = isFollowupSend
+      ? streamingAssistantShell({
+          responseMode: "followup",
+          stage3Model: followupEffective || apiConfig?.followup_model || "…",
+        })
+      : streamingAssistantShell({ pending: true });
 
     setConversation((prev) => {
       if (!prev) return prev;
@@ -1142,6 +1766,7 @@ export default function CouncilApp() {
     | UserMsg
     | AssistantMsg
   )[];
+  const hasAssistantHistory = messages.some((message) => message.role === "assistant");
 
   const SidebarBody = (
     <>
@@ -1224,6 +1849,15 @@ export default function CouncilApp() {
               {conversation?.title ?? "请选择或新建对话"}
             </h2>
           </div>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!conversation}
+            onClick={handleExportMarkdown}
+          >
+            <Download className="mr-2 h-4 w-4" />
+            导出 Markdown
+          </Button>
           {actionError ? (
             <div className="flex max-w-full flex-wrap items-center gap-2">
               <Badge variant="destructive" className="max-w-[min(12rem,40vw)] truncate">
@@ -1343,6 +1977,19 @@ export default function CouncilApp() {
                   `自动判断` 会结合当前问题和前文决定本轮是否联网、是否复用上一轮检索结果；`强制联网` 每轮都会重新联网检索。
                   若模型不支持联网，服务端会尝试去掉插件重试；本页选项会保存在本机浏览器。
                 </p>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="filter-untrusted">过滤不可信来源</Label>
+                    <Switch
+                      id="filter-untrusted"
+                      checked={filterUntrustedSources}
+                      onCheckedChange={setFilterUntrustedSources}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    开启后，联网阶段会下调并过滤论坛评论、社区帖子等低可信来源，并把可信度排序结果一并传给模型。
+                  </p>
+                </div>
                 {webSearchMode !== "off" ? (
                   <div className="space-y-2">
                     <Label>Web 抓取模型（仅联网阶段）</Label>
@@ -1354,19 +2001,8 @@ export default function CouncilApp() {
                         <SelectValue placeholder="选择模型" />
                       </SelectTrigger>
                       <SelectContent>
-                        {(apiConfig?.web_search_models ?? []).map((m) => (
-                          <SelectItem key={`wf-${m}`} value={m}>
-                            {m}
-                          </SelectItem>
-                        ))}
-                        {apiConfig?.web_fetch_model &&
-                        !(apiConfig.web_search_models ?? []).includes(
-                          apiConfig.web_fetch_model,
-                        ) ? (
-                          <SelectItem value={apiConfig.web_fetch_model}>
-                            {apiConfig.web_fetch_model}（服务端默认 Web 抓取）
-                          </SelectItem>
-                        ) : null}
+                        {renderModelSelectSections(webFetchModelSections)}
+                        {webFetchModelSections.length ? <SelectSeparator /> : null}
                         <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
                       </SelectContent>
                     </Select>
@@ -1378,8 +2014,11 @@ export default function CouncilApp() {
                       />
                     ) : null}
                     <p className="text-xs text-muted-foreground">
-                      仅用于联网检索阶段，与主席模型独立。下拉为服务端配置的「适合联网」模型（OpenAI / Anthropic /
-                      Perplexity / xAI 等原生搜索，以及带{" "}
+                      仅用于联网检索阶段，与主席模型独立。推荐项会固定排在最上面，来自服务端当前配置的
+                      <span className="font-mono"> WEB_SEARCH_MODELS </span>
+                      与默认
+                      <span className="font-mono"> WEB_FETCH_MODEL </span>
+                      （当前包含 OpenAI / Anthropic / Perplexity / xAI 的原生搜索模型，以及走 Exa 兜底的 Gemini）。带{" "}
                       <span className="font-mono">:online</span> 或 Exa 兜底的模型，见{" "}
                       <a
                         href="https://openrouter.ai/docs/guides/features/server-tools/web-search"
@@ -1404,19 +2043,8 @@ export default function CouncilApp() {
                       <SelectValue placeholder="选择模型" />
                     </SelectTrigger>
                     <SelectContent>
-                      {(apiConfig?.council_models ?? []).map((m) => (
-                        <SelectItem key={m} value={m}>
-                          {m}
-                        </SelectItem>
-                      ))}
-                      {apiConfig?.chairman_model &&
-                      !apiConfig.council_models.includes(
-                        apiConfig.chairman_model,
-                      ) ? (
-                        <SelectItem value={apiConfig.chairman_model}>
-                          {apiConfig.chairman_model}（默认主席）
-                        </SelectItem>
-                      ) : null}
+                      {renderModelSelectSections(chairmanModelSections)}
+                      {chairmanModelSections.length ? <SelectSeparator /> : null}
                       <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
                     </SelectContent>
                   </Select>
@@ -1428,6 +2056,182 @@ export default function CouncilApp() {
                     />
                   ) : null}
                 </div>
+                <div className="space-y-2">
+                  <Label>继续对话模型</Label>
+                  <Select
+                    value={followupSelect || undefined}
+                    onValueChange={setFollowupSelect}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择模型" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {renderModelSelectSections(followupModelSections)}
+                      {followupModelSections.length ? <SelectSeparator /> : null}
+                      <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {followupSelect === "__custom__" ? (
+                    <Input
+                      placeholder="openrouter/model-id"
+                      value={followupCustom}
+                      onChange={(e) => setFollowupCustom(e.target.value)}
+                    />
+                  ) : null}
+                  <p className="text-xs text-muted-foreground">
+                    多轮继续对话默认使用 `qwen/qwen3.6-plus:free`，不再走多评委投票。
+                  </p>
+                </div>
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <Label>Stage2 评委模型</Label>
+                    <p className="text-xs text-muted-foreground">
+                      这里的列表会直接决定 Stage1 和 Stage2 实际调用哪些模型，最少保留 2 个。
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    {effectiveCouncilModels.map((model, index) => (
+                      <div
+                        key={`${model}-${index}`}
+                        className="space-y-3 rounded-lg border border-border bg-muted/20 p-3"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <Badge variant="secondary">评委 {index + 1}</Badge>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={effectiveCouncilModels.length <= MIN_STAGE2_MODELS}
+                            onClick={() => {
+                              if (effectiveCouncilModels.length <= MIN_STAGE2_MODELS) {
+                                setCouncilModelsError(`至少保留 ${MIN_STAGE2_MODELS} 个模型`);
+                                return;
+                              }
+                              setCouncilModels((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
+                              setEditingCouncilModelIndex((prev) => {
+                                if (prev == null) return prev;
+                                if (prev === index) return null;
+                                return prev > index ? prev - 1 : prev;
+                              });
+                              setCouncilModelsError(null);
+                            }}
+                          >
+                            删除
+                          </Button>
+                        </div>
+                        <div className="space-y-2">
+                          <Select
+                            value={
+                              editingCouncilModelIndex === index
+                                ? "__custom__"
+                                : model || undefined
+                            }
+                            onValueChange={(value) => {
+                              if (value === "__custom__") {
+                                setEditingCouncilModelIndex(index);
+                                setEditingCouncilModelCustom(model);
+                                setCouncilModelsError(null);
+                                return;
+                              }
+                              setCouncilModels((prev) =>
+                                prev.map((item, itemIndex) =>
+                                  itemIndex === index ? value : item,
+                                ),
+                              );
+                              setEditingCouncilModelIndex((prev) =>
+                                prev === index ? null : prev,
+                              );
+                              setCouncilModelsError(null);
+                            }}
+                          >
+                            <SelectTrigger className="w-full">
+                              <SelectValue placeholder="选择模型" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {renderModelSelectSections(buildStage2ModelSectionsFor(model))}
+                              <SelectSeparator />
+                              <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {editingCouncilModelIndex === index ? (
+                          <div className="flex items-center gap-2">
+                            <Input
+                              placeholder="openrouter/model-id"
+                              value={editingCouncilModelCustom}
+                              onChange={(e) => setEditingCouncilModelCustom(e.target.value)}
+                            />
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              onClick={() => {
+                                const nextModel = editingCouncilModelCustom.trim();
+                                if (!nextModel) {
+                                  setCouncilModelsError("请输入模型 ID");
+                                  return;
+                                }
+                                if (
+                                  effectiveCouncilModels.some(
+                                    (item, itemIndex) =>
+                                      itemIndex !== index && item === nextModel,
+                                  )
+                                ) {
+                                  setCouncilModelsError("该模型已存在");
+                                  return;
+                                }
+                                setCouncilModels((prev) =>
+                                  prev.map((item, itemIndex) =>
+                                    itemIndex === index ? nextModel : item,
+                                  ),
+                                );
+                                setEditingCouncilModelIndex(null);
+                                setEditingCouncilModelCustom("");
+                                setCouncilModelsError(null);
+                              }}
+                            >
+                              保存
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => {
+                                setEditingCouncilModelIndex(null);
+                                setEditingCouncilModelCustom("");
+                                setCouncilModelsError(null);
+                              }}
+                            >
+                              取消
+                            </Button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="space-y-2 rounded-lg border border-dashed border-border p-3">
+                    <Label>新增评委模型</Label>
+                    <p className="text-xs text-muted-foreground">
+                      点击后会新增一条空白评委，再在该行选择模型或切换到自定义。
+                    </p>
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={() => {
+                          setCouncilModels((prev) => [...prev, ""]);
+                          setEditingCouncilModelIndex(null);
+                          setEditingCouncilModelCustom("");
+                          setCouncilModelsError(null);
+                        }}
+                      >
+                        新增
+                      </Button>
+                    </div>
+                  </div>
+                  {councilModelsError ? (
+                    <p className="text-xs text-destructive">{councilModelsError}</p>
+                  ) : null}
+                </div>
                 <div className="space-y-4">
                   <div className="flex items-center justify-between">
                     <Label>评委权重（Stage2 聚合）</Label>
@@ -1436,7 +2240,7 @@ export default function CouncilApp() {
                       variant="secondary"
                       size="sm"
                       onClick={() => {
-                        const models = apiConfig?.council_models ?? [];
+                        const models = effectiveCouncilModels;
                         const reset = buildJudgeWeights(models, null);
                         setJudgeWeights(reset);
                         persistWeights(reset);
@@ -1445,7 +2249,7 @@ export default function CouncilApp() {
                       重置为 1
                     </Button>
                   </div>
-                  {(apiConfig?.council_models ?? []).map((m) => (
+                  {effectiveCouncilModels.map((m) => (
                     <div key={m} className="space-y-2">
                       <div className="flex justify-between text-xs text-muted-foreground">
                         <span className="truncate font-mono">{m}</span>
@@ -1480,7 +2284,7 @@ export default function CouncilApp() {
               {messages.map((m, i) =>
                 m.role === "user" ? (
                   <div
-                    key={i}
+                    key={`user-${i}`}
                     className="rounded-lg border border-border bg-muted/50 px-4 py-3"
                   >
                     <div className="text-xs font-medium text-muted-foreground">
@@ -1490,7 +2294,7 @@ export default function CouncilApp() {
                   </div>
                 ) : (
                   <CouncilAssistantCard
-                    key={i}
+                    key={m.assistantMessageId ?? `assistant-${i}`}
                     m={m}
                     msgIndex={i}
                     conversationId={currentId}
@@ -1518,21 +2322,32 @@ export default function CouncilApp() {
         </div>
 
         <footer className="border-t border-border p-4">
-          <div className="mx-auto flex max-w-3xl gap-2">
-            <Textarea
-              rows={4}
-              className="flex-1"
-              placeholder="输入问题… Enter 换行，Command+Enter 发送"
-              value={input}
-              disabled={!currentId}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && e.metaKey) {
-                  e.preventDefault();
-                  if (!currentLoading) void handleSend();
-                }
-              }}
-            />
+          <div className="mx-auto max-w-3xl">
+            {hasAssistantHistory ? (
+              <div className="mb-3 flex items-center justify-end gap-2 text-xs text-muted-foreground mr-[75px]">
+                <Label htmlFor="continue-web-search">继续对话联网搜索</Label>
+                <Switch
+                  id="continue-web-search"
+                  checked={continueUseWebSearch}
+                  onCheckedChange={setContinueUseWebSearch}
+                />
+              </div>
+            ) : null}
+            <div className="flex gap-2">
+              <Textarea
+                rows={4}
+                className="flex-1"
+                placeholder="输入问题… Enter 换行，Command+Enter 发送"
+                value={input}
+                disabled={!currentId}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && e.metaKey) {
+                    e.preventDefault();
+                    if (!currentLoading) void handleSend();
+                  }
+                }}
+              />
             {currentLoading ? (
               <Button
                 type="button"
@@ -1551,6 +2366,7 @@ export default function CouncilApp() {
                 发送
               </Button>
             )}
+            </div>
           </div>
         </footer>
       </main>
@@ -1583,7 +2399,7 @@ export default function CouncilApp() {
                 {chairmanContextPrompt.max_input_tokens}
               </strong>{" "}
               tokens（模型总上下文 {chairmanContextPrompt.context_limit}）。
-              Stage 3 已暂缓执行；请选择上下文更大的模型后重试，或强制使用当前模型（可能被截断或报错）。
+              Stage 3 已暂缓执行；下拉框里会优先列出上下文最大的 5 个主席模型，请改用后重试，或强制使用当前模型（可能被截断或报错）。
             </p>
             <div className="mt-4 space-y-2">
               <Label htmlFor="chairman-pick">改用主席模型</Label>
@@ -1595,11 +2411,7 @@ export default function CouncilApp() {
                   <SelectValue placeholder="选择模型" />
                 </SelectTrigger>
                 <SelectContent>
-                  {chairmanContextPrompt.suggested_models.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
+                  {renderModelSelectSections(chairmanPromptSections)}
                 </SelectContent>
               </Select>
             </div>
@@ -1650,6 +2462,7 @@ export default function CouncilApp() {
 function StepperRow({
   webFetchDone,
   showWebFetch,
+  followup,
   stage1Done,
   stage2Done,
   stage3Done,
@@ -1657,6 +2470,7 @@ function StepperRow({
 }: {
   webFetchDone: boolean;
   showWebFetch: boolean;
+  followup?: boolean;
   stage1Done: boolean;
   stage2Done: boolean;
   stage3Done: boolean;
@@ -1666,8 +2480,12 @@ function StepperRow({
     ...(showWebFetch
       ? [{ n: 0, label: "W", done: webFetchDone, active: loading.webFetch }]
       : []),
-    { n: 1, label: "1", done: stage1Done, active: loading.stage1 },
-    { n: 2, label: "2", done: stage2Done, active: loading.stage2 },
+    ...(followup
+      ? []
+      : [
+          { n: 1, label: "1", done: stage1Done, active: loading.stage1 },
+          { n: 2, label: "2", done: stage2Done, active: loading.stage2 },
+        ]),
     { n: 3, label: "3", done: stage3Done, active: loading.stage3 },
   ];
   return (
@@ -1737,11 +2555,15 @@ function CouncilAssistantCard({
   busyKey: string | null;
   setBusyKey: (k: string | null) => void;
   onReload: () => void;
-  sendOpts: () => {
+  sendOpts: (isFollowup: boolean) => {
     chairman_model?: string;
+    followup_model?: string;
     web_fetch_model?: string;
+    council_models?: string[];
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
+    continue_use_web_search?: boolean;
+    filter_untrusted_sources?: boolean;
     judge_weights?: Record<string, number>;
   };
   setActionError: (s: string | null) => void;
@@ -1783,16 +2605,20 @@ function CouncilAssistantCard({
   const busyStage2 = busyKey === "s2";
   const busyStage3 = busyKey === "s3";
 
+  const isFollowup = m.responseMode === "followup";
+
   const effectiveLoading = {
     webFetch: loading.webFetch,
     stage1: loading.stage1 || busyStage1All,
     stage2: loading.stage2 || busyStage2,
-    stage3: loading.stage3 || busyStage2 || busyStage3,
+    stage3:
+      (loading.stage3 || busyStage2 || busyStage3) &&
+      !(isFollowup && loading.webFetch),
   };
 
   const showWebFetch = Boolean(m.webFetch) || effectiveLoading.webFetch;
 
-  const stepperStage2Done = s2done && !busyStage2;
+  const stepperStage2Done = !isFollowup && s2done && !busyStage2;
   const stepperStage3Done = s3done && !busyStage2 && !busyStage3;
 
   const run = async (key: string, fn: () => Promise<void>) => {
@@ -1809,10 +2635,10 @@ function CouncilAssistantCard({
     }
   };
 
-  const opts = sendOpts();
+  const opts = sendOpts(false);
   const stage3ScrollRef = useRef<HTMLDivElement>(null);
   const [stageTab, setStageTab] = useState<"web" | "1" | "2" | "3">(
-    showWebFetch ? "web" : "1",
+    showWebFetch ? "web" : isFollowup ? "3" : "1",
   );
 
   useEffect(() => {
@@ -1829,14 +2655,14 @@ function CouncilAssistantCard({
       setStageTab("web");
       return;
     }
-    if (stageTab === "3" && !s2done) {
+    if (!isFollowup && stageTab === "3" && !s2done) {
       setStageTab(s1done ? "2" : "1");
       return;
     }
-    if (stageTab === "2" && !s1done) {
+    if (!isFollowup && stageTab === "2" && !s1done) {
       setStageTab("1");
     }
-  }, [effectiveLoading.webFetch, pending, showWebFetch, stageTab, s1done, s2done, webFetchDone]);
+  }, [effectiveLoading.webFetch, isFollowup, pending, showWebFetch, stageTab, s1done, s2done, webFetchDone]);
 
   return (
     <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
@@ -1870,6 +2696,7 @@ function CouncilAssistantCard({
         <StepperRow
           webFetchDone={webFetchDone}
           showWebFetch={showWebFetch}
+          followup={isFollowup}
           stage1Done={s1done}
           stage2Done={stepperStage2Done}
           stage3Done={stepperStage3Done}
@@ -1906,9 +2733,15 @@ function CouncilAssistantCard({
       >
         <TabsList className="inline-flex h-auto min-h-10 w-full shrink-0 flex-wrap justify-start gap-1 overflow-x-auto rounded-lg bg-muted p-1">
           {showWebFetch ? <TabsTrigger value="web">Web 抓取</TabsTrigger> : null}
-          <TabsTrigger value="1" disabled={showWebFetch && !webFetchDone}>Stage 1</TabsTrigger>
-          <TabsTrigger value="2" disabled={!s1done}>Stage 2</TabsTrigger>
-          <TabsTrigger value="3" disabled={!s2done}>Stage 3</TabsTrigger>
+          {isFollowup ? (
+            <TabsTrigger value="3" disabled={showWebFetch && !webFetchDone}>继续对话</TabsTrigger>
+          ) : (
+            <>
+              <TabsTrigger value="1" disabled={showWebFetch && !webFetchDone}>Stage 1</TabsTrigger>
+              <TabsTrigger value="2" disabled={!s1done}>Stage 2</TabsTrigger>
+              <TabsTrigger value="3" disabled={!s2done}>Stage 3</TabsTrigger>
+            </>
+          )}
         </TabsList>
         {showWebFetch ? (
           <TabsContent
@@ -1918,10 +2751,11 @@ function CouncilAssistantCard({
             <WebFetchView data={m.webFetch ?? null} loading={effectiveLoading.webFetch} />
           </TabsContent>
         ) : null}
-        <TabsContent
-          value="1"
-          className="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
-        >
+        {!isFollowup ? (
+          <TabsContent
+            value="1"
+            className="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+          >
           <div className="flex shrink-0 flex-wrap gap-2 border-b border-border pb-2">
             <Button
               type="button"
@@ -1932,6 +2766,7 @@ function CouncilAssistantCard({
               onClick={() =>
                 void run("s1-all", async () => {
                   await rerunStage1Fn(conversationId, msgIndex, {
+                    council_models: opts.council_models,
                     use_web_search: opts.use_web_search,
                     use_web_search_mode: opts.use_web_search_mode,
                   });
@@ -1965,6 +2800,7 @@ function CouncilAssistantCard({
                       msgIndex,
                       it.model,
                       {
+                        council_models: opts.council_models,
                         use_web_search: opts.use_web_search,
                         use_web_search_mode: opts.use_web_search_mode,
                       },
@@ -1993,11 +2829,13 @@ function CouncilAssistantCard({
               busyModel={busyStage1Model}
             />
           </div>
-        </TabsContent>
-        <TabsContent
-          value="2"
-          className="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
-        >
+          </TabsContent>
+        ) : null}
+        {!isFollowup ? (
+          <TabsContent
+            value="2"
+            className="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+          >
           <div className="flex shrink-0 flex-wrap gap-2 border-b border-border pb-2">
             <Button
               type="button"
@@ -2008,6 +2846,7 @@ function CouncilAssistantCard({
               onClick={() =>
                 void run("s2", async () => {
                   await rerunStage2Fn(conversationId, msgIndex, {
+                    council_models: opts.council_models,
                     use_web_search: opts.use_web_search,
                     use_web_search_mode: opts.use_web_search_mode,
                     judge_weights: opts.judge_weights,
@@ -2035,42 +2874,50 @@ function CouncilAssistantCard({
               meta={m.metadata}
             />
           </div>
-        </TabsContent>
+          </TabsContent>
+        ) : null}
         <TabsContent
           value="3"
           className="mt-2 flex min-h-0 flex-1 flex-col overflow-hidden focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
         >
-          <div className="flex shrink-0 flex-wrap gap-2 border-b border-border pb-2">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              className="[&_svg]:size-3.5"
-              disabled={busyKey !== null || !s2done}
-              onClick={() =>
-                void run("s3", async () => {
-                  await rerunStage3Fn(conversationId, msgIndex, {
-                    use_web_search: opts.use_web_search,
-                    use_web_search_mode: opts.use_web_search_mode,
-                    chairman_model: opts.chairman_model,
-                    judge_weights: opts.judge_weights,
-                  });
-                })
-              }
-            >
-              <RefreshCw
-                className={cn(
-                  busyKey === "s3"
-                    ? "animate-spin text-status-running-foreground"
-                    : busyKey !== null || !s2done
-                      ? "text-muted-foreground"
-                      : "text-status-running-foreground",
-                )}
-                aria-hidden
-              />
-              重跑 Stage3
-            </Button>
-          </div>
+          {!isFollowup ? (
+            <div className="flex shrink-0 flex-wrap gap-2 border-b border-border pb-2">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="[&_svg]:size-3.5"
+                disabled={busyKey !== null || !s2done}
+                onClick={() =>
+                  void run("s3", async () => {
+                    await rerunStage3Fn(conversationId, msgIndex, {
+                      use_web_search: opts.use_web_search,
+                      use_web_search_mode: opts.use_web_search_mode,
+                      chairman_model: opts.chairman_model,
+                      council_models: opts.council_models,
+                      judge_weights: opts.judge_weights,
+                    });
+                  })
+                }
+              >
+                <RefreshCw
+                  className={cn(
+                    busyKey === "s3"
+                      ? "animate-spin text-status-running-foreground"
+                      : busyKey !== null || !s2done
+                        ? "text-muted-foreground"
+                        : "text-status-running-foreground",
+                  )}
+                  aria-hidden
+                />
+                重跑 Stage3
+              </Button>
+            </div>
+          ) : (
+            <div className="flex shrink-0 items-center border-b border-border pb-2 text-xs text-muted-foreground">
+              单模型继续对话结果
+            </div>
+          )}
           <div
             ref={stage3ScrollRef}
             className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-2 pr-1"
@@ -2095,6 +2942,21 @@ function WebFetchView({
   data: WebFetchResult | null;
   loading: boolean;
 }) {
+  const rankedSources = useMemo(
+    () => [...(data?.sources ?? [])].sort(compareWebFetchSources),
+    [data?.sources],
+  );
+  const topSources = rankedSources.slice(0, 3);
+  const hasStructuredSources = rankedSources.length > 0;
+  const showUnrankedWarning =
+    !loading &&
+    !data?.webSearchSkipped &&
+    !hasStructuredSources &&
+    Boolean(data?.content?.trim());
+  const warningText =
+    data?.webSearchWarning ??
+    "OpenRouter 这次没有返回结构化 url_citation，前端拿不到精确 URL，所以不能做来源排序。下面正文里的“来源清单 / 参考来源”只是模型文本输出，不等于已验证来源。";
+
   if (loading)
     return (
       <div
@@ -2153,40 +3015,141 @@ function WebFetchView({
           </span>
         </p>
       ) : null}
+      {showUnrankedWarning ? (
+        <div className="mt-2 rounded-md border border-red-200 bg-red-50/80 p-2 text-xs text-red-950 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-100">
+          <div className="font-medium">这次 Web Search 返回不可直接采信，也无法排序</div>
+          <p className="mt-1 leading-snug opacity-90">
+            {warningText}
+          </p>
+        </div>
+      ) : null}
       {data.sources && data.sources.length > 0 ? (
+        <div className="mt-2 rounded-md border border-amber-200 bg-amber-50/80 p-2 text-xs text-amber-950 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="font-medium">
+            来源可信度已展示给用户
+            <span className="ml-2 text-[11px] font-normal opacity-80">
+              {summarizeCredibility(rankedSources)}
+            </span>
+          </div>
+          <p className="mt-1 text-[11px] leading-snug opacity-85">
+            下方每条抓取来源都会直接显示可信等级、分数和说明，不再只在后台保留。
+          </p>
+        </div>
+      ) : null}
+      {rankedSources.length > 0 ? (
+        <div className="mt-2 rounded-md border border-emerald-200 bg-emerald-50/70 p-2 dark:border-emerald-900/70 dark:bg-emerald-950/20">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-medium text-emerald-900 dark:text-emerald-100">
+              Web Search 排序
+            </span>
+            <Badge variant="secondary" className="text-[10px]">
+              先按可信分数
+            </Badge>
+            <Badge variant="outline" className="text-[10px]">
+              再按参考权重
+            </Badge>
+            <span className="text-[11px] text-emerald-900/80 dark:text-emerald-100/80">
+              最高优先来源会排在最前面，供后续阶段直接参考。
+            </span>
+          </div>
+          <div className="mt-2 grid gap-2 md:grid-cols-3">
+            {topSources.map((source, index) => (
+              <a
+                key={`${source.url}-top-${index}`}
+                href={source.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded-md border border-emerald-200/80 bg-background/80 p-2 transition-colors hover:bg-background dark:border-emerald-900/60"
+              >
+                <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                  <span className="inline-flex min-w-6 items-center justify-center rounded-full bg-emerald-600 px-1.5 py-0.5 font-semibold text-white">
+                    #{index + 1}
+                  </span>
+                  <span className="truncate">{sourceHostnameLabel(source.url)}</span>
+                </div>
+                <div className="mt-1 line-clamp-2 text-xs font-medium text-foreground">
+                  {source.title?.trim() || source.url}
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {source.credibility ? (
+                    <Badge variant={credibilityBadgeVariant(source.credibility)} className="text-[10px]">
+                      {formatCredibilityLabel(source.credibility)}
+                    </Badge>
+                  ) : null}
+                  {source.credibilityScore != null ? (
+                    <Badge variant="outline" className="text-[10px]">
+                      {formatCredibilityScore(source.credibilityScore)}
+                    </Badge>
+                  ) : null}
+                </div>
+              </a>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {rankedSources.length > 0 ? (
         <div className="mt-2 rounded-md border border-border bg-muted/40 p-2">
           <div className="text-xs font-medium text-muted-foreground">
-            API 结构化来源（url_citation，{data.sources.length} 条）
+            API 结构化来源排序（url_citation，{rankedSources.length} 条）
           </div>
+          <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+            当前前端会在 Web 检索阶段直接展示排序结果，不再只是显示原始抓取文本。
+          </p>
           <ul className="mt-1.5 list-none space-y-2 pl-0 text-xs">
-            {data.sources.map((s, i) => (
+            {rankedSources.map((s, i) => (
               <li key={`${s.url}-${i}`} className="wrap-break-word">
-                <span className="tabular-nums text-muted-foreground">{i + 1}. </span>
+                <span className="tabular-nums font-medium text-foreground">#{i + 1}</span>
                 <a
                   href={s.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="font-medium text-primary underline underline-offset-2"
+                  className="ml-2 font-medium text-primary underline underline-offset-2"
                 >
                   {s.title?.trim() || s.url}
                 </a>
                 <span className="ml-1 font-mono text-[10px] text-muted-foreground">
-                  {(() => {
-                    try {
-                      return new URL(s.url).hostname;
-                    } catch {
-                      return "";
-                    }
-                  })()}
+                  {sourceHostnameLabel(s.url)}
                 </span>
+                {s.sourceType ? (
+                  <Badge variant="outline" className="ml-1 text-[10px]">
+                    {s.sourceType}
+                  </Badge>
+                ) : null}
+                {s.credibility ? (
+                  <Badge variant={credibilityBadgeVariant(s.credibility)} className="ml-1 text-[10px]">
+                    {formatCredibilityLabel(s.credibility)}
+                  </Badge>
+                ) : null}
+                {s.credibilityScore != null ? (
+                  <Badge variant="outline" className="ml-1 text-[10px]">
+                    分数 {formatCredibilityScore(s.credibilityScore)}
+                  </Badge>
+                ) : null}
+                {s.referenceWeight != null ? (
+                  <Badge variant="secondary" className="ml-1 text-[10px]">
+                    权重 {formatReferenceWeight(s.referenceWeight)}
+                  </Badge>
+                ) : null}
                 {s.snippet ? (
                   <p className="mt-0.5 pl-0 text-[11px] leading-snug text-muted-foreground">
                     {s.snippet.length > 280 ? `${s.snippet.slice(0, 280)}…` : s.snippet}
                   </p>
                 ) : null}
+                {s.credibilityReason ? (
+                  <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                    {s.credibilityReason}
+                  </p>
+                ) : null}
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+      {!hasStructuredSources && !loading && !data.webSearchSkipped ? (
+        <div className="mt-2 rounded-md border border-dashed border-border bg-muted/25 p-2 text-[11px] leading-snug text-muted-foreground">
+          本轮未收到可排序的结构化来源。要展示真正的 Web 排序，联网模型必须返回带精确 URL 的
+          <span className="mx-1 font-mono">url_citation</span>
+          数据，而不是只在正文里写几个站点名字。
         </div>
       ) : null}
       <div className="mt-2 max-w-none text-sm leading-relaxed text-foreground [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">
@@ -2231,11 +3194,13 @@ function Stage1View({
             value={`s1-${idx}`}
             className={cn(
               "max-w-36 shrink-0 truncate text-xs transition-opacity duration-300",
+              it.failed && "text-status-error-foreground",
               busyModel === it.model && "opacity-70",
             )}
             title={it.model}
           >
             {modelShortName(it.model)}
+            {it.failed ? " · 失败" : ""}
           </TabsTrigger>
         ))}
       </TabsList>
@@ -2247,21 +3212,45 @@ function Stage1View({
             value={`s1-${idx}`}
             className="mt-2 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
           >
-            <div className="font-mono text-xs text-muted-foreground">{it.model}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="font-mono text-xs text-muted-foreground">{it.model}</div>
+              {it.failed ? <Badge variant="destructive" className="text-[10px]">请求失败</Badge> : null}
+              {it.webSearchSkipped ? (
+                <Badge variant="warning" className="text-[10px]">已回退为无联网</Badge>
+              ) : null}
+            </div>
             <div
               className={cn(
                 "relative mt-2 min-h-16 overflow-hidden rounded-md",
+                it.failed && "border border-status-error-border bg-status-error/35 p-3",
                 isBusy && "ring-2 ring-status-running/40 ring-offset-2 ring-offset-background",
               )}
             >
-              <div
-                className={cn(
-                  "max-w-none text-sm leading-relaxed text-foreground transition-[filter,opacity] duration-300 ease-out [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2",
-                  isBusy && "pointer-events-none blur-[6px] opacity-60 select-none",
-                )}
-              >
-                <ReactMarkdown components={markdownComponents}>{it.response}</ReactMarkdown>
-              </div>
+              {it.failed ? (
+                <div
+                  className={cn(
+                    "text-sm leading-relaxed text-status-error-foreground transition-[filter,opacity] duration-300 ease-out",
+                    isBusy && "pointer-events-none blur-[6px] opacity-60 select-none",
+                  )}
+                >
+                  <p className="font-medium">该模型本轮返回失败。</p>
+                  <p className="mt-1 text-xs opacity-90">
+                    {it.error ?? "This model failed to respond. Please retry this model."}
+                  </p>
+                  <p className="mt-2 text-xs opacity-80">
+                    可直接点击上方“重跑 {modelShortName(it.model)}”再次请求这个模型。
+                  </p>
+                </div>
+              ) : (
+                <div
+                  className={cn(
+                    "max-w-none text-sm leading-relaxed text-foreground transition-[filter,opacity] duration-300 ease-out [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2",
+                    isBusy && "pointer-events-none blur-[6px] opacity-60 select-none",
+                  )}
+                >
+                  <ReactMarkdown components={markdownComponents}>{it.response}</ReactMarkdown>
+                </div>
+              )}
               {isBusy ? (
                 <div
                   className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/35 backdrop-blur-[2px]"
