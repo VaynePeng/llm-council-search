@@ -9,8 +9,6 @@ import {
   COUNCIL_MODELS,
   FOLLOWUP_MODEL,
   TITLE_MODEL,
-  WEB_FETCH_MODEL,
-  WEB_SEARCH_MODELS,
   chairmanContextLimitsForApi,
   resolveChairmanContextLimit,
 } from "./config.js";
@@ -29,13 +27,14 @@ import {
   stage3SynthesizeFinal,
   stage3SynthesizeFinalStream,
   stageWebFetch,
+  type StreamProgress,
   successfulStage1Items,
   synthesizeFollowUpAnswer,
   synthesizeFollowUpAnswerStream,
 } from "./council.js";
 import { withConversationLock } from "./lock.js";
-import { queryModel } from "./openrouter.js";
-import { getFeaturedModelGroups } from "./openrouter-models.js";
+import { queryModel } from "./ofox.js";
+import { getFeaturedModelGroups } from "./ofox-models.js";
 import {
   addAssistantMessage,
   addUserMessage,
@@ -76,16 +75,15 @@ app.get("/api/config", async (c) => {
   try {
     featured_model_groups = await getFeaturedModelGroups();
   } catch (err) {
-    console.error("[config] failed to load OpenRouter model catalog:", err);
+    console.error("[config] failed to load Ofox model catalog:", err);
   }
 
   return c.json({
     council_models: COUNCIL_MODELS,
-    web_search_models: WEB_SEARCH_MODELS,
+    web_search_provider: "tavily",
     chairman_model: CHAIRMAN_MODEL,
     followup_model: FOLLOWUP_MODEL,
     title_model: TITLE_MODEL,
-    web_fetch_model: WEB_FETCH_MODEL,
     chairman_context_limits: chairmanContextLimitsForApi(),
     chairman_output_reserve_tokens: CHAIRMAN_OUTPUT_RESERVE_TOKENS,
     featured_model_groups,
@@ -118,14 +116,20 @@ app.delete("/api/conversations/:id", async (c) => {
 });
 
 function extractApiKey(c: { req: { header: (k: string) => string | undefined } }): string | undefined {
-  return c.req.header("x-openrouter-key")?.trim() || undefined;
+  return c.req.header("x-ofox-key")?.trim() || undefined;
+}
+
+function extractTavilyKey(c: { req: { header: (k: string) => string | undefined } }): string | undefined {
+  return c.req.header("x-tavily-key")?.trim() || undefined;
 }
 
 const MISSING_API_KEY_DETAIL =
-  "OpenRouter API key required via X-OpenRouter-Key header";
+  "Ofox API key required via X-Ofox-Key header";
+const MISSING_TAVILY_KEY_DETAIL =
+  "Tavily API key required via X-Tavily-Key header when web search is enabled";
 
 const STAGE1_FAILURE_MESSAGE =
-  "All Stage 1 model requests failed. Check your OpenRouter API key, account credits, model availability, or server logs for the upstream error.";
+  "All Stage 1 model requests failed. Check your Ofox API key, account credits, model availability, or server logs for the upstream error.";
 
 function topChairmanModelsByContext(models: string[], limit = 5): string[] {
   return [...new Set(models.filter(Boolean))]
@@ -144,8 +148,6 @@ type SendBody = {
   use_web_search_mode?: "off" | "auto" | "on";
   continue_use_web_search?: boolean;
   filter_untrusted_sources?: boolean;
-  /** 覆盖服务端 `WEB_FETCH_MODEL`，用于联网检索阶段 */
-  web_fetch_model?: string;
   judge_weights?: Record<string, number>;
   /** 与 `judge_weights` 同义（见项目重构 §5.3 文档中的 weights 表述） */
   weights?: Record<string, number>;
@@ -167,11 +169,6 @@ function parseJudgeWeights(body: {
   const j = body.judge_weights ?? body.weights;
   if (!j || typeof j !== "object") return undefined;
   return j;
-}
-
-function parseWebFetchModel(body: { web_fetch_model?: string }): string | undefined {
-  const v = body.web_fetch_model?.trim();
-  return v || undefined;
 }
 
 function parseFollowupModel(body: { followup_model?: string }): string | undefined {
@@ -206,6 +203,7 @@ app.post("/api/conversations/:id/message", async (c) => {
   if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  const tavilyKey = extractTavilyKey(c);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -220,6 +218,9 @@ app.post("/api/conversations/:id/message", async (c) => {
     body.use_web_search_mode,
     body.use_web_search,
   );
+  if (webSearchMode !== "off" && !tavilyKey) {
+    return c.json({ detail: MISSING_TAVILY_KEY_DETAIL }, 400);
+  }
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
 
   await withConversationLock(id, async () => {
@@ -243,8 +244,9 @@ app.post("/api/conversations/:id/message", async (c) => {
     const webFetch = continueUseWebSearch
       ? await stageWebFetch(
           effectiveQuery,
-          parseWebFetchModel(body),
+          parseChairman(body),
           apiKey,
+          tavilyKey,
           c.req.raw.signal,
           {
             requestedMode: "on",
@@ -297,9 +299,9 @@ app.post("/api/conversations/:id/message", async (c) => {
     useWebSearch: webSearchPlan.action === "search",
     webSearchMode,
     councilModels: councilModels.models,
-    webFetchModel: parseWebFetchModel(body),
     judgeWeights,
     apiKey,
+    tavilyApiKey: tavilyKey,
     signal: c.req.raw.signal,
     historyMessages: conv.messages,
     webSearchPlan,
@@ -345,6 +347,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  const tavilyKey = extractTavilyKey(c);
 
   const conv = await getConversation(id);
   if (!conv) return c.json({ detail: "Conversation not found" }, 404);
@@ -356,19 +359,22 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const isFollowup = conv.messages.some((message) => message.role === "assistant");
   const chairmanModel = parseChairman(body);
   const followupModel = parseFollowupModel(body);
-  const webFetchModel = parseWebFetchModel(body);
   const judgeWeights = parseJudgeWeights(body);
   const webSearchMode = parseWebSearchMode(
     body.use_web_search_mode,
     body.use_web_search,
   );
   const continueUseWebSearch = Boolean(body.continue_use_web_search);
+  if ((webSearchMode !== "off" || continueUseWebSearch) && !tavilyKey) {
+    return c.json({ detail: MISSING_TAVILY_KEY_DETAIL }, 400);
+  }
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
   const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const push = (obj: unknown) => controller.enqueue(sseLine(obj));
+      const pushProgress = (data: StreamProgress) => push({ type: "progress", data });
       const requestSignal = c.req.raw.signal;
       const ensureNotAborted = () => {
         if (requestSignal.aborted) {
@@ -414,10 +420,15 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         if (isFollowup) {
           if (continueUseWebSearch) {
             push({ type: "web_fetch_start" });
+            pushProgress({
+              phase: "web_fetch",
+              message: "继续对话已开启联网检索，准备抓取公开网页。",
+            });
             webFetchResult = await stageWebFetch(
               effectiveQuery,
-              webFetchModel,
+              chairmanModel,
               apiKey,
+              tavilyKey,
               requestSignal,
               {
                 requestedMode: "on",
@@ -425,6 +436,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
                 reason: "继续对话已开启联网搜索。",
               },
               filterUntrustedSources,
+              pushProgress,
             );
             push({ type: "web_fetch_complete", data: webFetchResult });
             if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
@@ -433,6 +445,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           }
 
           push({ type: "followup_start", data: { model: followupModel?.trim() || FOLLOWUP_MODEL } });
+          pushProgress({
+            phase: "followup",
+            message: `正在用 ${followupModel?.trim() || FOLLOWUP_MODEL} 生成继续对话回答。`,
+            model: followupModel?.trim() || FOLLOWUP_MODEL,
+          });
           const followupResult = await synthesizeFollowUpAnswerStream(
             content,
             conv.messages,
@@ -477,9 +494,14 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           webSearchMode,
           apiKey,
           requestSignal,
+          pushProgress,
         );
 
         if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
+          pushProgress({
+            phase: "web_fetch",
+            message: "正在复用上一轮联网检索结果。",
+          });
           webFetchResult = {
             ...webSearchPlan.previousWebFetch,
             webSearchMode,
@@ -495,11 +517,13 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           push({ type: "web_fetch_start" });
           webFetchResult = await stageWebFetch(
             effectiveQuery,
-            webFetchModel,
+            chairmanModel,
             apiKey,
+            tavilyKey,
             requestSignal,
             webSearchPlan,
             filterUntrustedSources,
+            pushProgress,
           );
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
@@ -508,6 +532,12 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         }
 
         push({ type: "stage1_start" });
+        pushProgress({
+          phase: "stage1",
+          message: `Stage 1 已启动，准备并行请求 ${effectiveCouncilModels.length} 个模型。`,
+          current: 0,
+          total: effectiveCouncilModels.length,
+        });
         const stage1Results = await stage1CollectResponses(
           effectiveQuery,
           webSearchPlan.action === "search",
@@ -521,6 +551,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           apiKey,
           requestSignal,
           effectiveCouncilModels,
+          pushProgress,
         );
         push({ type: "stage1_complete", data: stage1Results });
 
@@ -552,6 +583,12 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         }
 
         push({ type: "stage2_start" });
+        pushProgress({
+          phase: "stage2",
+          message: `Stage 2 已启动，准备并行请求 ${effectiveCouncilModels.length} 个模型评审排序。`,
+          current: 0,
+          total: effectiveCouncilModels.length,
+        });
         const [stage2Results, labelToModel] = await stage2CollectRankings(
           effectiveQuery,
           stage1Results,
@@ -559,6 +596,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           apiKey,
           requestSignal,
           effectiveCouncilModels,
+          pushProgress,
         );
         const aggregateRankings = calculateAggregateRankings(
           stage2Results,
@@ -588,6 +626,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         let stage3Result: Stage3Result;
 
         if (!gate.proceed) {
+          pushProgress({
+            phase: "stage3",
+            message: "Stage 3 因主席模型上下文不足而暂缓执行，等待手动重试。",
+            model: gate.analysis.chairman_model,
+          });
           stage3Result = gate.stage3;
           const candidates = [
             ...effectiveCouncilModels,
@@ -628,6 +671,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           });
         } else {
           push({ type: "stage3_start", data: { model: chairModel } });
+          pushProgress({
+            phase: "stage3",
+            message: `Stage 3 已启动，正在用 ${chairModel} 综合前两阶段结果。`,
+            model: chairModel,
+          });
           stage3Result = await stage3SynthesizeFinalStream(
             effectiveQuery,
             stage1Results,
@@ -660,10 +708,14 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         }
         push({ type: "complete" });
       } catch (e) {
-        if (isAbortError(e)) return;
+        if (isAbortError(e) && requestSignal.aborted) return;
         push({
           type: "error",
-          message: e instanceof Error ? e.message : String(e),
+          message: isAbortError(e)
+            ? "上游请求超时或被中止。"
+            : e instanceof Error
+              ? e.message
+              : String(e),
         });
       } finally {
         controller.close();
@@ -741,7 +793,7 @@ app.post(
       const res = await queryModel(
         model,
         [{ role: "user", content: effectiveQuery }],
-        { useWebSearch: rerunPlan.action === "search", apiKey },
+        { apiKey },
       );
 
       const stage1 = [...msg.stage1];
@@ -1079,7 +1131,6 @@ type StatelessSendBody = {
   use_web_search_mode?: "off" | "auto" | "on";
   continue_use_web_search?: boolean;
   filter_untrusted_sources?: boolean;
-  web_fetch_model?: string;
   judge_weights?: Record<string, number>;
   weights?: Record<string, number>;
 };
@@ -1092,22 +1143,26 @@ app.post("/api/message/stateless/stream", async (c) => {
   if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
   const apiKey = extractApiKey(c);
   if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  const tavilyKey = extractTavilyKey(c);
 
   const historyMessages = (body.messages ?? []) as import("./storage.js").Message[];
   const isFirstMessage = historyMessages.filter((m) => m.role === "user").length === 0;
   const isFollowup = historyMessages.some((m) => m.role === "assistant");
   const chairmanModel = parseChairman(body);
   const followupModel = parseFollowupModel(body);
-  const webFetchModel = parseWebFetchModel(body);
   const judgeWeights = parseJudgeWeights(body);
   const webSearchMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const continueUseWebSearch = Boolean(body.continue_use_web_search);
+  if ((webSearchMode !== "off" || continueUseWebSearch) && !tavilyKey) {
+    return c.json({ detail: MISSING_TAVILY_KEY_DETAIL }, 400);
+  }
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
   const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const push = (obj: unknown) => controller.enqueue(sseLine(obj));
+      const pushProgress = (data: StreamProgress) => push({ type: "progress", data });
       const requestSignal = c.req.raw.signal;
       const ensureNotAborted = () => {
         if (requestSignal.aborted) {
@@ -1139,10 +1194,15 @@ app.post("/api/message/stateless/stream", async (c) => {
         if (isFollowup) {
           if (continueUseWebSearch) {
             push({ type: "web_fetch_start" });
+            pushProgress({
+              phase: "web_fetch",
+              message: "继续对话已开启联网检索，准备抓取公开网页。",
+            });
             webFetchResult = await stageWebFetch(
               effectiveQuery,
-              webFetchModel,
+              chairmanModel,
               apiKey,
+              tavilyKey,
               requestSignal,
               {
                 requestedMode: "on",
@@ -1150,12 +1210,18 @@ app.post("/api/message/stateless/stream", async (c) => {
                 reason: "继续对话已开启联网搜索。",
               },
               filterUntrustedSources,
+              pushProgress,
             );
             push({ type: "web_fetch_complete", data: webFetchResult });
             if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
           }
 
           push({ type: "followup_start", data: { model: followupModel?.trim() || FOLLOWUP_MODEL } });
+          pushProgress({
+            phase: "followup",
+            message: `正在用 ${followupModel?.trim() || FOLLOWUP_MODEL} 生成继续对话回答。`,
+            model: followupModel?.trim() || FOLLOWUP_MODEL,
+          });
           const followupResult = await synthesizeFollowUpAnswerStream(
             content,
             historyMessages,
@@ -1186,9 +1252,14 @@ app.post("/api/message/stateless/stream", async (c) => {
           webSearchMode,
           apiKey,
           requestSignal,
+          pushProgress,
         );
 
         if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
+          pushProgress({
+            phase: "web_fetch",
+            message: "正在复用上一轮联网检索结果。",
+          });
           webFetchResult = {
             ...webSearchPlan.previousWebFetch,
             webSearchMode,
@@ -1200,12 +1271,18 @@ app.post("/api/message/stateless/stream", async (c) => {
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         } else if (webSearchPlan.action === "search") {
           push({ type: "web_fetch_start" });
-          webFetchResult = await stageWebFetch(effectiveQuery, webFetchModel, apiKey, requestSignal, webSearchPlan, filterUntrustedSources);
+          webFetchResult = await stageWebFetch(effectiveQuery, chairmanModel, apiKey, tavilyKey, requestSignal, webSearchPlan, filterUntrustedSources, pushProgress);
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         }
 
         push({ type: "stage1_start" });
+        pushProgress({
+          phase: "stage1",
+          message: `Stage 1 已启动，准备并行请求 ${effectiveCouncilModels.length} 个模型。`,
+          current: 0,
+          total: effectiveCouncilModels.length,
+        });
         const stage1Results = await stage1CollectResponses(
           effectiveQuery,
           webSearchPlan.action === "search",
@@ -1216,6 +1293,7 @@ app.post("/api/message/stateless/stream", async (c) => {
           apiKey,
           requestSignal,
           effectiveCouncilModels,
+          pushProgress,
         );
         push({ type: "stage1_complete", data: stage1Results });
 
@@ -1227,6 +1305,12 @@ app.post("/api/message/stateless/stream", async (c) => {
         }
 
         push({ type: "stage2_start" });
+        pushProgress({
+          phase: "stage2",
+          message: `Stage 2 已启动，准备并行请求 ${effectiveCouncilModels.length} 个模型评审排序。`,
+          current: 0,
+          total: effectiveCouncilModels.length,
+        });
         const [stage2Results, labelToModel] = await stage2CollectRankings(
           effectiveQuery,
           stage1Results,
@@ -1234,6 +1318,7 @@ app.post("/api/message/stateless/stream", async (c) => {
           apiKey,
           requestSignal,
           effectiveCouncilModels,
+          pushProgress,
         );
         const aggregateRankings = calculateAggregateRankings(stage2Results, labelToModel, judgeWeights);
         push({ type: "stage2_complete", data: stage2Results, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } });
@@ -1246,6 +1331,11 @@ app.post("/api/message/stateless/stream", async (c) => {
         let stage3Result: Stage3Result;
 
         if (!gate.proceed) {
+          pushProgress({
+            phase: "stage3",
+            message: "Stage 3 因主席模型上下文不足而暂缓执行，等待手动重试。",
+            model: gate.analysis.chairman_model,
+          });
           stage3Result = gate.stage3;
           const candidates = [...effectiveCouncilModels, CHAIRMAN_MODEL, gate.analysis.chairman_model];
           const suggested = topChairmanModelsByContext(candidates, 5);
@@ -1265,6 +1355,11 @@ app.post("/api/message/stateless/stream", async (c) => {
           push({ type: "complete", data: { webFetch: webFetchResult, stage1: stage1Results, stage2: stage2Results, stage3: stage3Result, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } } });
         } else {
           push({ type: "stage3_start", data: { model: chairModel } });
+          pushProgress({
+            phase: "stage3",
+            message: `Stage 3 已启动，正在用 ${chairModel} 综合前两阶段结果。`,
+            model: chairModel,
+          });
           stage3Result = await stage3SynthesizeFinalStream(
             effectiveQuery, stage1Results, stage2Results, chairmanModel,
             webSearchPlan.action === "search", judgeWeights, labelToModel,
@@ -1276,8 +1371,15 @@ app.post("/api/message/stateless/stream", async (c) => {
           push({ type: "complete", data: { webFetch: webFetchResult, stage1: stage1Results, stage2: stage2Results, stage3: stage3Result, metadata: { label_to_model: labelToModel, aggregate_rankings: aggregateRankings } } });
         }
       } catch (e) {
-        if (isAbortError(e)) return;
-        push({ type: "error", message: e instanceof Error ? e.message : String(e) });
+        if (isAbortError(e) && requestSignal.aborted) return;
+        push({
+          type: "error",
+          message: isAbortError(e)
+            ? "上游请求超时或被中止。"
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        });
       } finally {
         controller.close();
       }
@@ -1349,7 +1451,7 @@ app.post("/api/message/stateless/rerun-stage1-model", async (c) => {
   const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const rerunPlan = await decideWebSearchPlan(userQuery, historyMessages, rerunMode, apiKey, c.req.raw.signal);
 
-  const res = await queryModel(model, [{ role: "user", content: effectiveQuery }], { useWebSearch: rerunPlan.action === "search", apiKey });
+  const res = await queryModel(model, [{ role: "user", content: effectiveQuery }], { apiKey });
 
   const currentStage1 = body.stage1 ?? [];
   const ix = currentStage1.findIndex((s) => s.model === model);

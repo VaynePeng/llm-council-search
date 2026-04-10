@@ -40,6 +40,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
   SheetTrigger,
@@ -56,6 +57,7 @@ import {
   getConversation,
   getLocalConversation,
   getStoredApiKey,
+  getStoredTavilyKey,
   listConversations,
   listLocalConversations,
   rerunStage1,
@@ -70,6 +72,7 @@ import {
   sendMessageStatelessStream,
   sendMessageStream,
   setStoredApiKey,
+  setStoredTavilyKey,
   updateLocalConversationTitle,
   type ApiConfig,
   type Conversation,
@@ -91,8 +94,6 @@ type StoredUiPrefs = {
   chairmanCustom?: string;
   followupSelect?: string;
   followupCustom?: string;
-  webFetchSelect?: string;
-  webFetchCustom?: string;
   storageMode?: "server" | "local";
   filterUntrustedSources?: boolean;
   continueUseWebSearch?: boolean;
@@ -114,21 +115,6 @@ function modelShortName(model: string): string {
   return p && p.length > 0 ? p : model;
 }
 
-function formatContextLimit(limit?: number): string | null {
-  if (limit == null || !Number.isFinite(limit) || limit <= 0) return null;
-  if (limit >= 1_000_000) return `${(limit / 1_000_000).toFixed(limit % 1_000_000 === 0 ? 0 : 1)}M`;
-  if (limit >= 1_000) return `${Math.round(limit / 1_000)}k`;
-  return String(limit);
-}
-
-function modelTitleWithContext(
-  model: string,
-  contextLimits?: Record<string, number>,
-): string {
-  const formatted = formatContextLimit(contextLimits?.[model]);
-  return formatted ? `${model} · 上下文 ${formatted}` : model;
-}
-
 type ModelSelectSection = {
   key: string;
   label: string;
@@ -143,7 +129,6 @@ type ModelSelectSection = {
 function buildModelSelectSections(
   baseSections: Array<{ key: string; label: string; models: string[] }>,
   featuredProviders: NonNullable<ApiConfig["featured_model_groups"]>,
-  contextLimits?: Record<string, number>,
 ): ModelSelectSection[] {
   const seen = new Set<string>();
   const sections: ModelSelectSection[] = [];
@@ -161,91 +146,31 @@ function buildModelSelectSections(
       items: models.map((model) => ({
         key: `${section.key}-${model}`,
         value: model,
-        label: modelTitleWithContext(model, contextLimits),
+        label: model,
       })),
     });
   }
 
   for (const provider of featuredProviders) {
-    const latest = provider.latest.filter((model) => {
+    const models = provider.models.filter((model) => {
       if (seen.has(model)) return false;
       seen.add(model);
       return true;
     });
-    const free = provider.free.filter((model) => {
-      if (seen.has(model)) return false;
-      seen.add(model);
-      return true;
-    });
+    if (!models.length) continue;
 
     sections.push({
       key: provider.key,
       label: provider.label,
-      items: [
-        ...latest.map((model, index) => ({
-          key: `${provider.key}-latest-${model}`,
-          value: model,
-          label: `最新 ${index + 1} · ${modelTitleWithContext(model, contextLimits)}`,
-        })),
-        ...(free.length
-          ? free.map((model, index) => ({
-              key: `${provider.key}-free-${model}`,
-              value: model,
-              label: `免费 ${index + 1} · ${modelTitleWithContext(model, contextLimits)}`,
-            }))
-          : [
-              {
-                key: `${provider.key}-free-empty`,
-                value: `__${provider.key}-free-empty__`,
-                label: "免费 · 暂无",
-                disabled: true,
-              },
-            ]),
-      ],
+      items: models.map((model) => ({
+        key: `${provider.key}-${model}`,
+        value: model,
+        label: model,
+      })),
     });
   }
 
   return sections;
-}
-
-function buildWebFetchModelSections(
-  webSearchModels: string[],
-  webFetchModel: string | undefined,
-  featuredProviders: NonNullable<ApiConfig["featured_model_groups"]>,
-  contextLimits?: Record<string, number>,
-): ModelSelectSection[] {
-  const recommended = [...new Set([...webSearchModels, webFetchModel ?? ""])].filter(Boolean);
-  const sections = buildModelSelectSections(
-    [
-      {
-        key: "web-fetch-recommended",
-        label: "推荐联网模型",
-        models: recommended,
-      },
-    ],
-    featuredProviders,
-    contextLimits,
-  );
-
-  return sections.map((section) => ({
-    ...section,
-    items: section.items.map((item, index) => {
-      const isDefault = item.value === webFetchModel && Boolean(webFetchModel);
-      const prefix = [
-        "推荐",
-        isDefault ? "默认" : null,
-        section.key === "web-fetch-recommended" ? `${index + 1}` : null,
-      ]
-        .filter(Boolean)
-        .join(" · ");
-      return {
-        ...item,
-        label: section.key === "web-fetch-recommended"
-          ? `${prefix} · ${item.label}`
-          : item.label,
-      };
-    }),
-  }));
 }
 
 function renderModelSelectSections(sections: ModelSelectSection[]) {
@@ -460,6 +385,8 @@ type WebFetchResult = {
   retrievedAt?: string;
   retrievedAtUnixSeconds?: number;
   sources?: WebFetchSource[];
+  searchTasks?: Array<{ query: string; why: string }>;
+  analysisOnly?: string[];
 };
 
 type Stage1Item = {
@@ -475,12 +402,23 @@ type Stage2Item = {
   parsed_ranking: string[];
 };
 type Stage3 = { model: string; response: string; reasoning_details?: unknown };
+type StreamProgress = {
+  phase: "web_plan" | "web_fetch" | "stage1" | "stage2" | "stage3" | "followup";
+  message: string;
+  current?: number;
+  total?: number;
+  model?: string;
+  query?: string;
+  searchTasks?: Array<{ query: string; why: string }>;
+  analysisOnly?: string[];
+};
 
 type AssistantMsg = {
   role: "assistant";
   assistantMessageId?: string;
   responseMode?: "council" | "followup";
   pending?: boolean;
+  progress?: StreamProgress | null;
   webFetch?: WebFetchResult | null;
   stage1: Stage1Item[] | null;
   stage2: Stage2Item[] | null;
@@ -591,6 +529,7 @@ function streamingAssistantShell({
     assistantMessageId,
     responseMode,
     pending,
+    progress: null,
     webFetch: null,
     stage1: null,
     stage2: null,
@@ -661,8 +600,6 @@ export default function CouncilApp() {
   const [chairmanCustom, setChairmanCustom] = useState("");
   const [followupSelect, setFollowupSelect] = useState<string>("");
   const [followupCustom, setFollowupCustom] = useState("");
-  const [webFetchSelect, setWebFetchSelect] = useState<string>("");
-  const [webFetchCustom, setWebFetchCustom] = useState("");
   const [webSearchMode, setWebSearchMode] = useState<WebSearchMode>("auto");
   const [continueUseWebSearch, setContinueUseWebSearch] = useState(false);
   const [filterUntrustedSources, setFilterUntrustedSources] = useState(true);
@@ -670,7 +607,8 @@ export default function CouncilApp() {
   const [judgeWeights, setJudgeWeights] = useState<Record<string, number>>({});
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [openrouterKey, setOpenrouterKey] = useState("");
+  const [ofoxKey, setOfoxKey] = useState("");
+  const [tavilyKey, setTavilyKey] = useState("");
   const [actionErrorByConversation, setActionErrorByConversation] = useState<
     Record<string, string | null>
   >({});
@@ -752,7 +690,8 @@ export default function CouncilApp() {
 
   useEffect(() => {
     setMounted(true);
-    setOpenrouterKey(getStoredApiKey());
+    setOfoxKey(getStoredApiKey());
+    setTavilyKey(getStoredTavilyKey());
   }, []);
 
   const chairmanEffective = useMemo(() => {
@@ -760,12 +699,6 @@ export default function CouncilApp() {
     if (chairmanSelect) return chairmanSelect;
     return "";
   }, [chairmanSelect, chairmanCustom]);
-
-  const webFetchEffective = useMemo(() => {
-    if (webFetchSelect === "__custom__") return webFetchCustom.trim();
-    if (webFetchSelect) return webFetchSelect;
-    return "";
-  }, [webFetchSelect, webFetchCustom]);
 
   const followupEffective = useMemo(() => {
     if (followupSelect === "__custom__") return followupCustom.trim();
@@ -785,22 +718,6 @@ export default function CouncilApp() {
     return cleaned;
   }, [effectiveCouncilModels]);
 
-  const webFetchModelSections = useMemo(
-    () =>
-      buildWebFetchModelSections(
-        apiConfig?.web_search_models ?? [],
-        apiConfig?.web_fetch_model,
-        apiConfig?.featured_model_groups ?? [],
-        apiConfig?.chairman_context_limits,
-      ),
-    [
-      apiConfig?.chairman_context_limits,
-      apiConfig?.featured_model_groups,
-      apiConfig?.web_fetch_model,
-      apiConfig?.web_search_models,
-    ],
-  );
-
   const chairmanModelSections = useMemo(
     () =>
       buildModelSelectSections([
@@ -813,7 +730,7 @@ export default function CouncilApp() {
             apiConfig?.chairman_model ?? "",
           ],
         },
-      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+      ], apiConfig?.featured_model_groups ?? []),
     [
       apiConfig?.chairman_model,
       apiConfig?.chairman_context_limits,
@@ -835,7 +752,7 @@ export default function CouncilApp() {
             ...effectiveCouncilModels,
           ],
         },
-      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+      ], apiConfig?.featured_model_groups ?? []),
     [
       apiConfig?.chairman_context_limits,
       effectiveCouncilModels,
@@ -865,7 +782,7 @@ export default function CouncilApp() {
             return !effectiveCouncilModels.filter(Boolean).includes(model);
           }),
         },
-      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+      ], apiConfig?.featured_model_groups ?? []),
     [
       apiConfig?.chairman_model,
       apiConfig?.chairman_context_limits,
@@ -884,7 +801,7 @@ export default function CouncilApp() {
           label: "推荐的 5 个最大上下文模型",
           models: chairmanContextPrompt?.suggested_models ?? [],
         },
-      ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
+      ], apiConfig?.featured_model_groups ?? []),
     [apiConfig?.chairman_context_limits, apiConfig?.featured_model_groups, chairmanContextPrompt?.suggested_models],
   );
 
@@ -1010,13 +927,6 @@ export default function CouncilApp() {
           prefs.followupSelect ?? cfg.followup_model ?? "qwen/qwen3.6-plus:free",
         );
         setFollowupCustom(prefs.followupCustom ?? "");
-        const wfDefault = cfg.web_fetch_model?.trim() ?? "";
-        const wsModels = cfg.web_search_models ?? [];
-        const savedWf = prefs.webFetchSelect;
-        setWebFetchSelect(
-          savedWf ?? (wfDefault || wsModels[0] || ""),
-        );
-        setWebFetchCustom(prefs.webFetchCustom ?? "");
         setStorageMode(prefs.storageMode ?? "server");
         setFilterUntrustedSources(prefs.filterUntrustedSources ?? true);
         setContinueUseWebSearch(prefs.continueUseWebSearch ?? false);
@@ -1038,8 +948,6 @@ export default function CouncilApp() {
           chairmanCustom,
           followupSelect,
           followupCustom,
-          webFetchSelect,
-          webFetchCustom,
           storageMode,
           filterUntrustedSources,
           continueUseWebSearch,
@@ -1056,8 +964,6 @@ export default function CouncilApp() {
     chairmanCustom,
     followupSelect,
     followupCustom,
-    webFetchSelect,
-    webFetchCustom,
     storageMode,
     filterUntrustedSources,
     continueUseWebSearch,
@@ -1134,7 +1040,6 @@ export default function CouncilApp() {
     (isFollowup: boolean) => ({
       chairman_model: chairmanEffective || undefined,
       followup_model: followupEffective || undefined,
-      web_fetch_model: webFetchEffective || undefined,
       council_models: validCouncilModels ?? undefined,
       use_web_search: webSearchMode !== "off",
       use_web_search_mode: webSearchMode,
@@ -1148,7 +1053,6 @@ export default function CouncilApp() {
       validCouncilModels,
       filterUntrustedSources,
       followupEffective,
-      webFetchEffective,
       webSearchMode,
       judgeWeights,
     ],
@@ -1224,6 +1128,12 @@ export default function CouncilApp() {
 
         await streamFn((type, ev) => {
           switch (type) {
+          case "progress":
+            patchLastAssistantActive((m) => ({
+              ...m,
+              progress: (ev.data as StreamProgress) ?? null,
+            }));
+            break;
           case "web_fetch_start":
             maybeRefreshSidebar();
             patchLastAssistantActive((m) => ({
@@ -1231,7 +1141,7 @@ export default function CouncilApp() {
               responseMode: isFollowup ? "followup" : "council",
               webFetch:
                 m.webFetch ??
-                ({ model: webFetchEffective || apiConfig?.web_fetch_model || "联网检索", content: "" } as WebFetchResult),
+                ({ model: chairmanEffective || apiConfig?.chairman_model || "主席模型", content: "" } as WebFetchResult),
               loading: { ...m.loading, webFetch: true },
             }));
             break;
@@ -1240,6 +1150,9 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               webFetch: ev.data as WebFetchResult,
+              progress: (m.progress?.phase === "web_fetch" || m.progress?.phase === "web_plan")
+                ? m.progress
+                : null,
               loading: { ...m.loading, webFetch: false },
             }));
             break;
@@ -1248,6 +1161,10 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               responseMode: "council",
+              progress:
+                m.progress?.phase === "web_plan" || m.progress?.phase === "web_fetch"
+                  ? null
+                  : m.progress,
               loading: { ...m.loading, stage1: true },
             }));
             break;
@@ -1256,6 +1173,7 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               stage1: ev.data as Stage1Item[],
+              progress: m.progress?.phase === "stage1" ? m.progress : null,
               loading: { ...m.loading, stage1: false },
               stale: { stage2: false, stage3: false },
             }));
@@ -1275,6 +1193,7 @@ export default function CouncilApp() {
               ...m,
               stage2: ev.data as Stage2Item[],
               metadata: (ev.metadata as AssistantMsg["metadata"]) ?? null,
+              progress: m.progress?.phase === "stage2" ? m.progress : null,
               loading: { ...m.loading, stage2: false },
             }));
             break;
@@ -1295,6 +1214,7 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               stage3: d.stage3,
+              progress: m.progress?.phase === "stage3" ? m.progress : null,
               loading: { ...m.loading, stage3: false },
             }));
             setChairmanContextPrompt({
@@ -1317,6 +1237,10 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               responseMode: "followup",
+              progress:
+                m.progress?.phase === "web_plan" || m.progress?.phase === "web_fetch"
+                  ? null
+                  : m.progress,
               loading: { ...m.loading, stage3: true },
               stage3: { model: sm || "…", response: "" },
             }));
@@ -1345,6 +1269,7 @@ export default function CouncilApp() {
               ...m,
               responseMode: "followup",
               stage3: ev.data as Stage3,
+              progress: m.progress?.phase === "followup" ? m.progress : null,
               loading: { ...m.loading, stage3: false },
             }));
             break;
@@ -1376,6 +1301,7 @@ export default function CouncilApp() {
             patchLastAssistantActive((m) => ({
               ...m,
               stage3: ev.data as Stage3,
+              progress: m.progress?.phase === "stage3" ? m.progress : null,
               loading: { ...m.loading, stage3: false },
             }));
             break;
@@ -1394,6 +1320,10 @@ export default function CouncilApp() {
             break;
           }
           case "complete": {
+            patchLastAssistantActive((m) => ({
+              ...m,
+              progress: null,
+            }));
             if (storageMode === "local") {
               // Persist the completed conversation to localStorage
               const existingConv = getLocalConversation(convId);
@@ -1435,6 +1365,17 @@ export default function CouncilApp() {
             break;
           }
           case "error":
+            patchLastAssistantActive((m) => ({
+              ...m,
+              progress: null,
+              loading: {
+                ...m.loading,
+                webFetch: false,
+                stage1: false,
+                stage2: false,
+                stage3: false,
+              },
+            }));
             delete streamDraftRef.current[convId];
             setActionErrorByConversation((prev) => ({
               ...prev,
@@ -1454,14 +1395,14 @@ export default function CouncilApp() {
       }
     },
     [
-      apiConfig?.web_fetch_model,
+      apiConfig?.chairman_model,
+      chairmanEffective,
       loadConversations,
       loadConversation,
       resetErrorState,
       sendOpts,
       setConversationLoading,
       storageMode,
-      webFetchEffective,
       conversation?.messages,
     ],
   );
@@ -1843,6 +1784,10 @@ export default function CouncilApp() {
 
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetContent side="left" className="flex w-[min(100%,20rem)] flex-col p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>会话列表</SheetTitle>
+            <SheetDescription>浏览、切换、新建或删除当前保存的对话。</SheetDescription>
+          </SheetHeader>
           {SidebarBody}
         </SheetContent>
       </Sheet>
@@ -1934,6 +1879,9 @@ export default function CouncilApp() {
             <SheetContent className="flex max-h-dvh flex-col overflow-y-auto">
               <SheetHeader>
                 <SheetTitle>高级设置</SheetTitle>
+                <SheetDescription className="sr-only">
+                  配置联网策略、模型选择、评委权重和对话存储方式。
+                </SheetDescription>
               </SheetHeader>
               <div className="mt-4 space-y-6">
                 <div className="space-y-2">
@@ -1956,19 +1904,35 @@ export default function CouncilApp() {
                   </p>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="apiKey">OpenRouter API Key</Label>
+                  <Label htmlFor="apiKey">Ofox API Key</Label>
                   <Input
                     id="apiKey"
                     type="password"
                     placeholder="sk-or-v1-..."
-                    value={openrouterKey}
+                    value={ofoxKey}
                     onChange={(e) => {
-                      setOpenrouterKey(e.target.value);
+                      setOfoxKey(e.target.value);
                       setStoredApiKey(e.target.value);
                     }}
                   />
                   <p className="text-xs text-muted-foreground">
-                    密钥仅保存在浏览器本地，不会上传至第三方。
+                    用于所有模型调用。密钥仅保存在浏览器本地，请求时仅转发给当前后端。
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="tavilyKey">Tavily API Key</Label>
+                  <Input
+                    id="tavilyKey"
+                    type="password"
+                    placeholder="tvly-..."
+                    value={tavilyKey}
+                    onChange={(e) => {
+                      setTavilyKey(e.target.value);
+                      setStoredTavilyKey(e.target.value);
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    仅在开启联网时使用。Web 抓取阶段现在固定由 Tavily 检索，模型只负责拆题、整理和后续分析。
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -1988,8 +1952,8 @@ export default function CouncilApp() {
                   </Select>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  `自动判断` 会结合当前问题和前文决定本轮是否联网、是否复用上一轮检索结果；`强制联网` 每轮都会重新联网检索。
-                  若模型不支持联网，服务端会尝试去掉插件重试；本页选项会保存在本机浏览器。
+                  `自动判断` 会结合当前问题和前文决定本轮是否联网、是否复用上一轮检索结果；`强制联网` 每轮都会重新调用 Tavily 检索。
+                  当前不会再使用模型原生 Web Search。
                 </p>
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -2005,46 +1969,8 @@ export default function CouncilApp() {
                   </p>
                 </div>
                 {webSearchMode !== "off" ? (
-                  <div className="space-y-2">
-                    <Label>Web 抓取模型（仅联网阶段）</Label>
-                    <Select
-                      value={webFetchSelect || undefined}
-                      onValueChange={setWebFetchSelect}
-                    >
-                      <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模型" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {renderModelSelectSections(webFetchModelSections)}
-                        {webFetchModelSections.length ? <SelectSeparator /> : null}
-                        <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    {webFetchSelect === "__custom__" ? (
-                      <Input
-                        placeholder="openrouter/model-id"
-                        value={webFetchCustom}
-                        onChange={(e) => setWebFetchCustom(e.target.value)}
-                      />
-                    ) : null}
-                    <p className="text-xs text-muted-foreground">
-                      仅用于联网检索阶段，与主席模型独立。推荐项会固定排在最上面，来自服务端当前配置的
-                      <span className="font-mono"> WEB_SEARCH_MODELS </span>
-                      与默认
-                      <span className="font-mono"> WEB_FETCH_MODEL </span>
-                      （当前包含 OpenAI / Anthropic / Perplexity / xAI 的原生搜索模型，以及走 Exa 兜底的 Gemini）。带{" "}
-                      <span className="font-mono">:online</span> 或 Exa 兜底的模型，见{" "}
-                      <a
-                        href="https://openrouter.ai/docs/guides/features/server-tools/web-search"
-                        className="underline underline-offset-2"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        OpenRouter Web Search
-                      </a>
-                      ）。自定义留空时由服务端{" "}
-                      <span className="font-mono">WEB_FETCH_MODEL</span> 决定。
-                    </p>
+                  <div className="rounded-lg border border-border bg-muted/20 p-3 text-xs text-muted-foreground">
+                    联网阶段流程固定为：主席模型拆解需要联网的事实点 {"->"} Tavily 抓取 {"->"} 主席模型整理来源与事实 {"->"} 再进入 Stage 1 / Stage 2 / Stage 3。
                   </div>
                 ) : null}
                 <div className="space-y-2">
@@ -2064,7 +1990,7 @@ export default function CouncilApp() {
                   </Select>
                   {chairmanSelect === "__custom__" ? (
                     <Input
-                      placeholder="openrouter/model-id"
+                      placeholder="provider/model-id"
                       value={chairmanCustom}
                       onChange={(e) => setChairmanCustom(e.target.value)}
                     />
@@ -2087,7 +2013,7 @@ export default function CouncilApp() {
                   </Select>
                   {followupSelect === "__custom__" ? (
                     <Input
-                      placeholder="openrouter/model-id"
+                      placeholder="provider/model-id"
                       value={followupCustom}
                       onChange={(e) => setFollowupCustom(e.target.value)}
                     />
@@ -2171,7 +2097,7 @@ export default function CouncilApp() {
                         {editingCouncilModelIndex === index ? (
                           <div className="flex items-center gap-2">
                             <Input
-                              placeholder="openrouter/model-id"
+                              placeholder="provider/model-id"
                               value={editingCouncilModelCustom}
                               onChange={(e) => setEditingCouncilModelCustom(e.target.value)}
                             />
@@ -2547,6 +2473,42 @@ function StepperRow({
   );
 }
 
+function ProgressNotice({ progress }: { progress?: StreamProgress | null }) {
+  if (!progress?.message?.trim()) return null;
+  const counter =
+    progress.total != null
+      ? `${Math.min(progress.current ?? 0, progress.total)}/${progress.total}`
+      : null;
+  return (
+    <div className="mb-3 rounded-md border border-status-running-border/40 bg-status-running/10 px-3 py-2 text-xs text-status-running-foreground">
+      <div className="flex items-center gap-2">
+        <Loader2 className="size-3.5 animate-spin" aria-hidden />
+        <span>{progress.message}</span>
+        {counter ? <span className="font-mono opacity-80">{counter}</span> : null}
+      </div>
+      {progress.phase === "web_fetch" && progress.searchTasks?.length ? (
+        <div className="mt-2 rounded-md border border-status-running-border/30 bg-background/60 px-2 py-2 text-[11px] text-foreground">
+          <div className="font-medium">本轮需要搜索的指标</div>
+          <ul className="mt-1 space-y-1">
+            {progress.searchTasks.map((task, index) => (
+              <li key={`${task.query}-${index}`} className="leading-snug">
+                <span className="font-mono text-[10px] opacity-70">#{index + 1}</span>
+                <span className="ml-2">{task.query}</span>
+                {task.why ? <span className="ml-2 text-muted-foreground">({task.why})</span> : null}
+              </li>
+            ))}
+          </ul>
+          {progress.analysisOnly?.length ? (
+            <p className="mt-2 leading-snug text-muted-foreground">
+              留给大模型后续处理：{progress.analysisOnly.join("；")}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function CouncilAssistantCard({
   m,
   msgIndex,
@@ -2572,7 +2534,6 @@ function CouncilAssistantCard({
   sendOpts: (isFollowup: boolean) => {
     chairman_model?: string;
     followup_model?: string;
-    web_fetch_model?: string;
     council_models?: string[];
     use_web_search?: boolean;
     use_web_search_mode?: WebSearchMode;
@@ -2620,9 +2581,10 @@ function CouncilAssistantCard({
   const busyStage3 = busyKey === "s3";
 
   const isFollowup = m.responseMode === "followup";
+  const webPlanActive = m.progress?.phase === "web_plan";
 
   const effectiveLoading = {
-    webFetch: loading.webFetch,
+    webFetch: loading.webFetch || webPlanActive,
     stage1: loading.stage1 || busyStage1All,
     stage2: loading.stage2 || busyStage2,
     stage3:
@@ -2694,10 +2656,10 @@ function CouncilAssistantCard({
       {(m.webFetch?.webSearchSkipped || webSearchSkippedModels.length > 0) ? (
         <div className="mb-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
           {m.webFetch?.webSearchSkipped ? (
-            <p>Web 抓取模型 ({modelShortName(m.webFetch.model)}) 不支持联网插件，已跳过联网搜索。</p>
+            <p>本轮联网检索被跳过：{modelShortName(m.webFetch.model)} 未生成可执行检索结果。</p>
           ) : null}
           {webSearchSkippedModels.length > 0 ? (
-            <p>以下模型不支持联网插件，已回退到无联网模式：{webSearchSkippedModels.map(modelShortName).join("、")}</p>
+            <p>以下模型本轮未接收到可验证的联网材料，已按纯文本模式作答：{webSearchSkippedModels.map(modelShortName).join("、")}</p>
           ) : null}
         </div>
       ) : null}
@@ -2717,6 +2679,7 @@ function CouncilAssistantCard({
           loading={effectiveLoading}
         />
       </div>
+      <ProgressNotice progress={m.progress} />
       {pending ? (
         <div
           className="mt-3 flex h-[min(58dvh,32rem)] min-h-[220px] flex-col gap-3 rounded-lg border border-status-running-border/40 bg-status-running/15 p-4"
@@ -2762,7 +2725,7 @@ function CouncilAssistantCard({
             value="web"
             className="mt-2 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
           >
-            <WebFetchView data={m.webFetch ?? null} loading={effectiveLoading.webFetch} />
+            <WebFetchView data={m.webFetch ?? null} loading={effectiveLoading.webFetch} progress={m.progress} />
           </TabsContent>
         ) : null}
         {!isFollowup ? (
@@ -2952,14 +2915,18 @@ function CouncilAssistantCard({
 function WebFetchView({
   data,
   loading,
+  progress,
 }: {
   data: WebFetchResult | null;
   loading: boolean;
+  progress?: StreamProgress | null;
 }) {
   const rankedSources = useMemo(
     () => [...(data?.sources ?? [])].sort(compareWebFetchSources),
     [data?.sources],
   );
+  const plannedSearchTasks = data?.searchTasks ?? progress?.searchTasks ?? [];
+  const plannedAnalysisOnly = data?.analysisOnly ?? progress?.analysisOnly ?? [];
   const topSources = rankedSources.slice(0, 3);
   const hasStructuredSources = rankedSources.length > 0;
   const showUnrankedWarning =
@@ -2969,7 +2936,7 @@ function WebFetchView({
     Boolean(data?.content?.trim());
   const warningText =
     data?.webSearchWarning ??
-    "OpenRouter 这次没有返回结构化 url_citation，前端拿不到精确 URL，所以不能做来源排序。下面正文里的“来源清单 / 参考来源”只是模型文本输出，不等于已验证来源。";
+    "本轮 Tavily 没有返回可用于排序的结构化来源，前端拿不到稳定的精确 URL 集合。下面正文里的“来源清单 / 参考来源”只是模型整理结果，不等于已验证来源。";
 
   if (loading)
     return (
@@ -2978,8 +2945,30 @@ function WebFetchView({
         style={{ animation: "council-fade-in 0.3s ease-out both" }}
       >
         <p className="text-sm text-foreground">
-          正在通过 OpenRouter 网页插件检索公开网页，请稍候…
+          正在用主席模型拆题并通过 Tavily 检索公开网页，请稍候…
         </p>
+        {progress?.message ? (
+          <p className="text-xs text-muted-foreground">{progress.message}</p>
+        ) : null}
+        {plannedSearchTasks.length ? (
+          <div className="rounded-md border border-status-running-border/30 bg-background/60 p-2 text-xs">
+            <div className="font-medium text-foreground">需要搜索的指标</div>
+            <ul className="mt-1 space-y-1 text-muted-foreground">
+              {plannedSearchTasks.map((task, index) => (
+                <li key={`${task.query}-${index}`} className="leading-snug">
+                  <span className="font-mono text-[10px]">#{index + 1}</span>
+                  <span className="ml-2">{task.query}</span>
+                  {task.why ? <span className="ml-2">({task.why})</span> : null}
+                </li>
+              ))}
+            </ul>
+            {plannedAnalysisOnly.length ? (
+              <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+                留给后续分析：{plannedAnalysisOnly.join("；")}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
         {data?.model ? (
           <div className="font-mono text-xs text-muted-foreground">{data.model}</div>
         ) : null}
@@ -3029,9 +3018,28 @@ function WebFetchView({
           </span>
         </p>
       ) : null}
+      {plannedSearchTasks.length ? (
+        <div className="mt-2 rounded-md border border-sky-200 bg-sky-50/80 p-2 text-xs text-sky-950 dark:border-sky-900/70 dark:bg-sky-950/30 dark:text-sky-100">
+          <div className="font-medium">Web Search 指标</div>
+          <ul className="mt-1 space-y-1">
+            {plannedSearchTasks.map((task, index) => (
+              <li key={`${task.query}-${index}`} className="leading-snug">
+                <span className="font-mono text-[10px] opacity-80">#{index + 1}</span>
+                <span className="ml-2">{task.query}</span>
+                {task.why ? <span className="ml-2 opacity-80">({task.why})</span> : null}
+              </li>
+            ))}
+          </ul>
+          {plannedAnalysisOnly.length ? (
+            <p className="mt-2 leading-snug opacity-85">
+              不走联网、留给后续模型处理：{plannedAnalysisOnly.join("；")}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       {showUnrankedWarning ? (
         <div className="mt-2 rounded-md border border-red-200 bg-red-50/80 p-2 text-xs text-red-950 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-100">
-          <div className="font-medium">这次 Web Search 返回不可直接采信，也无法排序</div>
+          <div className="font-medium">这次 Tavily 检索结果无法直接排序或采信</div>
           <p className="mt-1 leading-snug opacity-90">
             {warningText}
           </p>
@@ -3054,7 +3062,7 @@ function WebFetchView({
         <div className="mt-2 rounded-md border border-emerald-200 bg-emerald-50/70 p-2 dark:border-emerald-900/70 dark:bg-emerald-950/20">
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className="font-medium text-emerald-900 dark:text-emerald-100">
-              Web Search 排序
+              Tavily 来源排序
             </span>
             <Badge variant="secondary" className="text-[10px]">
               先按可信分数
@@ -3104,7 +3112,7 @@ function WebFetchView({
       {rankedSources.length > 0 ? (
         <div className="mt-2 rounded-md border border-border bg-muted/40 p-2">
           <div className="text-xs font-medium text-muted-foreground">
-            API 结构化来源排序（url_citation，{rankedSources.length} 条）
+            Tavily 结构化来源排序（{rankedSources.length} 条）
           </div>
           <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
             当前前端会在 Web 检索阶段直接展示排序结果，不再只是显示原始抓取文本。
@@ -3161,9 +3169,7 @@ function WebFetchView({
       ) : null}
       {!hasStructuredSources && !loading && !data.webSearchSkipped ? (
         <div className="mt-2 rounded-md border border-dashed border-border bg-muted/25 p-2 text-[11px] leading-snug text-muted-foreground">
-          本轮未收到可排序的结构化来源。要展示真正的 Web 排序，联网模型必须返回带精确 URL 的
-          <span className="mx-1 font-mono">url_citation</span>
-          数据，而不是只在正文里写几个站点名字。
+          本轮未收到可排序的结构化来源。要展示真正的来源排序，Tavily 检索结果必须带回可用的精确 URL，而不是只留下模型整理后的站点名称。
         </div>
       ) : null}
       <div className="mt-2 max-w-none text-sm leading-relaxed text-foreground [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-2">

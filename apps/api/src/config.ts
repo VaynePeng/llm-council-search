@@ -9,28 +9,18 @@ const repoRoot = path.resolve(__dirname, '..', '..', '..')
 loadEnv({ path: path.join(repoRoot, '.env') })
 loadEnv({ path: path.join(repoRoot, 'apps', 'api', '.env'), override: true })
 
-export const OPENROUTER_API_URL =
-  process.env.OPENROUTER_API_URL ??
-  'https://openrouter.ai/api/v1/chat/completions'
+export const OFOX_API_URL =
+  process.env.OFOX_API_URL ??
+  'https://api.ofox.ai/v1/chat/completions'
+
+export const TAVILY_API_URL =
+  process.env.TAVILY_API_URL ??
+  'https://api.tavily.com/search'
 
 export const COUNCIL_MODELS: string[] = [
   'openai/gpt-5.1',
   'google/gemini-3.1-pro-preview',
   'anthropic/claude-sonnet-4.5'
-]
-
-/**
- * 适合搭配 OpenRouter `openrouter:web_search` 服务端工具 / `:online` 的模型（`auto` 原生或 Exa 等）。
- * @see https://openrouter.ai/docs/guides/features/server-tools/web-search
- */
-export const WEB_SEARCH_MODELS: string[] = [
-  'openai/gpt-5.1:online',
-  'openai/gpt-4.1:online',
-  'anthropic/claude-sonnet-4.5',
-  'perplexity/sonar-pro',
-  'x-ai/grok-4',
-  'google/gemini-3.1-pro-preview',
-  'google/gemini-2.5-flash'
 ]
 
 export const CHAIRMAN_MODEL =
@@ -68,10 +58,6 @@ export const FOLLOWUP_MODEL =
 /** 用于 `auto` 联网判定的轻量路由模型；仅做 skip/search/reuse 决策。 */
 export const WEB_SEARCH_ROUTER_MODEL =
   process.env.WEB_SEARCH_ROUTER_MODEL ?? 'google/gemini-2.5-flash'
-
-/** 默认用 `:online` 模型名；实现上会去掉后缀并显式启用 `openrouter:web_search`。OpenAI 等走 `auto` 原生检索；Gemini 等在 openrouter.ts 中强制 `engine: "exa"`。 */
-export const WEB_FETCH_MODEL =
-  process.env.WEB_FETCH_MODEL ?? 'openai/gpt-5.1:online'
 
 export const DATA_DIR = path.resolve(
   process.env.DATA_DIR ?? path.join(__dirname, '..', 'data', 'conversations')

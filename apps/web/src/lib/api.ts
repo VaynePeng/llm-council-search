@@ -1,7 +1,8 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 
-const API_KEY_STORAGE = "llm-council-search-openrouter-key";
+const API_KEY_STORAGE = "llm-council-search-ofox-key";
+const TAVILY_KEY_STORAGE = "llm-council-search-tavily-key";
 
 export function getStoredApiKey(): string {
   if (typeof window === "undefined") return "";
@@ -17,9 +18,27 @@ export function setStoredApiKey(key: string): void {
   }
 }
 
+export function getStoredTavilyKey(): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(TAVILY_KEY_STORAGE) ?? "";
+}
+
+export function setStoredTavilyKey(key: string): void {
+  if (typeof window === "undefined") return;
+  if (key.trim()) {
+    localStorage.setItem(TAVILY_KEY_STORAGE, key.trim());
+  } else {
+    localStorage.removeItem(TAVILY_KEY_STORAGE);
+  }
+}
+
 function authHeaders(): Record<string, string> {
-  const key = getStoredApiKey();
-  return key ? { "X-OpenRouter-Key": key } : {};
+  const ofoxKey = getStoredApiKey();
+  const tavilyKey = getStoredTavilyKey();
+  return {
+    ...(ofoxKey ? { "X-Ofox-Key": ofoxKey } : {}),
+    ...(tavilyKey ? { "X-Tavily-Key": tavilyKey } : {}),
+  };
 }
 
 export type ConversationMeta = {
@@ -42,16 +61,13 @@ export type ApiConfig = {
   featured_model_groups?: Array<{
     key: string;
     label: string;
-    latest: string[];
-    free: string[];
+    models: string[];
   }>;
   council_models: string[];
-  /** 推荐用于 OpenRouter 联网（`openrouter:web_search`）的模型 ID */
-  web_search_models?: string[];
+  web_search_provider?: string;
   chairman_model: string;
   followup_model?: string;
   title_model: string;
-  web_fetch_model?: string;
   /** 已知模型的大致上下文上限（tokens），用于主席阶段预估 */
   chairman_context_limits?: Record<string, number>;
   chairman_output_reserve_tokens?: number;
@@ -95,7 +111,6 @@ export async function deleteConversation(id: string): Promise<void> {
 export type SendOptions = {
   chairman_model?: string;
   followup_model?: string;
-  web_fetch_model?: string;
   council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: WebSearchMode;
@@ -118,7 +133,6 @@ export async function sendMessage(
         content,
         chairman_model: options?.chairman_model,
         followup_model: options?.followup_model,
-        web_fetch_model: options?.web_fetch_model,
         council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
@@ -149,7 +163,6 @@ export async function sendMessageStream(
         content,
         chairman_model: options?.chairman_model,
         followup_model: options?.followup_model,
-        web_fetch_model: options?.web_fetch_model,
         council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
@@ -166,6 +179,7 @@ export async function sendMessageStream(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTerminalEvent = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -179,12 +193,35 @@ export async function sendMessageStream(
           const event = JSON.parse(line.slice(6)) as Record<string, unknown> & {
             type: string;
           };
+          if (event.type === "complete" || event.type === "error") {
+            sawTerminalEvent = true;
+          }
           onEvent(event.type, event);
         } catch {
           /* ignore */
         }
       }
     }
+  }
+
+  buffer += decoder.decode();
+  const trailingLine = buffer.trim();
+  if (trailingLine.startsWith("data: ")) {
+    try {
+      const event = JSON.parse(trailingLine.slice(6)) as Record<string, unknown> & {
+        type: string;
+      };
+      if (event.type === "complete" || event.type === "error") {
+        sawTerminalEvent = true;
+      }
+      onEvent(event.type, event);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (!signal?.aborted && !sawTerminalEvent) {
+    onEvent("error", { type: "error", message: "流式响应意外中断" });
   }
 }
 
@@ -414,7 +451,6 @@ export async function sendMessageStatelessStream(
       messages,
       chairman_model: options?.chairman_model,
       followup_model: options?.followup_model,
-      web_fetch_model: options?.web_fetch_model,
       council_models: options?.council_models,
       use_web_search: options?.use_web_search,
       use_web_search_mode: options?.use_web_search_mode,
@@ -430,6 +466,7 @@ export async function sendMessageStatelessStream(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTerminalEvent = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -441,12 +478,33 @@ export async function sendMessageStatelessStream(
       if (line.startsWith("data: ")) {
         try {
           const event = JSON.parse(line.slice(6)) as Record<string, unknown> & { type: string };
+          if (event.type === "complete" || event.type === "error") {
+            sawTerminalEvent = true;
+          }
           onEvent(event.type, event);
         } catch {
           /* ignore */
         }
       }
     }
+  }
+
+  buffer += decoder.decode();
+  const trailingLine = buffer.trim();
+  if (trailingLine.startsWith("data: ")) {
+    try {
+      const event = JSON.parse(trailingLine.slice(6)) as Record<string, unknown> & { type: string };
+      if (event.type === "complete" || event.type === "error") {
+        sawTerminalEvent = true;
+      }
+      onEvent(event.type, event);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (!signal?.aborted && !sawTerminalEvent) {
+    onEvent("error", { type: "error", message: "流式响应意外中断" });
   }
 }
 

@@ -24,6 +24,11 @@ export type WebFetchSource = {
   filteredOut?: boolean;
 };
 
+export type WebSearchTask = {
+  query: string;
+  why: string;
+};
+
 export type WebFetchResult = {
   model: string;
   content: string;
@@ -39,7 +44,11 @@ export type WebFetchResult = {
   /** ISO 8601 UTC，检索发起时刻；前端可用 dayjs 转本机时区展示 */
   retrievedAt?: string;
   retrievedAtUnixSeconds?: number;
-  /** OpenRouter 返回的结构化 URL 引用，供 UI 与 Stage1 核对 */
+  /** 主席模型在 web search 阶段拆出的可执行搜索指标/任务 */
+  searchTasks?: WebSearchTask[];
+  /** 明确留给后续模型处理、无需联网的项目 */
+  analysisOnly?: string[];
+  /** Ofox 返回的结构化 URL 引用，供 UI 与 Stage1 核对 */
   sources?: WebFetchSource[];
 };
 

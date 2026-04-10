@@ -1,5 +1,5 @@
 > **项目说明（请务必阅读）**  
-> - 本项目以 [**llm-council**](https://github.com/karpathy/llm-council) 为参考，在相同的三阶段议会思路上，额外加入了 **搜索（OpenRouter 联网 / `web` 插件）**、**分阶段与分模型重跑** 等能力。  
+> - 本项目以 [**llm-council**](https://github.com/karpathy/llm-council) 为参考，在相同的三阶段议会思路上，额外加入了 **搜索（Tavily 检索 + 模型分析）**、**分阶段与分模型重跑** 等能力。  
 > - **本仓库全部代码均为 AI 生成**，未保证人工逐行审核；使用前请自行审查安全性与正确性，生产环境请充分测试，风险自负。
 
 ---
@@ -15,7 +15,7 @@
 
 | 包 | 说明 |
 |----|------|
-| **`apps/api`** | Hono + TypeScript，`tsx` 开发；OpenRouter Chat Completions；会话 JSON 存储 + 文件锁 |
+| **`apps/api`** | Hono + TypeScript，`tsx` 开发；Ofox Chat Completions；会话 JSON 存储 + 文件锁 |
 | **`apps/web`** | Next.js 16（App Router）+ Tailwind 4 + Radix UI；`next-themes`；SSE 消费三阶段事件流 |
 
 ## 功能概览
@@ -23,7 +23,7 @@
 - **三阶段流程**：Stage1 并行多模型 → Stage2 匿名评审与解析排名 → Stage3 主席综合；支持 **SSE** 与 **非流式** 接口。
 - **评委权重**：Stage2 聚合排名加权；高级设置里 Slider + `localStorage`；请求体支持 `judge_weights` / 别名 `weights`。
 - **主席模型**：可选 `chairman_model` / 别名 `final_model`；设置内下拉 + 自定义模型 ID。
-- **联网**：OpenRouter `web` 插件；失败时 **自动去掉插件重试**（未实现 `:online` 模型后缀策略）。
+- **联网**：主席模型先拆解需要核验的部分，再由 **Tavily** 抓取，最后把结果交回模型整理与综合。
 - **重跑**：按模型重跑 Stage1、整阶段 Stage2、Stage3；**失败顶栏可「重试」**（发送流式与重跑均支持）。
 - **UI**：Stepper 进度；**Stage 1/2/3 主 Tab** + Stage1/2 内 **按模型（及聚合）子 Tab**，固定高度面板内滚动，减少整页拖动。
 - **会话**：列表、删除会话；助手消息持久化 `metadata`（`label_to_model`、`aggregate_rankings`）、`stale`、`assistantMessageId`。
@@ -46,7 +46,7 @@ pnpm dev
 
 单独启动：`pnpm dev:api` / `pnpm dev:web`。
 
-首次使用时，在网页里输入你的 OpenRouter API Key；前端会保存到浏览器本地 `localStorage`，并通过请求头发给 API。
+首次使用时，在网页里输入你的 Ofox API Key 与 Tavily API Key；前端会保存到浏览器本地 `localStorage`，并通过请求头发给 API。
 
 ## Docker 一键启动
 
@@ -75,7 +75,7 @@ docker compose down -v
 说明：
 
 - 容器内同时运行 Web 与 API，对外只需要暴露 `3000`。
-- OpenRouter API Key 由用户在网页端输入，服务端不再依赖 `.env` 中的密钥。
+- Ofox API Key 与 Tavily API Key 都由用户在网页端输入，服务端不再依赖 `.env` 中的密钥。
 - Docker 默认把会话数据持久化到命名卷 `api_data`，容器重建后仍保留。
 - 前端通过同容器内代理转发 `/api/*` 到本地 Hono 服务，所以用户不需要再单独暴露 `8001`。
 
@@ -108,7 +108,8 @@ docker run -d \
 
 | 现象 | 处理 |
 |------|------|
-| OpenRouter `401 Missing Authentication header` 或 `OpenRouter API key required via X-OpenRouter-Key header` | 需要先在网页端输入 OpenRouter API Key；该 key 会保存在当前浏览器本地。 |
+| Ofox `401 Missing Authentication header` 或 `Ofox API key required via X-Ofox-Key header` | 需要先在网页端输入 Ofox API Key；该 key 会保存在当前浏览器本地。 |
+| `Tavily API key required via X-Tavily-Key header when web search is enabled` | 需要在网页端输入 Tavily API Key；仅在开启联网时必需。 |
 | Web 启动报端口占用 | 结束占用 3000 的进程，或改 `next dev` 端口并在 `apps/api/src/index.ts` 的 CORS `origin` 中加入新前端地址。 |
 
 ## API 一览
@@ -135,7 +136,7 @@ docker run -d \
 
 ### 联网说明
 
-仅通过 OpenRouter 的 `web` 插件；**未实现**「`:online` 模型后缀」与插件并行的策略。生产若需同源，可在 Next `rewrites` 将 `/api` 代理到 Hono（需自行配置）。
+联网阶段固定为：主席模型拆解问题中的外部事实核验需求 -> Tavily 搜索 -> 主席模型整理检索 dossier -> 再进入 Stage1/2/3。当前不再使用模型原生 web search。
 
 ### 数据目录
 
@@ -161,7 +162,7 @@ pnpm --filter @llm-council-search/web exec tsc --noEmit
 
 ```
 apps/
-  api/          # Hono 服务、OpenRouter、council 逻辑、存储
+  api/          # Hono 服务、Ofox、council 逻辑、存储
   web/          # Next 应用、聊天 UI、SSE 客户端
 ```
 

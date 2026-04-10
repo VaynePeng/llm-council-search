@@ -1,4 +1,4 @@
-import { OPENROUTER_API_URL } from "./config.js";
+import { OFOX_API_URL } from "./config.js";
 
 export type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -6,7 +6,7 @@ export type ChatMessage = {
   reasoning_details?: unknown;
 };
 
-/** OpenRouter 对 web 结果的 `url_citation` 标注（与 Chat Completions message 对齐） */
+/** Ofox 对 web 结果的 `url_citation` 标注（与 Chat Completions message 对齐） */
 export type UrlCitationItem = {
   url: string;
   title?: string;
@@ -42,7 +42,7 @@ export function getWebSearchTemporalContext(now: Date = new Date()) {
   const isoUtc = now.toISOString();
   const unixSeconds = Math.floor(now.getTime() / 1000);
   const webSearchInstruction =
-    `When you use the OpenRouter web search tool, anchor retrieval time to ${isoUtc} (ISO 8601, UTC). ` +
+    `When you use the model's web search capability, anchor retrieval time to ${isoUtc} (ISO 8601, UTC). ` +
     `Unix epoch seconds: ${unixSeconds}. Do not assume the end user's local timezone; use this UTC anchor only. ` +
     `Prefer sources that are current as of this instant or clearly published recently; ` +
     `treat undated, undiscoverable-publish-date, or obviously stale pages as weaker evidence when the user needs up-to-date facts. ` +
@@ -58,7 +58,7 @@ export type WebSearchTemporalContext = ReturnType<typeof getWebSearchTemporalCon
 export type QueryOptions = {
   timeoutMs?: number;
   useWebSearch?: boolean;
-  /** `openrouter:web_search` 的 `max_results`（默认 5） */
+  /** 预留的联网搜索结果上限（默认 5） */
   webMaxResults?: number;
   /** 与聊天提示词共用同一时间锚，与注入的 system 补充说明一致 */
   webSearchTemporalContext?: WebSearchTemporalContext;
@@ -66,6 +66,13 @@ export type QueryOptions = {
   apiKey?: string;
   /** 外部取消信号，例如客户端中止会话流时同步中断上游请求 */
   signal?: AbortSignal;
+};
+
+export type QueryModelsParallelProgress = {
+  model: string;
+  status: "start" | "complete" | "error";
+  current: number;
+  total: number;
 };
 
 function abortError(): Error {
@@ -102,28 +109,9 @@ function createRequestSignal(
   };
 }
 
-/** `:online` 变体与显式联网二选一即可；去掉后缀避免与 `openrouter:web_search` 重复触发。 */
+/** `:online` 变体与显式联网二选一即可；去掉后缀避免重复触发模型侧联网能力。 */
 function stripOnlineSuffix(model: string): string {
   return model.endsWith(":online") ? model.slice(0, -":online".length) : model;
-}
-
-/** OpenRouter：仅 OpenAI / Anthropic / Perplexity / xAI 适合 `native`/`auto`；其余强制 Exa，避免部分模型（如 Google）原生检索异常。 */
-function webSearchToolsPayload(
-  model: string,
-  maxResults: number,
-): Array<Record<string, unknown>> {
-  const max = Math.min(25, Math.max(1, maxResults));
-  const m = stripOnlineSuffix(model).toLowerCase();
-  const nativePrefix =
-    m.startsWith("openai/") ||
-    m.startsWith("anthropic/") ||
-    m.startsWith("perplexity/") ||
-    m.startsWith("x-ai/");
-  const parameters: Record<string, unknown> = { max_results: max };
-  if (!nativePrefix) {
-    parameters.engine = "exa";
-  }
-  return [{ type: "openrouter:web_search", parameters }];
 }
 
 /** 服务端工具无 `search_prompt`，将时区与引用规则写入 system（与首条 system 合并）。 */
@@ -160,7 +148,7 @@ function chatRequestBody(
 function resolveApiKey(override?: string): string {
   const key = override?.trim();
   if (!key) {
-    throw new Error("OpenRouter API key required via X-OpenRouter-Key header");
+    throw new Error("Ofox API key required via X-Ofox-Key header");
   }
   return key;
 }
@@ -177,7 +165,7 @@ async function doFetch(
     Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
-  return fetch(OPENROUTER_API_URL, {
+  return fetch(OFOX_API_URL, {
     method: "POST",
     headers,
     body: JSON.stringify(chatRequestBody(model, messages, tools, false)),
@@ -197,7 +185,7 @@ async function doFetchStream(
     Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
-  return fetch(OPENROUTER_API_URL, {
+  return fetch(OFOX_API_URL, {
     method: "POST",
     headers,
     body: JSON.stringify(chatRequestBody(model, messages, tools, true)),
@@ -205,14 +193,14 @@ async function doFetchStream(
   });
 }
 
-/** 解析 OpenAI/OpenRouter 式 SSE 流，将正文增量交给 onDelta */
+/** 解析 OpenAI 兼容 SSE 流，将正文增量交给 onDelta */
 async function consumeChatCompletionStream(
   res: Response,
   onDelta: (chunk: string) => void,
 ): Promise<{ ok: boolean; reasoning_details?: unknown[] }> {
   if (!res.ok) {
     const text = await res.text();
-    console.error("OpenRouter stream HTTP error:", res.status, text);
+    console.error("Ofox stream HTTP error:", res.status, text);
     return { ok: false };
   }
   const reader = res.body?.getReader();
@@ -245,7 +233,7 @@ async function consumeChatCompletionStream(
           error?: { message?: string };
         };
         if (j.error?.message) {
-          console.error("OpenRouter stream chunk error:", j.error.message);
+          console.error("Ofox stream chunk error:", j.error.message);
           continue;
         }
         const delta = j.choices?.[0]?.delta;
@@ -283,16 +271,11 @@ export async function queryModel(
     signal,
   } = options;
 
-  const effectiveModel =
-    useWebSearch ? stripOnlineSuffix(model) : model;
-
+  void webMaxResults;
+  const effectiveModel = useWebSearch ? stripOnlineSuffix(model) : model;
   const payloadMessages = useWebSearch
     ? withWebSearchSystemInstruction(messages, webSearchTemporalContext)
     : messages;
-
-  const webTools = useWebSearch
-    ? webSearchToolsPayload(effectiveModel, webMaxResults)
-    : undefined;
 
   const request = createRequestSignal(timeoutMs, signal);
 
@@ -305,7 +288,7 @@ export async function queryModel(
   } | null> => {
     if (!res.ok) {
       const text = await res.text();
-      console.error(`OpenRouter error ${effectiveModel}:`, res.status, text);
+      console.error(`Ofox error ${effectiveModel}:`, res.status, text);
       return null;
     }
     const data = (await res.json()) as {
@@ -328,69 +311,20 @@ export async function queryModel(
 
   try {
     throwIfAborted(signal);
-    if (useWebSearch) {
-      let withWebSearchTool: {
-        content: string;
-        reasoning_details?: unknown;
-        citations?: UrlCitationItem[];
-      } | null = null;
-      try {
-        const resWith = await doFetch(
-          effectiveModel,
-          payloadMessages,
-          webTools,
-          request.signal,
-          apiKey,
-        );
-        withWebSearchTool = await parseSuccess(resWith);
-      } catch (e) {
-        console.warn(
-          `[OpenRouter] Web search request threw for ${effectiveModel}:`,
-          e,
-        );
-      }
-      if (withWebSearchTool) {
-        return {
-          content: withWebSearchTool.content,
-          reasoning_details: withWebSearchTool.reasoning_details,
-          citations: withWebSearchTool.citations,
-        };
-      }
-
-      console.warn(
-        `[OpenRouter] Web search request failed for ${effectiveModel}; retrying without web search tool.`,
-      );
-      try {
-        const resNo = await doFetch(
-          effectiveModel,
-          messages,
-          undefined,
-          request.signal,
-          apiKey,
-        );
-        const fallback = await parseSuccess(resNo);
-        if (fallback)
-          return {
-            ...fallback,
-            webSearchSkipped: true,
-          };
-      } catch (e) {
-        console.error(
-          `[OpenRouter] Fallback request without web search failed for ${effectiveModel}:`,
-          e,
-        );
-      }
-      return null;
-    }
-
     const res = await doFetch(
       effectiveModel,
-      messages,
+      payloadMessages,
       undefined,
       request.signal,
       apiKey,
     );
-    return parseSuccess(res);
+    const result = await parseSuccess(res);
+    return result
+      ? {
+          ...result,
+          ...(useWebSearch ? { webSearchSkipped: true } : {}),
+        }
+      : null;
   } catch (e) {
     if ((e as { name?: string })?.name === "AbortError") throw e;
     console.error(`Error querying model ${model}:`, e);
@@ -405,8 +339,7 @@ export type QueryStreamOptions = QueryOptions & {
 };
 
 /**
- * 流式调用模型（OpenRouter `stream: true`），通过 onDelta 推送正文增量。
- * 联网失败时会与非流式逻辑一致：重试无 `openrouter:web_search` 或整段回退到 queryModel。
+ * 流式调用模型（Ofox `stream: true`），通过 onDelta 推送正文增量。
  */
 export async function queryModelStream(
   model: string,
@@ -437,19 +370,17 @@ export async function queryModelStream(
     signal,
   };
 
+  void webMaxResults;
   const effectiveModel = useWebSearch ? stripOnlineSuffix(model) : model;
   const payloadMessages = useWebSearch
     ? withWebSearchSystemInstruction(messages, webSearchTemporalContext)
     : messages;
-  const webTools = useWebSearch
-    ? webSearchToolsPayload(effectiveModel, webMaxResults)
-    : undefined;
 
   const request = createRequestSignal(timeoutMs, signal);
 
   const runStream = async (
     toSend: ChatMessage[],
-    tools: Array<Record<string, unknown>> | undefined,
+      tools: Array<Record<string, unknown>> | undefined,
   ): Promise<{ content: string; reasoning_details?: unknown } | null> => {
     let accumulated = "";
     const res = await doFetchStream(
@@ -478,43 +409,20 @@ export async function queryModelStream(
 
   try {
     throwIfAborted(signal);
-    if (useWebSearch) {
-      try {
-        const acc = await runStream(payloadMessages, webTools);
-        if (acc !== null) return acc;
-      } catch (e) {
-        console.warn(
-          `[OpenRouter] Web search stream threw for ${effectiveModel}:`,
-          e,
-        );
-      }
-      console.warn(
-        `[OpenRouter] Web search stream failed for ${effectiveModel}; retrying without web search tool.`,
-      );
-      try {
-        const acc = await runStream(messages, undefined);
-        if (acc !== null) return { ...acc, webSearchSkipped: true };
-      } catch (e) {
-        console.error(
-          `[OpenRouter] Stream without web search failed for ${effectiveModel}:`,
-          e,
-        );
-      }
-      const fb = await queryModel(model, messages, restQuery);
-      if (fb?.content) {
-        onDelta(fb.content);
-        return fb;
-      }
-      return null;
-    }
-
     try {
-      const acc = await runStream(messages, undefined);
-      if (acc !== null) return acc;
+      const acc = await runStream(payloadMessages, undefined);
+      if (acc !== null) {
+        return useWebSearch ? { ...acc, webSearchSkipped: true } : acc;
+      }
     } catch (e) {
-      console.error(`[OpenRouter] Stream failed for ${effectiveModel}:`, e);
+      console.error(`[Ofox] Stream failed for ${effectiveModel}:`, e);
     }
-    const fb = await queryModel(model, messages, restQuery);
+    const fb = await queryModel(model, payloadMessages, {
+      ...restQuery,
+      useWebSearch: false,
+      webSearchTemporalContext: undefined,
+      webMaxResults: undefined,
+    });
     if (fb?.content) {
       onDelta(fb.content);
       return fb;
@@ -532,11 +440,28 @@ export async function queryModelStream(
 export async function queryModelsParallel(
   models: string[],
   messages: ChatMessage[],
-  options: QueryOptions = {},
+  options: QueryOptions & {
+    onProgress?: (event: QueryModelsParallelProgress) => void;
+  } = {},
 ): Promise<Map<string, Awaited<ReturnType<typeof queryModel>>>> {
+  const { onProgress, ...queryOptions } = options;
+  let completed = 0;
   const entries = await Promise.all(
     models.map(async (model) => {
-      const r = await queryModel(model, messages, options);
+      onProgress?.({
+        model,
+        status: "start",
+        current: completed,
+        total: models.length,
+      });
+      const r = await queryModel(model, messages, queryOptions);
+      completed += 1;
+      onProgress?.({
+        model,
+        status: r == null ? "error" : "complete",
+        current: completed,
+        total: models.length,
+      });
       return [model, r] as const;
     }),
   );

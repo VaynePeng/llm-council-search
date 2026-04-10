@@ -4,7 +4,6 @@ import {
   CHAIRMAN_OUTPUT_RESERVE_TOKENS,
   FOLLOWUP_MODEL,
   TITLE_MODEL,
-  WEB_FETCH_MODEL,
   WEB_SEARCH_ROUTER_MODEL,
   resolveChairmanContextLimit,
 } from "./config.js";
@@ -15,8 +14,10 @@ import {
   queryModelsParallel,
   type ChatMessage,
   type QueryOptions,
+  type QueryModelsParallelProgress,
   type UrlCitationItem,
-} from "./openrouter.js";
+} from "./ofox.js";
+import { tavilySearch } from "./tavily.js";
 import type {
   Message,
   Stage1Item,
@@ -24,6 +25,7 @@ import type {
   Stage3Result,
   WebFetchResult,
   WebFetchSource,
+  WebSearchTask,
 } from "./storage.js";
 
 function appendStructuredCitations(
@@ -61,12 +63,12 @@ export type CouncilRunOptions = {
   webSearchMode?: WebSearchMode;
   /** Override Stage1/Stage2 judge models */
   councilModels?: string[];
-  /** Override `WEB_FETCH_MODEL` for the web research stage */
-  webFetchModel?: string;
   /** Weight of each judge model's vote in Stage2 aggregate (default 1) */
   judgeWeights?: Record<string, number>;
   /** 由前端传入的用户 API Key */
   apiKey?: string;
+  /** 由前端传入的用户 Tavily Key */
+  tavilyApiKey?: string;
   signal?: AbortSignal;
   historyMessages?: Message[];
   webSearchPlan?: WebSearchPlan;
@@ -81,6 +83,19 @@ export type WebSearchPlan = {
   reason: string;
   previousWebFetch?: WebFetchResult;
 };
+
+export type StreamProgress = {
+  phase: "web_plan" | "web_fetch" | "stage1" | "stage2" | "stage3" | "followup";
+  message: string;
+  current?: number;
+  total?: number;
+  model?: string;
+  query?: string;
+  searchTasks?: WebSearchTask[];
+  analysisOnly?: string[];
+};
+
+type ProgressCallback = (event: StreamProgress) => void;
 
 type WebSearchPlanAction = WebSearchPlan["action"];
 
@@ -476,9 +491,20 @@ export async function decideWebSearchPlan(
   requestedMode: WebSearchMode,
   apiKey?: string,
   signal?: AbortSignal,
+  onProgress?: ProgressCallback,
 ): Promise<WebSearchPlan> {
   if (requestedMode !== "auto") {
-    return decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+    const plan = decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+    onProgress?.({
+      phase: "web_plan",
+      message:
+        plan.action === "search"
+          ? "已根据设置直接执行联网检索。"
+          : plan.action === "reuse"
+            ? "已根据设置直接复用上轮联网检索。"
+            : "已根据设置关闭联网检索。",
+    });
+    return plan;
   }
 
   const previous = latestWebFetch(messages);
@@ -508,6 +534,10 @@ export async function decideWebSearchPlan(
   ].join("\n");
 
   try {
+    onProgress?.({
+      phase: "web_plan",
+      message: "主席模型正在判断本轮是否需要联网，以及是否复用上轮检索。",
+    });
     const response = await queryModel(
       WEB_SEARCH_ROUTER_MODEL,
       [{ role: "user", content: routerPrompt }],
@@ -523,6 +553,15 @@ export async function decideWebSearchPlan(
       typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
 
     if (action && reason) {
+      onProgress?.({
+        phase: "web_plan",
+        message:
+          action === "search"
+            ? "已决定执行新的联网检索。"
+            : action === "reuse"
+              ? "已决定复用上一轮联网检索结果。"
+              : "已决定跳过联网检索。",
+      });
       return {
         requestedMode,
         action,
@@ -536,130 +575,303 @@ export async function decideWebSearchPlan(
     console.warn("[web-search-router] model decision failed, fallback to rules:", err);
   }
 
-  return decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+  const fallback = decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+  onProgress?.({
+    phase: "web_plan",
+    message:
+      fallback.action === "search"
+        ? "联网决策模型不可用，已按规则回退为重新检索。"
+        : fallback.action === "reuse"
+          ? "联网决策模型不可用，已按规则回退为复用上轮结果。"
+          : "联网决策模型不可用，已按规则回退为跳过联网。",
+  });
+  return fallback;
 }
 
 function queryOpts(useWebSearch?: boolean, apiKey?: string): QueryOptions {
-  return { useWebSearch: Boolean(useWebSearch), apiKey };
+  void useWebSearch;
+  return { apiKey };
+}
+
+function normalizeSearchTasks(raw: unknown): WebSearchTask[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const rec = item as { query?: unknown; why?: unknown };
+      const query = typeof rec.query === "string" ? rec.query.trim() : "";
+      const why = typeof rec.why === "string" ? rec.why.trim() : "";
+      if (!query) return null;
+      return { query, why: why || "用于核验问题中的外部事实。" };
+    })
+    .filter((item): item is WebSearchTask => Boolean(item))
+    .slice(0, 5);
+}
+
+type TavilyCollectedSource = WebFetchSource & {
+  query: string;
+  publishedDate?: string;
+};
+
+function dedupeTavilySources(
+  sources: TavilyCollectedSource[],
+  filterUntrustedSources: boolean,
+): WebFetchSource[] {
+  const seen = new Set<string>();
+  const unique = sources.filter((source) => {
+    const key = source.url.trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return enrichAndSortSources(unique, filterUntrustedSources);
 }
 
 export async function stageWebFetch(
   userQuery: string,
-  modelOverride?: string,
+  chairmanModelOverride?: string,
   apiKey?: string,
+  tavilyApiKey?: string,
   signal?: AbortSignal,
   plan?: WebSearchPlan,
   filterUntrustedSources = false,
+  onProgress?: ProgressCallback,
 ): Promise<WebFetchResult> {
-  const model = modelOverride?.trim() || WEB_FETCH_MODEL;
+  const model = chairmanModelOverride?.trim() || CHAIRMAN_MODEL;
   const t = getWebSearchTemporalContext();
-  const system = `You are a web retrieval worker with access to a web search tool. Your job is to decide what must be searched on the web, retrieve fresh and checkable facts for only that part, and return a neutral retrieval dossier.
+  const planningPrompt = [
+    "你负责规划联网检索，但不能亲自搜索。",
+    `当前检索时间锚点（UTC）：${t.isoUtc}；Unix ${t.unixSeconds}。`,
+    "请先分析用户问题，把真正需要外部检索核验的部分拆成少量搜索任务。",
+    "不要回答原问题，不要给结论，不要输出 markdown。",
+    "只输出 JSON，格式如下：",
+    '{"search_tasks":[{"query":"搜索词","why":"为什么查"}],"analysis_only":["无需联网的分析项"]}',
+    "要求：",
+    "- search_tasks 最多 5 个，尽量覆盖必须核验的事实点。",
+    "- 对于时效性问题，把时间锚点写进 query。",
+    "- 如果问题几乎都不需要联网，允许 search_tasks 为空。",
+    "",
+    "用户问题：",
+    userQuery,
+  ].join("\n");
 
-Temporal anchor: the search is executed at **${t.isoUtc}** (ISO 8601, UTC), Unix **${t.unixSeconds}** s. Do not assume the end user's local timezone. Interpret "recent", "latest", "currently" relative to this UTC instant; prefer sources with visible, plausible publication or update times; flag content that appears years out of date for time-sensitive topics.
+  onProgress?.({
+    phase: "web_fetch",
+    message: "主席模型正在拆解需要联网核验的事实点。",
+    model,
+  });
+  const planningResponse = await queryModel(
+    model,
+    [{ role: "user", content: planningPrompt }],
+    { timeoutMs: 45_000, apiKey, signal },
+  );
 
-Rules:
-- First analyze the user request privately and split it into:
-  1. parts that require fresh external facts or source verification;
-  2. parts that are analysis, explanation, comparison, summarization, drafting, or other reasoning that do not require web access.
-- Search only for category (1). Do not spend search budget on category (2).
-- Do not answer the user's full question. Do not provide recommendations, final conclusions, prioritization, or subjective judgments beyond minimal source description.
-- Do not output your private planning or chain-of-thought. Only output the retrieval dossier.
-- Use the search tool; do not invent URLs, quotes, or publication dates.
-- Every important claim should be traceable to a real page/domain you saw in search results or API citations.
-- Source notes must stay descriptive, not prescriptive. It is acceptable to mark a source as official documentation, regulator page, company blog, press report, forum post, archived page, or undated page.
-- Prefer official docs, regulators, primary-source announcements, and well-edited reporting. Treat forum posts, comment threads, social posts, and unverified aggregators as weak evidence.
-- If a source is obviously a forum/community/comment page, explicitly say it is low-confidence material and avoid relying on it unless necessary.
-- ${filterUntrustedSources ? "The caller has enabled unreliable-source filtering. Do not rely on forums, comment threads, social posts, or low-trust aggregators except to mention that they were excluded." : "You may mention lower-confidence sources only as secondary context and you must label them clearly as weak evidence."}
-- If results conflict, report the conflict neutrally and cite both sides. Do not decide the winner for later models.
-- Match the user's language: if the question is in Chinese, write in Simplified Chinese; otherwise mirror the question's language.
-- Use Markdown. Use real markdown links [site or title](full_url) in 参考来源 where you have URLs.
+  const planningJson = parseFirstJsonObject(planningResponse?.content ?? "");
+  const searchTasks = normalizeSearchTasks(planningJson?.search_tasks);
+  const analysisOnly = Array.isArray(planningJson?.analysis_only)
+    ? planningJson.analysis_only
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
 
-${WEB_SOURCE_DISCIPLINE}`;
-
-  const userPrompt = `## 检索基准时间（本次请求发起时刻，仅 UTC，不推断用户本地时区）
-- **ISO 8601（UTC）**：${t.isoUtc}
-- **Unix 时间戳（秒）**：${t.unixSeconds}
-
-在此 UTC 时刻下检索与作答：涉及时效、版本、政策、安全公告、股价等议题时，**优先**采纳可核对日期且与上述时刻接近的资料；对明显过时、无日期或仅历史档案价值的页面降低权重并在文中说明。如需面向读者表述当地时间，仅可在文中根据来源页面自行说明，勿臆测用户时区。
-
----
-
-Question:
-${userQuery}
-
-Produce this structure (adapt heading language to the user's language, e.g. 简体中文 for Chinese questions):
-
-## 联网检索范围
-- 列出你判断“需要联网”的事实点、最新信息、需要核验的外部说法。
-- 列出你判断“无需联网、留给后续模型处理”的内容类型，例如分析、解释、对比、总结、建议、写作。
-- 这一节只做任务拆分，不给最终答案。
-
-## 检索摘要
-1–3 sentences: what you searched for in the web-required part only, and what material you found (or that little relevant material exists). Mention if results skew old relative to the retrieval time above.
-
-## 来源清单
-For each significant source you rely on, give: 来源名称、域名/URL、来源类型（官方/媒体/社区/文档/论坛/聚合页等）、可见日期（若有）、一句客观说明。不要打分，不要排优先级，不要给采信建议。
-
-## 检索到的事实
-Bullet list: concrete externally sourced facts only. Each bullet should be traceable to one or more sources, and when you mention a sourced fact you must include both the source name and the exact URL. Keep wording factual and compact. No recommendations, no final synthesis, no answer framing.
-
-## 冲突与缺口
-- List conflicts between sources, if any.
-- List important missing facts, ambiguous dates, or items that still need verification.
-- Keep this descriptive only.
-
-## 参考来源
-Numbered list with **Markdown links** [title or domain](https://...) for every URL you cite. If the API gave structured citations, align with them. If no usable URLs, state that clearly.`;
-
-  const messages: ChatMessage[] = [
-    { role: "system", content: system },
-    { role: "user", content: userPrompt },
-  ];
-  const response = await queryModel(model, messages, {
-    useWebSearch: true,
-    webMaxResults: 10,
-    timeoutMs: 180_000,
-    webSearchTemporalContext: t,
-    apiKey,
-    signal,
+  onProgress?.({
+    phase: "web_fetch",
+    message:
+      searchTasks.length > 0
+        ? `websearch 已产出 ${searchTasks.length} 个需要搜索的指标。`
+        : "websearch 未产出可执行搜索指标。",
+    model,
+    searchTasks,
+    analysisOnly,
   });
 
-  if (!response) {
+  if (searchTasks.length === 0) {
+    onProgress?.({
+      phase: "web_fetch",
+      message: "主席模型判断本轮没有必须交给 Tavily 的检索任务。",
+      model,
+    });
     return {
       model,
-      content: "(Web fetch failed)",
+      content: [
+        "## 联网检索范围",
+        "- 主席模型判断当前问题没有明确必须联网核验的事实点，或现有问题主要是分析/解释任务。",
+        ...(analysisOnly.length
+          ? analysisOnly.map((item) => `- 留给后续模型处理：${item}`)
+          : ["- 留给后续模型处理：分析、解释、比较、总结与结论生成。"]),
+        "",
+        "## 检索摘要",
+        "本轮未实际调用 Tavily，因为主席模型未生成有效搜索任务。",
+        "",
+        "## 参考来源",
+        "无",
+      ].join("\n"),
       webSearchMode: plan?.requestedMode,
       webSearchAction: plan?.action ?? "search",
       webSearchReason: plan?.reason,
+      webSearchVerified: false,
+      webSearchWarning: "主席模型未生成可执行的 Tavily 搜索任务，本轮没有结构化联网来源。",
+      retrievedAt: t.isoUtc,
+      retrievedAtUnixSeconds: t.unixSeconds,
+      searchTasks,
+      analysisOnly,
     };
   }
 
-  const citations = response.citations ?? [];
-  const content =
-    citations.length > 0
-      ? appendStructuredCitations(response.content ?? "", citations)
-      : (response.content ?? "");
+  onProgress?.({
+    phase: "web_fetch",
+    message: `已生成 ${searchTasks.length} 个 Tavily 检索任务，开始抓取公开网页。`,
+    current: 0,
+    total: searchTasks.length,
+    model,
+  });
 
-  const sources: WebFetchSource[] | undefined =
-    citations.length > 0
-      ? enrichAndSortSources(
-          citations.map((c) => ({
-          url: c.url,
-          title: c.title,
-          snippet: c.content,
-          })),
-          filterUntrustedSources,
-        )
-      : undefined;
+  let finishedSearches = 0;
+  const tavilyRuns = await Promise.all(
+    searchTasks.map(async (task) => {
+      onProgress?.({
+        phase: "web_fetch",
+        message: `Tavily 检索：${task.query}`,
+        current: finishedSearches,
+        total: searchTasks.length,
+        query: task.query,
+      });
+      const results = await tavilySearch(task.query, {
+        apiKey: tavilyApiKey ?? "",
+        maxResults: 5,
+        signal,
+      });
+      finishedSearches += 1;
+      onProgress?.({
+        phase: "web_fetch",
+        message: `Tavily 已完成 ${finishedSearches}/${searchTasks.length} 个检索任务。`,
+        current: finishedSearches,
+        total: searchTasks.length,
+        query: task.query,
+      });
+      return { task, results };
+    }),
+  );
 
-  const credibilityBlock = sources?.length
-      ? formatCredibilityForPrompt(sources)
-      : "";
+  const flattenedSources = tavilyRuns.flatMap(({ task, results }) =>
+    results.map((item) => ({
+      url: item.url,
+      title: item.title,
+      snippet: item.content,
+      query: task.query,
+      publishedDate: item.published_date,
+      referenceWeight: item.score != null ? Math.round(item.score * 10) / 10 : undefined,
+    })),
+  );
+  const sources = dedupeTavilySources(flattenedSources, filterUntrustedSources);
+  const credibilityBlock = sources.length ? formatCredibilityForPrompt(sources) : "";
 
-  const verified = Boolean(sources?.length);
-  const warning = verified
-    ? undefined
-    : "OpenRouter 本次未返回可核验的结构化 url_citation；以下正文仅为模型生成的检索摘要，不能作为已验证来源，也不会传给后续阶段。";
+  const rawResultsBlock = tavilyRuns
+    .map(({ task, results }, index) => {
+      const lines = results.length
+        ? results.map((item, itemIndex) =>
+            [
+              `${itemIndex + 1}. 标题: ${item.title ?? item.url}`,
+              `   URL: ${item.url}`,
+              `   可见日期: ${item.published_date ?? "未标明"}`,
+              `   摘要: ${clipText(item.content ?? "", 500) || "无"}`,
+            ].join("\n"),
+          )
+        : ["(无结果)"];
+      return [
+        `### 搜索任务 ${index + 1}`,
+        `- 查询: ${task.query}`,
+        `- 目的: ${task.why}`,
+        ...lines,
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  const synthesisPrompt = [
+    "你是主席模型。你已经完成了“问题分析”，现在只基于 Tavily 返回的结果整理一份中立的联网检索 dossier。",
+    "注意：真正的搜索已经由 Tavily 完成，你不能声称自己又搜索到了别的页面，也不能捏造来源。",
+    `检索时间锚点（UTC）：${t.isoUtc}；Unix ${t.unixSeconds}。`,
+    "输出要求：",
+    "- 不回答用户的最终问题。",
+    "- 只整理需要联网的部分、来源、已检索到的事实、冲突与缺口。",
+    "- 每个外部事实都要带来源名称和精确 URL。",
+    `- ${filterUntrustedSources ? "低可信论坛/社区来源已由调用方过滤，必要时只说明被过滤。" : "若使用社区/论坛来源，必须明确标成低可信。"} `,
+    "- 使用简体中文，使用 Markdown。",
+    "",
+    "输出结构：",
+    "## 联网检索范围",
+    "## 检索摘要",
+    "## 来源清单",
+    "## 检索到的事实",
+    "## 冲突与缺口",
+    "## 参考来源",
+    "",
+    "无需联网、留给后续模型处理的项目：",
+    ...(analysisOnly.length ? analysisOnly.map((item) => `- ${item}`) : ["- 分析、解释、总结、比较与最终结论。"]),
+    "",
+    "Tavily 搜索任务与结果：",
+    rawResultsBlock,
+    "",
+    WEB_SOURCE_DISCIPLINE,
+  ].join("\n");
+
+  onProgress?.({
+    phase: "web_fetch",
+    message: "主席模型正在整理 Tavily 返回结果，生成联网 dossier。",
+    model,
+  });
+  let synthesisResponse: Awaited<ReturnType<typeof queryModel>> | null = null;
+  let synthesisFallbackWarning: string | undefined;
+  try {
+    synthesisResponse = await queryModel(
+      model,
+      [{ role: "user", content: synthesisPrompt }],
+      { timeoutMs: 90_000, apiKey, signal },
+    );
+  } catch (err) {
+    if ((err as { name?: string })?.name === "AbortError" && signal?.aborted) {
+      throw err;
+    }
+    synthesisFallbackWarning = "主席模型整理 Tavily 结果失败，已回退为原始检索摘要。";
+    onProgress?.({
+      phase: "web_fetch",
+      message: "主席模型整理检索结果失败，已回退为原始检索摘要。",
+      model,
+    });
+  }
+
+  const fallbackContent = [
+    "## 联网检索范围",
+    ...(analysisOnly.length
+      ? analysisOnly.map((item) => `- 留给后续模型处理：${item}`)
+      : ["- 留给后续模型处理：分析、解释、比较、总结与结论生成。"]),
+    "",
+    "## 检索摘要",
+    "主席模型未成功整理 dossier，以下保留 Tavily 原始检索摘要。",
+    "",
+    rawResultsBlock,
+    "",
+    "## 来源清单",
+    ...(sources.length
+      ? sources.map((source, index) => `${index + 1}. [${source.title?.trim() || source.url}](${source.url})`)
+      : ["无"]),
+    "",
+    "## 冲突与缺口",
+    "- 需要由后续模型基于以上结果继续归纳、交叉核验与作答。",
+    "",
+    "## 参考来源",
+    ...(sources.length
+      ? sources.map((source) => `- [${source.title?.trim() || source.url}](${source.url})`)
+      : ["无"]),
+  ].join("\n");
+
+  const content = synthesisResponse?.content?.trim() || fallbackContent;
+  const verified = Boolean(sources.length);
+  const warning = synthesisFallbackWarning
+    ?? (verified
+      ? undefined
+      : "Tavily 本次未返回可排序的结构化来源，本轮仅保留检索摘要，不向后续阶段传递联网证据。");
 
   return {
     model,
@@ -669,10 +881,12 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
     webSearchReason: plan?.reason,
     webSearchVerified: verified,
     ...(warning ? { webSearchWarning: warning } : {}),
-    webSearchSkipped: response.webSearchSkipped,
+    webSearchSkipped: false,
     retrievedAt: t.isoUtc,
     retrievedAtUnixSeconds: t.unixSeconds,
-    ...(sources ? { sources } : {}),
+    searchTasks,
+    analysisOnly,
+    ...(sources.length ? { sources } : {}),
   };
 }
 
@@ -686,6 +900,7 @@ export async function stage1CollectResponses(
   apiKey?: string,
   signal?: AbortSignal,
   councilModels: string[] = COUNCIL_MODELS,
+  onProgress?: ProgressCallback,
 ): Promise<Stage1Item[]> {
   let userContent = userQuery;
   if (webContext) {
@@ -731,7 +946,23 @@ ${userQuery}`;
 
   const messages: ChatMessage[] = [{ role: "user", content: userContent }];
   const opts = webContext ? { apiKey, signal } : { ...queryOpts(useWebSearch, apiKey), signal };
-  const responses = await queryModelsParallel(councilModels, messages, opts);
+  const responses = await queryModelsParallel(councilModels, messages, {
+    ...opts,
+    onProgress: (event: QueryModelsParallelProgress) => {
+      onProgress?.({
+        phase: "stage1",
+        message:
+          event.status === "start"
+            ? `Stage 1：正在请求 ${event.model}`
+            : event.status === "complete"
+              ? `Stage 1：已收到 ${event.model}（${event.current}/${event.total}）`
+              : `Stage 1：${event.model} 请求失败（${event.current}/${event.total}）`,
+        current: event.current,
+        total: event.total,
+        model: event.model,
+      });
+    },
+  });
 
   const stage1: Stage1Item[] = [];
   for (const [model, response] of responses) {
@@ -765,6 +996,7 @@ export async function stage2CollectRankings(
   apiKey?: string,
   signal?: AbortSignal,
   councilModels: string[] = COUNCIL_MODELS,
+  onProgress?: ProgressCallback,
 ): Promise<[Stage2Item[], Record<string, string>]> {
   const successfulStage1 = successfulStage1Items(stage1Results);
   const labels = successfulStage1.map((_, i) => String.fromCharCode(65 + i));
@@ -818,7 +1050,24 @@ Now provide your evaluation and ranking:`;
   const responses = await queryModelsParallel(
     councilModels,
     messages,
-    { ...queryOpts(useWebSearch, apiKey), signal },
+    {
+      ...queryOpts(useWebSearch, apiKey),
+      signal,
+      onProgress: (event: QueryModelsParallelProgress) => {
+        onProgress?.({
+          phase: "stage2",
+          message:
+            event.status === "start"
+              ? `Stage 2：正在请求 ${event.model} 进行评审排序`
+              : event.status === "complete"
+                ? `Stage 2：已收到 ${event.model} 的排序（${event.current}/${event.total}）`
+                : `Stage 2：${event.model} 评审失败（${event.current}/${event.total}）`,
+          current: event.current,
+          total: event.total,
+          model: event.model,
+        });
+      },
+    },
   );
 
   const stage2: Stage2Item[] = [];
@@ -1092,7 +1341,7 @@ export async function stage3SynthesizeFinal(
   };
 }
 
-/** Stage3 流式合成：通过 onDelta 推送 OpenRouter 返回的正文增量（供 SSE 转发）。 */
+/** Stage3 流式合成：通过 onDelta 推送 Ofox 返回的正文增量（供 SSE 转发）。 */
 export async function stage3SynthesizeFinalStream(
   userQuery: string,
   stage1Results: Stage1Item[],
@@ -1350,8 +1599,8 @@ export async function runFullCouncil(
     webSearchMode,
     councilModels = COUNCIL_MODELS,
     judgeWeights,
-    webFetchModel,
     apiKey,
+    tavilyApiKey,
     signal,
     historyMessages = [],
     webSearchPlan,
@@ -1385,8 +1634,9 @@ export async function runFullCouncil(
   } else if (plan.action === "search") {
     webFetchResult = await stageWebFetch(
       effectiveQuery,
-      webFetchModel,
+      chairmanModel,
       apiKey,
+      tavilyApiKey,
       signal,
       plan,
       filterUntrustedSources,

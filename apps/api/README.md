@@ -1,6 +1,6 @@
 # Vela 助手 · 后端（`@llm-council-search/api`）
 
-[Hono](https://hono.dev/) + TypeScript 实现的 API 服务：OpenRouter 三阶段议会、会话 JSON 存储、SSE 流式端点、分阶段重跑、联网（`web` 插件）与失败降级等。
+[Hono](https://hono.dev/) + TypeScript 实现的 API 服务：Ofox 三阶段议会、Tavily 联网检索、会话 JSON 存储、SSE 流式端点、分阶段重跑等。
 
 **完整说明、免责声明、仓库链接**见 monorepo 根目录 [**`../../README.md`**](../../README.md)。
 
@@ -32,7 +32,8 @@ pnpm start    # node dist/index.js（需先 build）
 
 | 变量 | 说明 |
 |------|------|
-| `OPENROUTER_API_KEY` | 必填 |
+| `OFOX_API_URL` | 可选，默认 `https://api.ofox.ai/v1/chat/completions` |
+| `TAVILY_API_URL` | 可选，默认 `https://api.tavily.com/search` |
 | `PORT` | 默认 `8001` |
 | `CHAIRMAN_MODEL` / `TITLE_MODEL` | 可选 |
 | `DATA_DIR` | 可选，会话目录；默认 `apps/api/data/conversations` |
@@ -41,7 +42,8 @@ pnpm start    # node dist/index.js（需先 build）
 
 - `src/index.ts` — 路由与 SSE
 - `src/council.ts` — Stage1/2/3 与聚合
-- `src/openrouter.ts` — 模型请求与联网重试
+- `src/ofox.ts` — Ofox 模型请求
+- `src/tavily.ts` — Tavily 搜索封装
 - `src/storage.ts` — 会话读写
 - `src/config.ts` — 配置（含 dotenv 加载）
 - `src/lock.ts` — 会话文件锁
