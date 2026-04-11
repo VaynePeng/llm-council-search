@@ -1,6 +1,7 @@
 node_modules
 .git
 .next
+apps/web/.next
 apps/*/dist
 apps/api/data
 .env

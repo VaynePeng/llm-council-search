@@ -80,7 +80,7 @@ ENV HOSTNAME=0.0.0.0
 ENV PORT=8001
 ENV DATA_DIR=/app/data
 ENV ALLOWED_ORIGINS=http://localhost:3000
-ENV NEXT_PUBLIC_API_URL=
+ENV NEXT_PUBLIC_API_URL=http://localhost:8001
 ENV API_PROXY_TARGET=http://127.0.0.1:8001
 
 RUN corepack enable
@@ -104,5 +104,6 @@ COPY docker/start.sh ./docker/start.sh
 RUN chmod +x ./docker/start.sh && mkdir -p /app/data
 
 EXPOSE 3000
+EXPOSE 8001
 
 CMD ["./docker/start.sh"]

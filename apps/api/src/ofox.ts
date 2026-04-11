@@ -85,6 +85,28 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortError();
 }
 
+function isConnectionResetError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  const cause = (e as { cause?: unknown }).cause;
+  if (cause instanceof Error && (cause as { code?: string }).code === "ECONNRESET") return true;
+  return (e as { code?: string }).code === "ECONNRESET";
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (isConnectionResetError(e)) {
+      // 连接池里的旧连接被服务端/代理重置，重试一次
+      return fetch(url, init);
+    }
+    throw e;
+  }
+}
+
 function createRequestSignal(
   timeoutMs: number,
   externalSignal?: AbortSignal,
@@ -165,7 +187,7 @@ async function doFetch(
     Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
-  return fetch(OFOX_API_URL, {
+  return fetchWithRetry(OFOX_API_URL, {
     method: "POST",
     headers,
     body: JSON.stringify(chatRequestBody(model, messages, tools, false)),
@@ -185,7 +207,7 @@ async function doFetchStream(
     Authorization: `Bearer ${resolveApiKey(apiKey)}`,
   };
 
-  return fetch(OFOX_API_URL, {
+  return fetchWithRetry(OFOX_API_URL, {
     method: "POST",
     headers,
     body: JSON.stringify(chatRequestBody(model, messages, tools, true)),
@@ -326,7 +348,8 @@ export async function queryModel(
         }
       : null;
   } catch (e) {
-    if ((e as { name?: string })?.name === "AbortError") throw e;
+    // 只在外部信号取消时才 re-throw，内部超时产生的 AbortError 视为模型失败
+    if ((e as { name?: string })?.name === "AbortError" && signal?.aborted) throw e;
     console.error(`Error querying model ${model}:`, e);
     return null;
   } finally {
@@ -429,7 +452,7 @@ export async function queryModelStream(
     }
     return null;
   } catch (e) {
-    if ((e as { name?: string })?.name === "AbortError") throw e;
+    if ((e as { name?: string })?.name === "AbortError" && signal?.aborted) throw e;
     console.error(`Error streaming model ${model}:`, e);
     return null;
   } finally {

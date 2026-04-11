@@ -2479,13 +2479,33 @@ function ProgressNotice({ progress }: { progress?: StreamProgress | null }) {
     progress.total != null
       ? `${Math.min(progress.current ?? 0, progress.total)}/${progress.total}`
       : null;
+  const phaseLabel =
+    progress.phase === "web_plan"
+      ? "联网决策"
+      : progress.phase === "web_fetch"
+        ? "Web 抓取"
+        : progress.phase === "stage1"
+          ? "Stage 1"
+          : progress.phase === "stage2"
+            ? "Stage 2"
+            : progress.phase === "stage3"
+              ? "Stage 3"
+              : "继续对话";
   return (
     <div className="mb-3 rounded-md border border-status-running-border/40 bg-status-running/10 px-3 py-2 text-xs text-status-running-foreground">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <Loader2 className="size-3.5 animate-spin" aria-hidden />
+        <span className="rounded-full border border-status-running-border/40 bg-background/70 px-1.5 py-0.5 text-[10px] font-medium tracking-[0.02em]">
+          {phaseLabel}
+        </span>
         <span>{progress.message}</span>
         {counter ? <span className="font-mono opacity-80">{counter}</span> : null}
       </div>
+      {progress.model ? (
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          当前模型：<span className="font-mono">{progress.model}</span>
+        </div>
+      ) : null}
       {progress.phase === "web_fetch" && progress.searchTasks?.length ? (
         <div className="mt-2 rounded-md border border-status-running-border/30 bg-background/60 px-2 py-2 text-[11px] text-foreground">
           <div className="font-medium">本轮需要搜索的指标</div>
@@ -2596,6 +2616,8 @@ function CouncilAssistantCard({
 
   const stepperStage2Done = !isFollowup && s2done && !busyStage2;
   const stepperStage3Done = s3done && !busyStage2 && !busyStage3;
+  const stage2Unlocked = s1done || effectiveLoading.stage2 || s2done || effectiveLoading.stage3 || s3done;
+  const stage3Unlocked = s2done || effectiveLoading.stage3 || s3done;
 
   const run = async (key: string, fn: () => Promise<void>) => {
     resetErrorState();
@@ -2624,21 +2646,30 @@ function CouncilAssistantCard({
       return;
     }
     if (!showWebFetch && stageTab === "web") {
-      setStageTab("1");
+      setStageTab(isFollowup ? "3" : "1");
       return;
     }
     if (stageTab === "1" && showWebFetch && !webFetchDone) {
       setStageTab("web");
       return;
     }
-    if (!isFollowup && stageTab === "3" && !s2done) {
-      setStageTab(s1done ? "2" : "1");
+    if (!isFollowup && stageTab === "3" && !stage3Unlocked) {
+      setStageTab(stage2Unlocked ? "2" : "1");
       return;
     }
-    if (!isFollowup && stageTab === "2" && !s1done) {
+    if (!isFollowup && stageTab === "2" && !stage2Unlocked) {
       setStageTab("1");
     }
-  }, [effectiveLoading.webFetch, isFollowup, pending, showWebFetch, stageTab, s1done, s2done, webFetchDone]);
+  }, [
+    effectiveLoading.webFetch,
+    isFollowup,
+    pending,
+    stage2Unlocked,
+    stage3Unlocked,
+    showWebFetch,
+    stageTab,
+    webFetchDone,
+  ]);
 
   return (
     <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
@@ -2693,10 +2724,10 @@ function CouncilAssistantCard({
               strokeWidth={2}
               aria-hidden
             />
-            <span>正在分析问题并判断是否需要联网检索…</span>
+            <span>正在启动本轮处理…</span>
           </div>
           <div className="text-xs text-muted-foreground">
-            已开始处理，本条回答会在收到阶段事件后立即切换到对应视图。
+            收到首个阶段事件后，这里会立即切换到对应视图。
           </div>
           <Skeleton className="h-9 w-full rounded-lg bg-status-running/35" />
           <Skeleton className="h-24 w-full rounded-lg bg-status-running/35" />
@@ -2715,8 +2746,8 @@ function CouncilAssistantCard({
           ) : (
             <>
               <TabsTrigger value="1" disabled={showWebFetch && !webFetchDone}>Stage 1</TabsTrigger>
-              <TabsTrigger value="2" disabled={!s1done}>Stage 2</TabsTrigger>
-              <TabsTrigger value="3" disabled={!s2done}>Stage 3</TabsTrigger>
+              <TabsTrigger value="2" disabled={!stage2Unlocked}>Stage 2</TabsTrigger>
+              <TabsTrigger value="3" disabled={!stage3Unlocked}>Stage 3</TabsTrigger>
             </>
           )}
         </TabsList>
@@ -2804,6 +2835,7 @@ function CouncilAssistantCard({
               items={m.stage1}
               loading={loading.stage1}
               busyModel={busyStage1Model}
+              progress={m.progress}
             />
           </div>
           </TabsContent>
@@ -2849,6 +2881,7 @@ function CouncilAssistantCard({
               items={m.stage2}
               loading={effectiveLoading.stage2}
               meta={m.metadata}
+              progress={m.progress}
             />
           </div>
           </TabsContent>
@@ -3183,10 +3216,12 @@ function Stage1View({
   items,
   loading,
   busyModel,
+  progress,
 }: {
   items: Stage1Item[] | null;
   loading: boolean;
   busyModel?: string | null;
+  progress?: StreamProgress | null;
 }) {
   if (loading)
     return (
@@ -3194,6 +3229,20 @@ function Stage1View({
         className="flex flex-1 flex-col space-y-3 rounded-lg border border-status-running-border/40 bg-status-running/15 p-3"
         style={{ animation: "council-fade-in 0.3s ease-out both" }}
       >
+        <div className="flex flex-wrap items-center gap-2 text-xs text-status-running-foreground">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+          <span>{progress?.message ?? "Stage 1 正在并行请求模型…"}</span>
+          {progress?.total != null ? (
+            <span className="font-mono opacity-80">
+              {Math.min(progress.current ?? 0, progress.total)}/{progress.total}
+            </span>
+          ) : null}
+        </div>
+        {progress?.model ? (
+          <div className="text-[11px] text-muted-foreground">
+            当前模型：<span className="font-mono">{progress.model}</span>
+          </div>
+        ) : null}
         <Skeleton className="h-4 w-2/3 bg-status-running/35" />
         <Skeleton className="h-24 w-full bg-status-running/35" />
       </div>
@@ -3300,10 +3349,12 @@ function Stage2View({
   items,
   loading,
   meta,
+  progress,
 }: {
   items: Stage2Item[] | null;
   loading: boolean;
   meta: AssistantMsg["metadata"];
+  progress?: StreamProgress | null;
 }) {
   if (loading)
     return (
@@ -3311,6 +3362,20 @@ function Stage2View({
         className="flex flex-1 flex-col space-y-3 rounded-lg border border-status-running-border/40 bg-status-running/15 p-3"
         style={{ animation: "council-fade-in 0.3s ease-out both" }}
       >
+        <div className="flex flex-wrap items-center gap-2 text-xs text-status-running-foreground">
+          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+          <span>{progress?.message ?? "Stage 2 正在生成评审排序…"}</span>
+          {progress?.total != null ? (
+            <span className="font-mono opacity-80">
+              {Math.min(progress.current ?? 0, progress.total)}/{progress.total}
+            </span>
+          ) : null}
+        </div>
+        {progress?.model ? (
+          <div className="text-[11px] text-muted-foreground">
+            当前模型：<span className="font-mono">{progress.model}</span>
+          </div>
+        ) : null}
         <Skeleton className="h-4 w-1/2 bg-status-running/35" />
         <Skeleton className="h-32 w-full bg-status-running/35" />
       </div>

@@ -59,6 +59,7 @@ docker compose up -d --build
 启动后：
 
 - **Web**：<http://localhost:3000>
+- **API**：<http://localhost:8001>
 
 停止：
 
@@ -74,10 +75,11 @@ docker compose down -v
 
 说明：
 
-- 容器内同时运行 Web 与 API，对外只需要暴露 `3000`。
+- 容器内同时运行 Web 与 API。
+- Docker 默认同时暴露 `3000` 与 `8001`；前端在浏览器里会直连 `8001` 的 API，这样流式阶段事件不会经过 Next rewrite，避免 SSE 被代理缓存后卡在首屏占位态。
 - Ofox API Key 与 Tavily API Key 都由用户在网页端输入，服务端不再依赖 `.env` 中的密钥。
 - Docker 默认把会话数据持久化到命名卷 `api_data`，容器重建后仍保留。
-- 前端通过同容器内代理转发 `/api/*` 到本地 Hono 服务，所以用户不需要再单独暴露 `8001`。
+- 保留了 Next 的 `/api/*` 代理能力，主要用于开发或自定义部署；Docker 默认路径不再依赖这层代理。
 
 如果你要发布成单镜像，用户启动命令可以简化为：
 
@@ -85,6 +87,7 @@ docker compose down -v
 docker run -d \
   --name llm-council-search \
   -p 3000:3000 \
+  -p 8001:8001 \
   -v llm-council-search-data:/app/data \
   <your-image>:latest
 ```

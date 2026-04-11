@@ -737,11 +737,17 @@ export async function stageWebFetch(
         total: searchTasks.length,
         query: task.query,
       });
-      const results = await tavilySearch(task.query, {
-        apiKey: tavilyApiKey ?? "",
-        maxResults: 5,
-        signal,
-      });
+      let results: Awaited<ReturnType<typeof tavilySearch>> = [];
+      try {
+        results = await tavilySearch(task.query, {
+          apiKey: tavilyApiKey ?? "",
+          maxResults: 5,
+          signal,
+        });
+      } catch (e) {
+        if ((e as { name?: string })?.name === "AbortError") throw e;
+        console.error(`Tavily search failed for query "${task.query}":`, e);
+      }
       finishedSearches += 1;
       onProgress?.({
         phase: "web_fetch",

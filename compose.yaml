@@ -4,7 +4,7 @@ services:
       context: .
       target: app
       args:
-        NEXT_PUBLIC_API_URL: ""
+        NEXT_PUBLIC_API_URL: "http://localhost:8001"
     environment:
       PORT: 8001
       DATA_DIR: /app/data
@@ -12,6 +12,7 @@ services:
       API_PROXY_TARGET: http://127.0.0.1:8001
     ports:
       - "3000:3000"
+      - "8001:8001"
     volumes:
       - api_data:/app/data
 

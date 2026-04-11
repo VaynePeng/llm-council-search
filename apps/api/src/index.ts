@@ -194,6 +194,16 @@ function isAbortError(err: unknown): boolean {
   return (err as { name?: string })?.name === "AbortError";
 }
 
+/** Node.js fetch 网络失败时 e.message 只是 "fetch failed"，真正原因在 e.cause。 */
+function formatStreamError(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const cause = (e as { cause?: unknown }).cause;
+  if (cause instanceof Error && e.message === "fetch failed") {
+    return `fetch failed: ${cause.message}`;
+  }
+  return e.message;
+}
+
 app.post("/api/conversations/:id/message", async (c) => {
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
@@ -711,11 +721,7 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         if (isAbortError(e) && requestSignal.aborted) return;
         push({
           type: "error",
-          message: isAbortError(e)
-            ? "上游请求超时或被中止。"
-            : e instanceof Error
-              ? e.message
-              : String(e),
+          message: isAbortError(e) ? "上游请求超时或被中止。" : formatStreamError(e),
         });
       } finally {
         controller.close();
@@ -1374,11 +1380,7 @@ app.post("/api/message/stateless/stream", async (c) => {
         if (isAbortError(e) && requestSignal.aborted) return;
         push({
           type: "error",
-          message: isAbortError(e)
-            ? "上游请求超时或被中止。"
-            : e instanceof Error
-              ? e.message
-              : String(e),
+          message: isAbortError(e) ? "上游请求超时或被中止。" : formatStreamError(e),
         });
       } finally {
         controller.close();
