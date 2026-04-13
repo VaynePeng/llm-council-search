@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { logger } from "hono/logger";
 import {
   ALLOWED_ORIGINS,
   API_PORT,
@@ -52,6 +53,8 @@ import {
 
 const app = new Hono();
 const allowedOrigins = new Set(ALLOWED_ORIGINS);
+
+app.use("*", logger());
 
 app.use(
   "*",

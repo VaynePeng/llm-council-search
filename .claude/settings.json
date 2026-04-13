@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "input=$(cat); model=$(echo \"$input\" | jq -r '.model.display_name // \"unknown\"'); five_pct=$(echo \"$input\" | jq -r '.rate_limits.five_hour.used_percentage // empty'); five_reset=$(echo \"$input\" | jq -r '.rate_limits.five_hour.resets_at // empty'); week_pct=$(echo \"$input\" | jq -r '.rate_limits.seven_day.used_percentage // empty'); week_reset=$(echo \"$input\" | jq -r '.rate_limits.seven_day.resets_at // empty'); out=\"$model\"; if [ -n \"$five_pct\" ]; then five_reset_str=$([ -n \"$five_reset\" ] && date -d \"@$five_reset\" \"+%H:%M\" 2>/dev/null || echo \"?\"); out=\"$out | 5h: $(printf '%.0f' \"$five_pct\")% (resets $five_reset_str)\"; fi; if [ -n \"$week_pct\" ]; then week_reset_str=$([ -n \"$week_reset\" ] && date -d \"@$week_reset\" \"+%m/%d %H:%M\" 2>/dev/null || echo \"?\"); out=\"$out | 7d: $(printf '%.0f' \"$week_pct\")% (resets $week_reset_str)\"; fi; echo \"$out\""
+  }
+}

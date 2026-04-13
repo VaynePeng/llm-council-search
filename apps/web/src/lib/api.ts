@@ -1,5 +1,17 @@
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+  process.env.NEXT_PUBLIC_API_URL ?? "";
+
+export function generateUUID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback for non-secure contexts (plain HTTP)
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 const API_KEY_STORAGE = "llm-council-search-ofox-key";
 const TAVILY_KEY_STORAGE = "llm-council-search-tavily-key";
@@ -398,7 +410,7 @@ export function getLocalConversation(id: string): Conversation | null {
 
 export function createLocalConversation(): Conversation {
   const conv: StoredConversation = {
-    id: crypto.randomUUID(),
+    id: generateUUID(),
     created_at: new Date().toISOString(),
     title: "New Conversation",
     messages: [],

@@ -3,8 +3,6 @@ services:
     build:
       context: .
       target: app
-      args:
-        NEXT_PUBLIC_API_URL: "http://localhost:8001"
     environment:
       PORT: 8001
       DATA_DIR: /app/data

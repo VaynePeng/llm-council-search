@@ -74,6 +74,7 @@ import {
   setStoredApiKey,
   setStoredTavilyKey,
   updateLocalConversationTitle,
+  generateUUID,
   type ApiConfig,
   type Conversation,
   type ConversationMeta,
@@ -514,7 +515,7 @@ function usePinnedBottomAutoscroll(
 function streamingAssistantShell({
   pending = false,
   responseMode = "council",
-  assistantMessageId = crypto.randomUUID(),
+  assistantMessageId = generateUUID(),
   stage3Model,
   stage3Loading = false,
 }: {
@@ -1332,7 +1333,7 @@ export default function CouncilApp() {
                 const assistantMsg = {
                   role: "assistant" as const,
                   schemaVersion: 2,
-                  assistantMessageId: crypto.randomUUID(),
+                  assistantMessageId: generateUUID(),
                   responseMode:
                     localCollected.responseMode ??
                     (isFollowup ? "followup" : "council"),

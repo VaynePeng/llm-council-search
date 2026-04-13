@@ -80,7 +80,6 @@ ENV HOSTNAME=0.0.0.0
 ENV PORT=8001
 ENV DATA_DIR=/app/data
 ENV ALLOWED_ORIGINS=http://localhost:3000
-ENV NEXT_PUBLIC_API_URL=http://localhost:8001
 ENV API_PROXY_TARGET=http://127.0.0.1:8001
 
 RUN corepack enable
