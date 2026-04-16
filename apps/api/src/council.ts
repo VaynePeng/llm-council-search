@@ -17,6 +17,7 @@ import {
   type QueryOptions,
   type UrlCitationItem,
 } from "./openrouter.js";
+import { logInfo, logStep, logWarn, summarizeError, summarizeText } from "./logging.js";
 import type {
   Message,
   Stage1Item,
@@ -57,7 +58,6 @@ export function hasVerifiedWebFetchSources(
 
 export type CouncilRunOptions = {
   chairmanModel?: string;
-  useWebSearch?: boolean;
   webSearchMode?: WebSearchMode;
   /** Override Stage1/Stage2 judge models */
   councilModels?: string[];
@@ -80,6 +80,12 @@ export type WebSearchPlan = {
   action: "skip" | "search" | "reuse";
   reason: string;
   previousWebFetch?: WebFetchResult;
+};
+
+export type WebFetchScopePreview = {
+  plannedSearchTopics: string[];
+  deferredTopics: string[];
+  scopeSummary?: string;
 };
 
 type WebSearchPlanAction = WebSearchPlan["action"];
@@ -446,6 +452,62 @@ function parseFirstJsonObject(text: string): Record<string, unknown> | null {
   }
 }
 
+function parseStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+export async function describeWebFetchScope(
+  userQuery: string,
+  apiKey?: string,
+  signal?: AbortSignal,
+): Promise<WebFetchScopePreview | undefined> {
+  const prompt = [
+    "你要把当前问题拆成两类：",
+    "1. 本轮需要联网搜索核实的内容",
+    "2. 留给后续模型处理的内容（分析、判断、总结、建议、写作、对比等）",
+    "",
+    "要求：",
+    "- 只输出 JSON，不要输出 markdown，不要解释。",
+    '- JSON 格式：{"plannedSearchTopics":["..."],"deferredTopics":["..."],"scopeSummary":"..."}',
+    "- 每个数组 1-6 项，短句即可。",
+    "- 如果某类没有内容，返回空数组。",
+    "- scopeSummary 用一句中文概括本轮抓取的重点；不要写最终答案。",
+    "",
+    "当前问题：",
+    userQuery,
+  ].join("\n");
+
+  try {
+    const response = await queryModel(
+      WEB_SEARCH_ROUTER_MODEL,
+      [{ role: "user", content: prompt }],
+      { timeoutMs: 10_000, apiKey, signal },
+    );
+    const parsed = parseFirstJsonObject(response?.content ?? "");
+    const plannedSearchTopics = parseStringArray(parsed?.plannedSearchTopics);
+    const deferredTopics = parseStringArray(parsed?.deferredTopics);
+    const scopeSummary =
+      typeof parsed?.scopeSummary === "string" && parsed.scopeSummary.trim()
+        ? parsed.scopeSummary.trim()
+        : undefined;
+    if (plannedSearchTopics.length === 0 && deferredTopics.length === 0 && !scopeSummary) {
+      return undefined;
+    }
+    return { plannedSearchTopics, deferredTopics, ...(scopeSummary ? { scopeSummary } : {}) };
+  } catch (err) {
+    if ((err as { name?: string })?.name === "AbortError" && signal?.aborted) throw err;
+    logWarn("council.web_fetch_scope.failed", {
+      userQueryPreview: summarizeText(userQuery, 120),
+      error: summarizeError(err),
+    });
+    return undefined;
+  }
+}
+
 function latestWebFetchSummary(webFetch?: WebFetchResult): string {
   if (!webFetch) return "无";
   const summary = clipText(webFetch.content, 900);
@@ -477,8 +539,21 @@ export async function decideWebSearchPlan(
   apiKey?: string,
   signal?: AbortSignal,
 ): Promise<WebSearchPlan> {
+  const startedAt = Date.now();
+  logInfo("council.web_search_plan.start", {
+    requestedMode,
+    historyCount: messages.length,
+    userQueryPreview: summarizeText(userQuery, 120),
+  });
   if (requestedMode !== "auto") {
-    return decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+    const plan = decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+    logInfo("council.web_search_plan.done", {
+      requestedMode,
+      action: plan.action,
+      reason: plan.reason,
+      durationMs: Date.now() - startedAt,
+    });
+    return plan;
   }
 
   const previous = latestWebFetch(messages);
@@ -523,24 +598,39 @@ export async function decideWebSearchPlan(
       typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
 
     if (action && reason) {
-      return {
+      const plan = {
         requestedMode,
         action,
         reason,
         ...(action === "reuse" && previous ? { previousWebFetch: previous } : {}),
       };
+      logInfo("council.web_search_plan.done", {
+        requestedMode,
+        action: plan.action,
+        reason: plan.reason,
+        durationMs: Date.now() - startedAt,
+      });
+      return plan;
     }
   } catch (err) {
     // 只有外部 signal 主动取消时才向上抛；本地超时触发的 AbortError 应 fallback 到规则
     if ((err as { name?: string })?.name === "AbortError" && signal?.aborted) throw err;
-    console.warn("[web-search-router] model decision failed, fallback to rules:", err);
+    logWarn("council.web_search_plan.router_failed", {
+      requestedMode,
+      durationMs: Date.now() - startedAt,
+      error: summarizeError(err),
+    });
   }
 
-  return decideWebSearchPlanByRules(userQuery, messages, requestedMode);
-}
-
-function queryOpts(useWebSearch?: boolean, apiKey?: string): QueryOptions {
-  return { useWebSearch: Boolean(useWebSearch), apiKey };
+  const plan = decideWebSearchPlanByRules(userQuery, messages, requestedMode);
+  logInfo("council.web_search_plan.done", {
+    requestedMode,
+    action: plan.action,
+    reason: plan.reason,
+    durationMs: Date.now() - startedAt,
+    fallbackToRules: true,
+  });
+  return plan;
 }
 
 export async function stageWebFetch(
@@ -550,6 +640,7 @@ export async function stageWebFetch(
   signal?: AbortSignal,
   plan?: WebSearchPlan,
   filterUntrustedSources = false,
+  scopePreview?: WebFetchScopePreview,
 ): Promise<WebFetchResult> {
   const model = modelOverride?.trim() || WEB_FETCH_MODEL;
   const t = getWebSearchTemporalContext();
@@ -615,19 +706,31 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
     { role: "system", content: system },
     { role: "user", content: userPrompt },
   ];
-  const response = await queryModel(model, messages, {
-    useWebSearch: true,
-    webMaxResults: 10,
-    timeoutMs: 180_000,
-    webSearchTemporalContext: t,
-    apiKey,
-    signal,
-  });
+  const response = await logStep("council.stage_web_fetch", {
+    model,
+    requestedMode: plan?.requestedMode,
+    action: plan?.action ?? "search",
+    filterUntrustedSources,
+    userQueryPreview: summarizeText(userQuery, 120),
+  }, async () =>
+    queryModel(model, messages, {
+      useWebSearch: true,
+      webMaxResults: 10,
+      timeoutMs: 180_000,
+      webSearchTemporalContext: t,
+      apiKey,
+      signal,
+    }),
+  );
 
   if (!response) {
+    logWarn("council.stage_web_fetch.empty_response", { model });
     return {
       model,
       content: "(Web fetch failed)",
+      plannedSearchTopics: scopePreview?.plannedSearchTopics,
+      deferredTopics: scopePreview?.deferredTopics,
+      scopeSummary: scopePreview?.scopeSummary,
       webSearchMode: plan?.requestedMode,
       webSearchAction: plan?.action ?? "search",
       webSearchReason: plan?.reason,
@@ -661,9 +764,19 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
     ? undefined
     : "OpenRouter 本次未返回可核验的结构化 url_citation；以下正文仅为模型生成的检索摘要，不能作为已验证来源，也不会传给后续阶段。";
 
+  logInfo("council.stage_web_fetch.result", {
+    model,
+    verified,
+    sourceCount: sources?.length ?? 0,
+    webSearchSkipped: response.webSearchSkipped ?? false,
+  });
+
   return {
     model,
     content: `${content}${credibilityBlock ? `\n\n---\n${credibilityBlock}` : ""}`,
+    plannedSearchTopics: scopePreview?.plannedSearchTopics,
+    deferredTopics: scopePreview?.deferredTopics,
+    scopeSummary: scopePreview?.scopeSummary,
     webSearchMode: plan?.requestedMode,
     webSearchAction: plan?.action ?? "search",
     webSearchReason: plan?.reason,
@@ -678,15 +791,11 @@ Numbered list with **Markdown links** [title or domain](https://...) for every U
 
 export type WebRetrievalMeta = { isoUtc: string; unixSeconds: number };
 
-export async function stage1CollectResponses(
+export function buildStage1UserPrompt(
   userQuery: string,
-  useWebSearch?: boolean,
   webContext?: string,
   webRetrievalMeta?: WebRetrievalMeta,
-  apiKey?: string,
-  signal?: AbortSignal,
-  councilModels: string[] = COUNCIL_MODELS,
-): Promise<Stage1Item[]> {
+): string {
   let userContent = userQuery;
   if (webContext) {
     const clock =
@@ -729,9 +838,35 @@ Question:
 ${userQuery}`;
   }
 
+  return userContent;
+}
+
+export async function stage1CollectResponses(
+  userQuery: string,
+  webContext?: string,
+  webRetrievalMeta?: WebRetrievalMeta,
+  apiKey?: string,
+  signal?: AbortSignal,
+  councilModels: string[] = COUNCIL_MODELS,
+): Promise<Stage1Item[]> {
+  const startedAt = Date.now();
+  const userContent = buildStage1UserPrompt(
+    userQuery,
+    webContext,
+    webRetrievalMeta,
+  );
+
   const messages: ChatMessage[] = [{ role: "user", content: userContent }];
-  const opts = webContext ? { apiKey, signal } : { ...queryOpts(useWebSearch, apiKey), signal };
-  const responses = await queryModelsParallel(councilModels, messages, opts);
+  logInfo("council.stage1.start", {
+    councilModels,
+    modelCount: councilModels.length,
+    hasWebContext: Boolean(webContext),
+    userQueryPreview: summarizeText(userQuery, 120),
+  });
+  const responses = await queryModelsParallel(councilModels, messages, {
+    apiKey,
+    signal,
+  });
 
   const stage1: Stage1Item[] = [];
   for (const [model, response] of responses) {
@@ -751,6 +886,12 @@ ${userQuery}`;
       error: "This model failed to respond. Please retry this model.",
     });
   }
+  logInfo("council.stage1.done", {
+    modelCount: councilModels.length,
+    successCount: stage1.filter((item) => !item.failed).length,
+    failureCount: stage1.filter((item) => item.failed).length,
+    durationMs: Date.now() - startedAt,
+  });
   return stage1;
 }
 
@@ -761,11 +902,11 @@ export function successfulStage1Items(stage1Results: Stage1Item[]): Stage1Item[]
 export async function stage2CollectRankings(
   userQuery: string,
   stage1Results: Stage1Item[],
-  useWebSearch?: boolean,
   apiKey?: string,
   signal?: AbortSignal,
   councilModels: string[] = COUNCIL_MODELS,
 ): Promise<[Stage2Item[], Record<string, string>]> {
+  const startedAt = Date.now();
   const successfulStage1 = successfulStage1Items(stage1Results);
   const labels = successfulStage1.map((_, i) => String.fromCharCode(65 + i));
 
@@ -815,10 +956,16 @@ FINAL RANKING:
 Now provide your evaluation and ranking:`;
 
   const messages: ChatMessage[] = [{ role: "user", content: rankingPrompt }];
+  logInfo("council.stage2.start", {
+    councilModels,
+    modelCount: councilModels.length,
+    successfulStage1Count: successfulStage1.length,
+    userQueryPreview: summarizeText(userQuery, 120),
+  });
   const responses = await queryModelsParallel(
     councilModels,
     messages,
-    { ...queryOpts(useWebSearch, apiKey), signal },
+    { apiKey, signal },
   );
 
   const stage2: Stage2Item[] = [];
@@ -832,6 +979,12 @@ Now provide your evaluation and ranking:`;
       });
     }
   }
+
+  logInfo("council.stage2.done", {
+    responseCount: stage2.length,
+    labelCount: Object.keys(labelToModel).length,
+    durationMs: Date.now() - startedAt,
+  });
 
   return [stage2, labelToModel];
 }
@@ -1055,7 +1208,6 @@ export async function stage3SynthesizeFinal(
   stage1Results: Stage1Item[],
   stage2Results: Stage2Item[],
   chairmanModel?: string,
-  useWebSearch?: boolean,
   judgeWeights?: Record<string, number>,
   labelToModel?: Record<string, string>,
   apiKey?: string,
@@ -1074,10 +1226,16 @@ export async function stage3SynthesizeFinal(
   );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
-  const response = await queryModel(chair, messages, {
-    ...queryOpts(useWebSearch, apiKey),
-    signal,
-  });
+  const response = await logStep("council.stage3", {
+    chair,
+    stage1Count: stage1Results.length,
+    stage2Count: stage2Results.length,
+  }, async () =>
+    queryModel(chair, messages, {
+      apiKey,
+      signal,
+    }),
+  );
 
   if (response == null) {
     return {
@@ -1098,7 +1256,6 @@ export async function stage3SynthesizeFinalStream(
   stage1Results: Stage1Item[],
   stage2Results: Stage2Item[],
   chairmanModel: string | undefined,
-  useWebSearch: boolean | undefined,
   judgeWeights: Record<string, number> | undefined,
   labelToModel: Record<string, string> | undefined,
   onDelta: (chunk: string) => void,
@@ -1118,11 +1275,17 @@ export async function stage3SynthesizeFinalStream(
   );
 
   const messages: ChatMessage[] = [{ role: "user", content: chairmanPrompt }];
-  const response = await queryModelStream(chair, messages, {
-    ...queryOpts(useWebSearch, apiKey),
-    onDelta,
-    signal,
-  });
+  const response = await logStep("council.stage3_stream", {
+    chair,
+    stage1Count: stage1Results.length,
+    stage2Count: stage2Results.length,
+  }, async () =>
+    queryModelStream(chair, messages, {
+      apiKey,
+      onDelta,
+      signal,
+    }),
+  );
 
   if (response == null) {
     return {
@@ -1195,10 +1358,17 @@ export async function synthesizeFollowUpAnswer(
   webContext?: string,
 ): Promise<Stage3Result> {
   const model = followupModel?.trim() || FOLLOWUP_MODEL;
-  const response = await queryModel(
+  const response = await logStep("council.followup", {
     model,
-    buildFollowUpMessages(userQuery, historyMessages, webContext),
-    { apiKey, signal },
+    historyCount: historyMessages.length,
+    hasWebContext: Boolean(webContext),
+    userQueryPreview: summarizeText(userQuery, 120),
+  }, async () =>
+    queryModel(
+      model,
+      buildFollowUpMessages(userQuery, historyMessages, webContext),
+      { apiKey, signal },
+    ),
   );
 
   return {
@@ -1218,10 +1388,17 @@ export async function synthesizeFollowUpAnswerStream(
   webContext?: string,
 ): Promise<Stage3Result> {
   const model = followupModel?.trim() || FOLLOWUP_MODEL;
-  const response = await queryModelStream(
+  const response = await logStep("council.followup_stream", {
     model,
-    buildFollowUpMessages(userQuery, historyMessages, webContext),
-    { apiKey, signal, onDelta },
+    historyCount: historyMessages.length,
+    hasWebContext: Boolean(webContext),
+    userQueryPreview: summarizeText(userQuery, 120),
+  }, async () =>
+    queryModelStream(
+      model,
+      buildFollowUpMessages(userQuery, historyMessages, webContext),
+      { apiKey, signal, onDelta },
+    ),
   );
 
   return {
@@ -1307,11 +1484,16 @@ Question: ${userQuery}
 Title:`;
 
   const messages: ChatMessage[] = [{ role: "user", content: titlePrompt }];
-  const response = await queryModel(TITLE_MODEL, messages, {
-    timeoutMs: 30_000,
-    apiKey,
-    signal,
-  });
+  const response = await logStep("council.title", {
+    model: TITLE_MODEL,
+    userQueryPreview: summarizeText(userQuery, 120),
+  }, async () =>
+    queryModel(TITLE_MODEL, messages, {
+      timeoutMs: 30_000,
+      apiKey,
+      signal,
+    }),
+  );
 
   if (response == null) return "New Conversation";
 
@@ -1344,9 +1526,9 @@ export async function runFullCouncil(
   { label_to_model: Record<string, string>; aggregate_rankings: AggregateRanking[] },
   WebFetchResult | undefined,
 ]> {
+  const startedAt = Date.now();
   const {
     chairmanModel,
-    useWebSearch,
     webSearchMode,
     councilModels = COUNCIL_MODELS,
     judgeWeights,
@@ -1357,6 +1539,13 @@ export async function runFullCouncil(
     webSearchPlan,
     filterUntrustedSources = false,
   } = options;
+  logInfo("council.run_full.start", {
+    chairmanModel: chairmanModel?.trim() || CHAIRMAN_MODEL,
+    councilModels,
+    webSearchMode,
+    historyCount: historyMessages.length,
+    userQueryPreview: summarizeText(userQuery, 120),
+  });
 
   const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
   const plan =
@@ -1364,7 +1553,7 @@ export async function runFullCouncil(
     (await decideWebSearchPlan(
       userQuery,
       historyMessages,
-      webSearchMode ?? (useWebSearch ? "on" : "off"),
+      webSearchMode ?? "off",
       apiKey,
       signal,
     ));
@@ -1398,7 +1587,6 @@ export async function runFullCouncil(
 
   const stage1Results = await stage1CollectResponses(
     effectiveQuery,
-    plan.action === "search",
     webContext,
     webFetchResult?.retrievedAt != null
       ? {
@@ -1426,7 +1614,6 @@ export async function runFullCouncil(
   const [stage2Results, labelToModel] = await stage2CollectRankings(
     effectiveQuery,
     stage1Results,
-    plan.action === "search",
     apiKey,
     signal,
     councilModels,
@@ -1446,12 +1633,11 @@ export async function runFullCouncil(
     webFetchResult?.sources,
   );
   const stage3Result = gate.proceed
-    ? await stage3SynthesizeFinal(
+      ? await stage3SynthesizeFinal(
         effectiveQuery,
         stage1Results,
         stage2Results,
         chairmanModel,
-        plan.action === "search",
         judgeWeights,
         labelToModel,
         apiKey,
@@ -1459,6 +1645,15 @@ export async function runFullCouncil(
         webFetchResult?.sources,
       )
     : gate.stage3;
+
+  logInfo("council.run_full.done", {
+    stage1Count: stage1Results.length,
+    stage1SuccessCount: successfulStage1Items(stage1Results).length,
+    stage2Count: stage2Results.length,
+    stage3Model: stage3Result.model,
+    webFetchSourceCount: webFetchResult?.sources?.length ?? 0,
+    durationMs: Date.now() - startedAt,
+  });
 
   return [
     stage1Results,

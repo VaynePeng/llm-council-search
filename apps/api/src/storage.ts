@@ -27,6 +27,9 @@ export type WebFetchSource = {
 export type WebFetchResult = {
   model: string;
   content: string;
+  plannedSearchTopics?: string[];
+  deferredTopics?: string[];
+  scopeSummary?: string;
   webSearchMode?: "off" | "auto" | "on";
   webSearchAction?: "skip" | "search" | "reuse";
   webSearchReason?: string;

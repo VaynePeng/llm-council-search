@@ -20,12 +20,13 @@ export const COUNCIL_MODELS: string[] = [
 ]
 
 /**
- * 适合搭配 OpenRouter `openrouter:web_search` 服务端工具 / `:online` 的模型（`auto` 原生或 Exa 等）。
+ * 适合用作“联网抓取阶段”的模型候选。实际联网通过
+ * `tools: [{ type: "openrouter:web_search" }]` 显式启用。
  * @see https://openrouter.ai/docs/guides/features/server-tools/web-search
  */
 export const WEB_SEARCH_MODELS: string[] = [
-  'openai/gpt-5.1:online',
-  'openai/gpt-4.1:online',
+  'openai/gpt-5.1',
+  'openai/gpt-4.1',
   'anthropic/claude-sonnet-4.5',
   'perplexity/sonar-pro',
   'x-ai/grok-4',
@@ -63,25 +64,25 @@ export function resolveChairmanContextLimit(modelId: string): number {
 
 export const TITLE_MODEL = process.env.TITLE_MODEL ?? 'google/gemini-2.5-flash'
 export const FOLLOWUP_MODEL =
-  process.env.FOLLOWUP_MODEL ?? 'qwen/qwen3.6-plus:free'
+  process.env.FOLLOWUP_MODEL ?? 'qwen/qwen3.6-plus'
 
 /** 用于 `auto` 联网判定的轻量路由模型；仅做 skip/search/reuse 决策。 */
 export const WEB_SEARCH_ROUTER_MODEL =
   process.env.WEB_SEARCH_ROUTER_MODEL ?? 'google/gemini-2.5-flash'
 
-/** 默认用 `:online` 模型名；实现上会去掉后缀并显式启用 `openrouter:web_search`。OpenAI 等走 `auto` 原生检索；Gemini 等在 openrouter.ts 中强制 `engine: "exa"`。 */
+/** 联网抓取阶段专用模型；通过 OpenRouter server tool 显式启用 web search。 */
 export const WEB_FETCH_MODEL =
-  process.env.WEB_FETCH_MODEL ?? 'openai/gpt-5.1:online'
+  process.env.WEB_FETCH_MODEL ?? 'openai/gpt-5.1'
 
 export const DATA_DIR = path.resolve(
   process.env.DATA_DIR ?? path.join(__dirname, '..', 'data', 'conversations')
 )
 
-export const API_PORT = Number(process.env.PORT ?? '8001')
+export const API_PORT = Number(process.env.PORT ?? '4001')
 
 export const ALLOWED_ORIGINS: string[] = (
   process.env.ALLOWED_ORIGINS ??
-  'http://localhost:3000,http://localhost:5173'
+  'http://localhost:4000,http://localhost:5173'
 )
   .split(',')
   .map((origin) => origin.trim())

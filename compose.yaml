@@ -2,18 +2,17 @@ services:
   app:
     build:
       context: .
+      dockerfile: Dockerfile
       target: app
-      args:
-        NEXT_PUBLIC_API_URL: ""
+    image: llm-council-search:latest
     environment:
-      PORT: 8001
+      PORT: "4001"
       DATA_DIR: /app/data
-      ALLOWED_ORIGINS: http://localhost:3000
-      API_PROXY_TARGET: http://127.0.0.1:8001
+      ALLOWED_ORIGINS: http://localhost:4000,http://127.0.0.1:4000
+      API_PROXY_TARGET: http://127.0.0.1:4001
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     ports:
-      - "3000:3000"
+      - "4000:4000"
     volumes:
-      - api_data:/app/data
-
-volumes:
-  api_data:
+      - ./docker-data:/app/data
+    restart: unless-stopped

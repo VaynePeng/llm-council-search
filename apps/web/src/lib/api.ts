@@ -1,5 +1,17 @@
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+  process.env.NEXT_PUBLIC_API_URL ?? "";
+
+export function generateUUID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback for non-secure contexts (plain HTTP)
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 const API_KEY_STORAGE = "llm-council-search-openrouter-key";
 
@@ -22,6 +34,17 @@ function authHeaders(): Record<string, string> {
   return key ? { "X-OpenRouter-Key": key } : {};
 }
 
+async function readErrorDetail(res: Response, fallback: string): Promise<string> {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const j = (await res.json().catch(() => ({}))) as { detail?: string; error?: { message?: string } };
+    return j.detail ?? j.error?.message ?? fallback;
+  }
+
+  const text = (await res.text().catch(() => "")).trim();
+  return text || fallback;
+}
+
 export type ConversationMeta = {
   id: string;
   created_at: string;
@@ -39,6 +62,7 @@ export type Conversation = {
 export type WebSearchMode = "off" | "auto" | "on";
 
 export type ApiConfig = {
+  available_model_ids?: string[];
   featured_model_groups?: Array<{
     key: string;
     label: string;
@@ -92,10 +116,16 @@ export async function deleteConversation(id: string): Promise<void> {
   if (!res.ok && res.status !== 204) throw new Error("Failed to delete");
 }
 
+export async function cancelStream(conversationId: string): Promise<void> {
+  await fetch(`${API_BASE}/api/conversations/${conversationId}/stream`, {
+    method: "DELETE",
+    headers: { ...authHeaders() },
+  }).catch(() => { /* best-effort */ });
+}
+
 export type SendOptions = {
   chairman_model?: string;
   followup_model?: string;
-  web_fetch_model?: string;
   council_models?: string[];
   use_web_search?: boolean;
   use_web_search_mode?: WebSearchMode;
@@ -118,7 +148,6 @@ export async function sendMessage(
         content,
         chairman_model: options?.chairman_model,
         followup_model: options?.followup_model,
-        web_fetch_model: options?.web_fetch_model,
         council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
@@ -128,7 +157,7 @@ export async function sendMessage(
       }),
     },
   );
-  if (!res.ok) throw new Error("Failed to send message");
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to send message"));
   return res.json();
 }
 
@@ -149,7 +178,6 @@ export async function sendMessageStream(
         content,
         chairman_model: options?.chairman_model,
         followup_model: options?.followup_model,
-        web_fetch_model: options?.web_fetch_model,
         council_models: options?.council_models,
         use_web_search: options?.use_web_search,
         use_web_search_mode: options?.use_web_search_mode,
@@ -160,7 +188,7 @@ export async function sendMessageStream(
     },
   );
 
-  if (!res.ok) throw new Error("Failed to send message");
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to send message"));
   const reader = res.body?.getReader();
   if (!reader) throw new Error("No response body");
 
@@ -361,7 +389,7 @@ export function getLocalConversation(id: string): Conversation | null {
 
 export function createLocalConversation(): Conversation {
   const conv: StoredConversation = {
-    id: crypto.randomUUID(),
+    id: generateUUID(),
     created_at: new Date().toISOString(),
     title: "New Conversation",
     messages: [],
@@ -414,7 +442,6 @@ export async function sendMessageStatelessStream(
       messages,
       chairman_model: options?.chairman_model,
       followup_model: options?.followup_model,
-      web_fetch_model: options?.web_fetch_model,
       council_models: options?.council_models,
       use_web_search: options?.use_web_search,
       use_web_search_mode: options?.use_web_search_mode,
@@ -424,7 +451,7 @@ export async function sendMessageStatelessStream(
     }),
   });
 
-  if (!res.ok) throw new Error("Failed to send message");
+  if (!res.ok) throw new Error(await readErrorDetail(res, "Failed to send message"));
   const reader = res.body?.getReader();
   if (!reader) throw new Error("No response body");
 

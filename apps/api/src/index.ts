@@ -15,9 +15,11 @@ import {
   resolveChairmanContextLimit,
 } from "./config.js";
 import {
+  buildStage1UserPrompt,
   calculateAggregateRankings,
   composeEffectiveUserQuery,
   decideWebSearchPlan,
+  describeWebFetchScope,
   gateChairmanStage3,
   generateConversationTitle,
   hasVerifiedWebFetchSources,
@@ -35,7 +37,15 @@ import {
 } from "./council.js";
 import { withConversationLock } from "./lock.js";
 import { queryModel } from "./openrouter.js";
-import { getFeaturedModelGroups } from "./openrouter-models.js";
+import { getOpenRouterModelCatalog } from "./openrouter-models.js";
+import {
+  logError,
+  logInfo,
+  logWarn,
+  summarizeError,
+  summarizeText,
+  withLogContext,
+} from "./logging.js";
 import {
   addAssistantMessage,
   addUserMessage,
@@ -51,8 +61,68 @@ import {
   type Stage3Result,
 } from "./storage.js";
 
-const app = new Hono();
+type AppEnv = {
+  Variables: {
+    requestId: string;
+    requestStartedAt: number;
+  };
+};
+
+const app = new Hono<AppEnv>();
 const allowedOrigins = new Set(ALLOWED_ORIGINS);
+
+/** 正在进行的流式任务控制器（conversationId → AbortController） */
+const taskControllers = new Map<string, AbortController>();
+
+function bodySummary(body: SendBody): Record<string, unknown> {
+  return {
+    contentPreview: summarizeText(body.content?.trim(), 120),
+    chairmanModel: parseChairman(body),
+    followupModel: parseFollowupModel(body),
+    webFetchModel: parseWebFetchModel(body),
+    councilModels: body.council_models,
+    useWebSearch: body.use_web_search,
+    webSearchMode: body.use_web_search_mode,
+    continueUseWebSearch: body.continue_use_web_search,
+    filterUntrustedSources: body.filter_untrusted_sources,
+    hasJudgeWeights: Boolean(parseJudgeWeights(body)),
+  };
+}
+
+function webFetchSummary(webFetch: Awaited<ReturnType<typeof stageWebFetch>> | undefined): Record<string, unknown> {
+  return {
+    hasWebFetch: Boolean(webFetch),
+    webFetchModel: webFetch?.model,
+    webFetchSourceCount: webFetch?.sources?.length ?? 0,
+    webSearchAction: webFetch?.webSearchAction,
+    webSearchSkipped: webFetch?.webSearchSkipped ?? false,
+    webSearchVerified: webFetch?.webSearchVerified ?? false,
+  };
+}
+
+function stage3Summary(stage3: Stage3Result): Record<string, unknown> {
+  return {
+    stage3Model: stage3.model,
+    stage3ResponsePreview: summarizeText(stage3.response, 160),
+  };
+}
+
+function logValidationFailure(
+  event: string,
+  detail: string,
+  data?: Record<string, unknown>,
+): void {
+  logWarn(event, {
+    detail,
+    ...(data ?? {}),
+  });
+}
+
+function logConversationMissing(id: string): void {
+  logValidationFailure("conversation.lookup.miss", "Conversation not found", {
+    conversationId: id,
+  });
+}
 
 app.use(
   "*",
@@ -67,18 +137,66 @@ app.use(
   }),
 );
 
+app.use("*", async (c, next) => {
+  const requestId = crypto.randomUUID().slice(0, 8);
+  const requestStartedAt = Date.now();
+  const url = new URL(c.req.url);
+  c.set("requestId", requestId);
+  c.set("requestStartedAt", requestStartedAt);
+
+  return withLogContext(
+    {
+      requestId,
+      route: `${c.req.method} ${url.pathname}`,
+    },
+    async () => {
+      logInfo("request.start", {
+        method: c.req.method,
+        path: url.pathname,
+        userAgent: c.req.header("user-agent"),
+      });
+      try {
+        await next();
+      } catch (error) {
+        logError("request.unhandled_error", {
+          durationMs: Date.now() - requestStartedAt,
+          error: summarizeError(error),
+        });
+        throw error;
+      } finally {
+        logInfo("request.finish", {
+          status: c.res.status,
+          durationMs: Date.now() - requestStartedAt,
+        });
+      }
+    },
+  );
+});
+
 app.get("/", (c) =>
   c.json({ status: "ok", service: "Vela 助手 API (Hono)" }),
 );
 
 app.get("/api/config", async (c) => {
-  let featured_model_groups: Awaited<ReturnType<typeof getFeaturedModelGroups>> = [];
+  logInfo("config.requested");
+  let featured_model_groups: Awaited<ReturnType<typeof getOpenRouterModelCatalog>>["featuredModelGroups"] = [];
+  let available_model_ids: string[] = [];
   try {
-    featured_model_groups = await getFeaturedModelGroups();
+    const catalog = await getOpenRouterModelCatalog();
+    featured_model_groups = catalog.featuredModelGroups;
+    available_model_ids = catalog.availableModelIds;
   } catch (err) {
-    console.error("[config] failed to load OpenRouter model catalog:", err);
+    logWarn("config.catalog_load_failed", {
+      error: summarizeError(err),
+    });
   }
 
+  logInfo("config.responding", {
+    councilModelCount: COUNCIL_MODELS.length,
+    webSearchModelCount: WEB_SEARCH_MODELS.length,
+    availableModelCount: available_model_ids.length,
+    featuredGroupCount: featured_model_groups.length,
+  });
   return c.json({
     council_models: COUNCIL_MODELS,
     web_search_models: WEB_SEARCH_MODELS,
@@ -88,32 +206,54 @@ app.get("/api/config", async (c) => {
     web_fetch_model: WEB_FETCH_MODEL,
     chairman_context_limits: chairmanContextLimitsForApi(),
     chairman_output_reserve_tokens: CHAIRMAN_OUTPUT_RESERVE_TOKENS,
+    available_model_ids,
     featured_model_groups,
   });
 });
 
 app.get("/api/conversations", async (c) => {
   const list = await listConversations();
+  logInfo("conversations.list.done", {
+    count: list.length,
+  });
   return c.json(list);
 });
 
 app.post("/api/conversations", async (c) => {
   const id = crypto.randomUUID();
   const conv = await createConversation(id);
+  logInfo("conversations.create.done", {
+    conversationId: id,
+    messageCount: conv.messages.length,
+  });
   return c.json(conv);
 });
 
 app.get("/api/conversations/:id", async (c) => {
   const id = c.req.param("id");
   const conv = await getConversation(id);
-  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+  if (!conv) {
+    logConversationMissing(id);
+    return c.json({ detail: "Conversation not found" }, 404);
+  }
+  logInfo("conversations.get.done", {
+    conversationId: id,
+    messageCount: conv.messages.length,
+    title: summarizeText(conv.title, 80),
+  });
   return c.json(conv);
 });
 
 app.delete("/api/conversations/:id", async (c) => {
   const id = c.req.param("id");
   const ok = await deleteConversation(id);
-  if (!ok) return c.json({ detail: "Conversation not found" }, 404);
+  if (!ok) {
+    logConversationMissing(id);
+    return c.json({ detail: "Conversation not found" }, 404);
+  }
+  logInfo("conversations.delete.done", {
+    conversationId: id,
+  });
   return c.body(null, 204);
 });
 
@@ -201,14 +341,38 @@ app.post("/api/conversations/:id/message", async (c) => {
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
-  if (!content) return c.json({ detail: "content required" }, 400);
+  if (!content) {
+    logValidationFailure("message.create.invalid_body", "content required", {
+      conversationId: id,
+    });
+    return c.json({ detail: "content required" }, 400);
+  }
   const councilModels = parseCouncilModels(body);
-  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+  if (councilModels.error) {
+    logValidationFailure("message.create.invalid_body", councilModels.error, {
+      conversationId: id,
+      ...bodySummary(body),
+    });
+    return c.json({ detail: councilModels.error }, 400);
+  }
   const apiKey = extractApiKey(c);
-  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  if (!apiKey) {
+    logValidationFailure("message.create.missing_api_key", MISSING_API_KEY_DETAIL, {
+      conversationId: id,
+    });
+    return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  }
+
+  logInfo("message.create.received", {
+    conversationId: id,
+    ...bodySummary(body),
+  });
 
   const conv = await getConversation(id);
-  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+  if (!conv) {
+    logConversationMissing(id);
+    return c.json({ detail: "Conversation not found" }, 404);
+  }
 
   const shouldGenerateTitle =
     conv.messages.length === 0 ||
@@ -222,8 +386,21 @@ app.post("/api/conversations/:id/message", async (c) => {
   );
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
 
+  logInfo("message.create.context_loaded", {
+    conversationId: id,
+    existingMessageCount: conv.messages.length,
+    shouldGenerateTitle,
+    isFollowup,
+    webSearchMode,
+    filterUntrustedSources,
+  });
+
   await withConversationLock(id, async () => {
     await addUserMessage(id, content);
+  });
+  logInfo("message.create.user_saved", {
+    conversationId: id,
+    contentPreview: summarizeText(content, 120),
   });
 
   if (shouldGenerateTitle) {
@@ -235,11 +412,20 @@ app.post("/api/conversations/:id/message", async (c) => {
     await withConversationLock(id, async () => {
       await updateConversationTitle(id, title);
     });
+    logInfo("message.create.title_saved", {
+      conversationId: id,
+      title: summarizeText(title, 80),
+    });
   }
 
   if (isFollowup) {
     const continueUseWebSearch = Boolean(body.continue_use_web_search);
     const effectiveQuery = composeEffectiveUserQuery(content, conv.messages);
+    logInfo("message.create.followup.start", {
+      conversationId: id,
+      continueUseWebSearch,
+      effectiveQueryPreview: summarizeText(effectiveQuery, 120),
+    });
     const webFetch = continueUseWebSearch
       ? await stageWebFetch(
           effectiveQuery,
@@ -254,6 +440,12 @@ app.post("/api/conversations/:id/message", async (c) => {
           filterUntrustedSources,
         )
       : undefined;
+    if (webFetch) {
+      logInfo("message.create.followup.web_fetch_done", {
+        conversationId: id,
+        ...webFetchSummary(webFetch),
+      });
+    }
     const stage3 = await synthesizeFollowUpAnswer(
       content,
       conv.messages,
@@ -262,6 +454,10 @@ app.post("/api/conversations/:id/message", async (c) => {
       c.req.raw.signal,
       webFetch?.content,
     );
+    logInfo("message.create.followup.answer_done", {
+      conversationId: id,
+      ...stage3Summary(stage3),
+    });
 
     await withConversationLock(id, async () => {
       await addAssistantMessage(
@@ -273,6 +469,9 @@ app.post("/api/conversations/:id/message", async (c) => {
         webFetch,
         "followup",
       );
+    });
+    logInfo("message.create.followup.saved", {
+      conversationId: id,
     });
 
     return c.json({
@@ -292,9 +491,14 @@ app.post("/api/conversations/:id/message", async (c) => {
     apiKey,
     c.req.raw.signal,
   );
+  logInfo("message.create.council.plan_done", {
+    conversationId: id,
+    requestedMode: webSearchMode,
+    action: webSearchPlan.action,
+    reason: webSearchPlan.reason,
+  });
   const [s1, s2, s3, meta, webFetch] = await runFullCouncil(content, {
     chairmanModel: parseChairman(body),
-    useWebSearch: webSearchPlan.action === "search",
     webSearchMode,
     councilModels: councilModels.models,
     webFetchModel: parseWebFetchModel(body),
@@ -304,6 +508,13 @@ app.post("/api/conversations/:id/message", async (c) => {
     historyMessages: conv.messages,
     webSearchPlan,
     filterUntrustedSources,
+  });
+  logInfo("message.create.council.completed", {
+    conversationId: id,
+    stage1Count: s1.length,
+    stage2Count: s2.length,
+    ...stage3Summary(s3),
+    ...webFetchSummary(webFetch),
   });
 
   await withConversationLock(id, async () => {
@@ -319,6 +530,9 @@ app.post("/api/conversations/:id/message", async (c) => {
       webFetch,
       "council",
     );
+  });
+  logInfo("message.create.council.saved", {
+    conversationId: id,
   });
 
   return c.json({
@@ -336,18 +550,52 @@ function sseLine(obj: unknown): Uint8Array {
   return new TextEncoder().encode(s);
 }
 
+function sseComment(text: string): Uint8Array {
+  return new TextEncoder().encode(`: ${text}\n\n`);
+}
+
+function ssePadding(size = 2048): Uint8Array {
+  return new TextEncoder().encode(`: ${" ".repeat(size)}\n\n`);
+}
+
+const SSE_HEARTBEAT_MS = 10_000;
+
 app.post("/api/conversations/:id/message/stream", async (c) => {
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => ({}))) as SendBody;
   const content = body.content?.trim();
-  if (!content) return c.json({ detail: "content required" }, 400);
+  if (!content) {
+    logValidationFailure("message.stream.invalid_body", "content required", {
+      conversationId: id,
+    });
+    return c.json({ detail: "content required" }, 400);
+  }
   const councilModels = parseCouncilModels(body);
-  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+  if (councilModels.error) {
+    logValidationFailure("message.stream.invalid_body", councilModels.error, {
+      conversationId: id,
+      ...bodySummary(body),
+    });
+    return c.json({ detail: councilModels.error }, 400);
+  }
   const apiKey = extractApiKey(c);
-  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  if (!apiKey) {
+    logValidationFailure("message.stream.missing_api_key", MISSING_API_KEY_DETAIL, {
+      conversationId: id,
+    });
+    return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  }
+
+  logInfo("message.stream.received", {
+    conversationId: id,
+    ...bodySummary(body),
+  });
 
   const conv = await getConversation(id);
-  if (!conv) return c.json({ detail: "Conversation not found" }, 404);
+  if (!conv) {
+    logConversationMissing(id);
+    return c.json({ detail: "Conversation not found" }, 404);
+  }
 
   const shouldGenerateTitle =
     conv.messages.length === 0 ||
@@ -366,12 +614,64 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
   const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
+  logInfo("message.stream.context_loaded", {
+    conversationId: id,
+    existingMessageCount: conv.messages.length,
+    shouldGenerateTitle,
+    isFollowup,
+    webSearchMode,
+    continueUseWebSearch,
+    filterUntrustedSources,
+    councilModelCount: effectiveCouncilModels.length,
+  });
+
+  // 任务级 AbortController：不随 HTTP 请求断开而终止，仅在显式取消时终止
+  const taskController = new AbortController();
+  taskControllers.set(id, taskController);
+  const taskSignal = taskController.signal;
+  logInfo("message.stream.task_registered", {
+    conversationId: id,
+  });
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const push = (obj: unknown) => controller.enqueue(sseLine(obj));
       const requestSignal = c.req.raw.signal;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+      // 客户端断连（刷新/导航）时关闭 SSE 流，但不中止后台任务
+      const onRequestAbort = () => {
+        logWarn("message.stream.client_disconnected", {
+          conversationId: id,
+        });
+        try { controller.close(); } catch { /* already closed */ }
+      };
+      requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+
+      // push 安全包装：客户端已断连时静默忽略
+      const push = (obj: unknown) => {
+        if (requestSignal.aborted) return;
+        try { controller.enqueue(sseLine(obj)); } catch { /* stream closed */ }
+      };
+
+      try {
+        controller.enqueue(ssePadding());
+        controller.enqueue(sseComment("stream-open"));
+        push({ type: "stream_open", data: { conversationId: id } });
+        heartbeat = setInterval(() => {
+          if (requestSignal.aborted) return;
+          try {
+            controller.enqueue(sseComment("keepalive"));
+          } catch {
+            /* stream closed */
+          }
+        }, SSE_HEARTBEAT_MS);
+      } catch {
+        /* stream closed before first flush */
+      }
+
+      // 仅在显式取消（Stop 按钮调用 cancel 接口）时中止
       const ensureNotAborted = () => {
-        if (requestSignal.aborted) {
+        if (taskSignal.aborted) {
           const err = new Error("Aborted");
           err.name = "AbortError";
           throw err;
@@ -384,9 +684,13 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         await withConversationLock(id, async () => {
           await addUserMessage(id, content);
         });
+        logInfo("message.stream.user_saved", {
+          conversationId: id,
+          contentPreview: summarizeText(content, 120),
+        });
 
         const titlePromise = shouldGenerateTitle
-          ? generateConversationTitle(content, apiKey, requestSignal)
+          ? generateConversationTitle(content, apiKey, taskSignal)
           : null;
 
         void (async () => {
@@ -397,36 +701,64 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             await withConversationLock(id, async () => {
               await updateConversationTitle(id, title);
             });
+            logInfo("message.stream.title_saved", {
+              conversationId: id,
+              title: summarizeText(title, 80),
+            });
             try {
               push({ type: "title_complete", data: { title } });
             } catch {
               /* 流可能已因错误提前关闭 */
             }
           } catch (err) {
-            console.error("generateConversationTitle:", err);
+            logWarn("message.stream.title_failed", {
+              conversationId: id,
+              error: summarizeError(err),
+            });
           }
         })();
 
         const effectiveQuery = composeEffectiveUserQuery(content, conv.messages);
+        logInfo("message.stream.query_composed", {
+          conversationId: id,
+          effectiveQueryPreview: summarizeText(effectiveQuery, 120),
+        });
         let webFetchResult: Awaited<ReturnType<typeof stageWebFetch>> | undefined;
         let webContext: string | undefined;
 
         if (isFollowup) {
+          logInfo("message.stream.followup.start", {
+            conversationId: id,
+            continueUseWebSearch,
+          });
           if (continueUseWebSearch) {
-            push({ type: "web_fetch_start" });
+            push({ type: "web_fetch_start", data: { model: webFetchModel?.trim() || WEB_FETCH_MODEL } });
+            const scopePreview = await describeWebFetchScope(
+              effectiveQuery,
+              apiKey,
+              taskSignal,
+            );
+            if (scopePreview) {
+              push({ type: "web_fetch_scope", data: scopePreview });
+            }
             webFetchResult = await stageWebFetch(
               effectiveQuery,
               webFetchModel,
               apiKey,
-              requestSignal,
+              taskSignal,
               {
                 requestedMode: "on",
                 action: "search",
                 reason: "继续对话已开启联网搜索。",
               },
               filterUntrustedSources,
+              scopePreview,
             );
             push({ type: "web_fetch_complete", data: webFetchResult });
+            logInfo("message.stream.followup.web_fetch_done", {
+              conversationId: id,
+              ...webFetchSummary(webFetchResult),
+            });
             if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
               webContext = webFetchResult.content;
             }
@@ -439,10 +771,14 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             followupModel,
             (delta) => push({ type: "followup_delta", data: { delta } }),
             apiKey,
-            requestSignal,
+            taskSignal,
             webContext,
           );
           push({ type: "followup_complete", data: followupResult });
+          logInfo("message.stream.followup.answer_done", {
+            conversationId: id,
+            ...stage3Summary(followupResult),
+          });
 
           ensureNotAborted();
           await withConversationLock(id, async () => {
@@ -455,6 +791,9 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
               webFetchResult,
               "followup",
             );
+          });
+          logInfo("message.stream.followup.saved", {
+            conversationId: id,
           });
           push({
             type: "complete",
@@ -476,8 +815,14 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           conv.messages,
           webSearchMode,
           apiKey,
-          requestSignal,
+          taskSignal,
         );
+        logInfo("message.stream.council.plan_done", {
+          conversationId: id,
+          requestedMode: webSearchMode,
+          action: webSearchPlan.action,
+          reason: webSearchPlan.reason,
+        });
 
         if (webSearchPlan.action === "reuse" && webSearchPlan.previousWebFetch) {
           webFetchResult = {
@@ -488,20 +833,37 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             reusedFromPrevious: true,
           };
           push({ type: "web_fetch_complete", data: webFetchResult });
+          logInfo("message.stream.council.web_fetch_reused", {
+            conversationId: id,
+            ...webFetchSummary(webFetchResult),
+          });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
             webContext = webFetchResult.content;
           }
         } else if (webSearchPlan.action === "search") {
-          push({ type: "web_fetch_start" });
+          push({ type: "web_fetch_start", data: { model: webFetchModel?.trim() || WEB_FETCH_MODEL } });
+          const scopePreview = await describeWebFetchScope(
+            effectiveQuery,
+            apiKey,
+            taskSignal,
+          );
+          if (scopePreview) {
+            push({ type: "web_fetch_scope", data: scopePreview });
+          }
           webFetchResult = await stageWebFetch(
             effectiveQuery,
             webFetchModel,
             apiKey,
-            requestSignal,
+            taskSignal,
             webSearchPlan,
             filterUntrustedSources,
+            scopePreview,
           );
           push({ type: "web_fetch_complete", data: webFetchResult });
+          logInfo("message.stream.council.web_fetch_done", {
+            conversationId: id,
+            ...webFetchSummary(webFetchResult),
+          });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) {
             webContext = webFetchResult.content;
           }
@@ -510,7 +872,6 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         push({ type: "stage1_start" });
         const stage1Results = await stage1CollectResponses(
           effectiveQuery,
-          webSearchPlan.action === "search",
           webContext,
           webFetchResult?.retrievedAt != null && webContext
             ? {
@@ -519,10 +880,15 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
               }
             : undefined,
           apiKey,
-          requestSignal,
+          taskSignal,
           effectiveCouncilModels,
         );
         push({ type: "stage1_complete", data: stage1Results });
+        logInfo("message.stream.council.stage1_done", {
+          conversationId: id,
+          stage1Count: stage1Results.length,
+          stage1SuccessCount: successfulStage1Items(stage1Results).length,
+        });
 
         if (successfulStage1Items(stage1Results).length === 0) {
           const stage3Result: Stage3Result = {
@@ -545,6 +911,9 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
               "council",
             );
           });
+          logWarn("message.stream.council.stage1_all_failed", {
+            conversationId: id,
+          });
 
           push({ type: "stage3_complete", data: stage3Result });
           push({ type: "complete" });
@@ -555,9 +924,8 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
         const [stage2Results, labelToModel] = await stage2CollectRankings(
           effectiveQuery,
           stage1Results,
-          webSearchPlan.action === "search",
           apiKey,
-          requestSignal,
+          taskSignal,
           effectiveCouncilModels,
         );
         const aggregateRankings = calculateAggregateRankings(
@@ -565,6 +933,11 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
           labelToModel,
           judgeWeights,
         );
+        logInfo("message.stream.council.stage2_done", {
+          conversationId: id,
+          stage2Count: stage2Results.length,
+          aggregateRankingCount: aggregateRankings.length,
+        });
         push({
           type: "stage2_complete",
           data: stage2Results,
@@ -611,6 +984,12 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
               "council",
             );
           });
+          logWarn("message.stream.council.stage3_blocked", {
+            conversationId: id,
+            chairmanModel: gate.analysis.chairman_model,
+            estimatedInputTokens: gate.analysis.estimated_input_tokens,
+            contextLimit: gate.analysis.context_limit,
+          });
 
           const convAfter = await getConversation(id);
           const msgIndex = convAfter ? convAfter.messages.length - 1 : -1;
@@ -633,15 +1012,18 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
             stage1Results,
             stage2Results,
             chairmanModel,
-            webSearchPlan.action === "search",
             judgeWeights,
             labelToModel,
             (delta) => push({ type: "stage3_delta", data: { delta } }),
             apiKey,
-            requestSignal,
+            taskSignal,
             webFetchResult?.sources,
           );
           push({ type: "stage3_complete", data: stage3Result });
+          logInfo("message.stream.council.stage3_done", {
+            conversationId: id,
+            ...stage3Summary(stage3Result),
+          });
 
           ensureNotAborted();
           await withConversationLock(id, async () => {
@@ -657,16 +1039,34 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
               webFetchResult,
             );
           });
+          logInfo("message.stream.council.saved", {
+            conversationId: id,
+          });
         }
         push({ type: "complete" });
       } catch (e) {
-        if (isAbortError(e)) return;
+        if (isAbortError(e)) {
+          logWarn("message.stream.aborted", {
+            conversationId: id,
+          });
+          return;
+        }
+        logError("message.stream.failed", {
+          conversationId: id,
+          error: summarizeError(e),
+        });
         push({
           type: "error",
           message: e instanceof Error ? e.message : String(e),
         });
       } finally {
-        controller.close();
+        if (heartbeat) clearInterval(heartbeat);
+        requestSignal.removeEventListener("abort", onRequestAbort);
+        taskControllers.delete(id);
+        logInfo("message.stream.task_finished", {
+          conversationId: id,
+        });
+        try { controller.close(); } catch { /* already closed */ }
       }
     },
   });
@@ -674,10 +1074,29 @@ app.post("/api/conversations/:id/message/stream", async (c) => {
   return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
+});
+
+// 显式取消正在进行的流式任务（Stop 按钮调用）
+app.delete("/api/conversations/:id/stream", (c) => {
+  const id = c.req.param("id");
+  const ctrl = taskControllers.get(id);
+  if (ctrl) {
+    ctrl.abort();
+    taskControllers.delete(id);
+    logInfo("message.stream.cancelled", {
+      conversationId: id,
+    });
+    return c.json({ cancelled: true });
+  }
+  logInfo("message.stream.cancel_noop", {
+    conversationId: id,
+  });
+  return c.json({ cancelled: false });
 });
 
 type RerunBody = {
@@ -703,15 +1122,43 @@ app.post(
   async (c) => {
     const id = c.req.param("id");
     const msgIndex = parseMsgIndex(c);
-    if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+    if (msgIndex < 0) {
+      logValidationFailure("message.rerun_stage1_model.invalid_body", "invalid msgIndex", {
+        conversationId: id,
+      });
+      return c.json({ detail: "invalid msgIndex" }, 400);
+    }
     const apiKey = extractApiKey(c);
-    if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+    if (!apiKey) {
+      logValidationFailure("message.rerun_stage1_model.missing_api_key", MISSING_API_KEY_DETAIL, {
+        conversationId: id,
+        msgIndex,
+      });
+      return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+    }
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
     const councilModels = parseCouncilModels(body);
-    if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+    if (councilModels.error) {
+      logValidationFailure("message.rerun_stage1_model.invalid_body", councilModels.error, {
+        conversationId: id,
+        msgIndex,
+      });
+      return c.json({ detail: councilModels.error }, 400);
+    }
     const model = body.model?.trim();
-    if (!model) return c.json({ detail: "model required" }, 400);
+    if (!model) {
+      logValidationFailure("message.rerun_stage1_model.invalid_body", "model required", {
+        conversationId: id,
+        msgIndex,
+      });
+      return c.json({ detail: "model required" }, 400);
+    }
+    logInfo("message.rerun_stage1_model.received", {
+      conversationId: id,
+      msgIndex,
+      model,
+    });
 
     const result = await withConversationLock(id, async () => {
       const conv = await getConversation(id);
@@ -738,10 +1185,52 @@ app.post(
         c.req.raw.signal,
       );
 
+      let webContext: string | undefined;
+      let webRetrievalMeta:
+        | {
+            isoUtc: string;
+            unixSeconds: number;
+          }
+        | undefined;
+      if (
+        rerunPlan.action === "reuse" &&
+        rerunPlan.previousWebFetch &&
+        !rerunPlan.previousWebFetch.webSearchSkipped &&
+        hasVerifiedWebFetchSources(rerunPlan.previousWebFetch)
+      ) {
+        webContext = rerunPlan.previousWebFetch.content;
+        if (rerunPlan.previousWebFetch.retrievedAt) {
+          webRetrievalMeta = {
+            isoUtc: rerunPlan.previousWebFetch.retrievedAt,
+            unixSeconds: rerunPlan.previousWebFetch.retrievedAtUnixSeconds ?? 0,
+          };
+        }
+      } else if (
+        rerunMode !== "off" &&
+        msg.webFetch &&
+        !msg.webFetch.webSearchSkipped &&
+        hasVerifiedWebFetchSources(msg.webFetch)
+      ) {
+        webContext = msg.webFetch.content;
+        if (msg.webFetch.retrievedAt) {
+          webRetrievalMeta = {
+            isoUtc: msg.webFetch.retrievedAt,
+            unixSeconds: msg.webFetch.retrievedAtUnixSeconds ?? 0,
+          };
+        }
+      }
+
       const res = await queryModel(
         model,
-        [{ role: "user", content: effectiveQuery }],
-        { useWebSearch: rerunPlan.action === "search", apiKey },
+        [{
+          role: "user",
+          content: buildStage1UserPrompt(
+            effectiveQuery,
+            webContext,
+            webRetrievalMeta,
+          ),
+        }],
+        { apiKey },
       );
 
       const stage1 = [...msg.stage1];
@@ -781,6 +1270,12 @@ app.post(
     if (result.error === "model not in stage1")
       return c.json({ detail: "model not in stage1" }, 400);
 
+    logInfo("message.rerun_stage1_model.completed", {
+      conversationId: id,
+      msgIndex,
+      model,
+      webSearchSkipped: result.webSearchSkipped ?? false,
+    });
     return c.json(result);
   },
 );
@@ -790,13 +1285,35 @@ app.post(
   async (c) => {
     const id = c.req.param("id");
     const msgIndex = parseMsgIndex(c);
-    if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+    if (msgIndex < 0) {
+      logValidationFailure("message.rerun_stage1.invalid_body", "invalid msgIndex", {
+        conversationId: id,
+      });
+      return c.json({ detail: "invalid msgIndex" }, 400);
+    }
     const apiKey = extractApiKey(c);
-    if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+    if (!apiKey) {
+      logValidationFailure("message.rerun_stage1.missing_api_key", MISSING_API_KEY_DETAIL, {
+        conversationId: id,
+        msgIndex,
+      });
+      return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+    }
 
     const body = (await c.req.json().catch(() => ({}))) as RerunBody;
     const councilModels = parseCouncilModels(body);
-    if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+    if (councilModels.error) {
+      logValidationFailure("message.rerun_stage1.invalid_body", councilModels.error, {
+        conversationId: id,
+        msgIndex,
+      });
+      return c.json({ detail: councilModels.error }, 400);
+    }
+    logInfo("message.rerun_stage1.received", {
+      conversationId: id,
+      msgIndex,
+      councilModels: councilModels.models,
+    });
 
     const result = await withConversationLock(id, async () => {
       const conv = await getConversation(id);
@@ -842,7 +1359,6 @@ app.post(
 
       const stage1 = await stage1CollectResponses(
         effectiveQuery,
-        rerunPlan.action === "search",
         webContext,
         msg.webFetch?.retrievedAt != null
           ? {
@@ -877,6 +1393,12 @@ app.post(
     if (result.error === "all stage1 models failed")
       return c.json({ detail: STAGE1_FAILURE_MESSAGE }, 502);
 
+    logInfo("message.rerun_stage1.completed", {
+      conversationId: id,
+      msgIndex,
+      stage1Count: result.stage1.length,
+      stage1SuccessCount: successfulStage1Items(result.stage1).length,
+    });
     return c.json(result);
   },
 );
@@ -884,14 +1406,37 @@ app.post(
 app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => {
   const id = c.req.param("id");
   const msgIndex = parseMsgIndex(c);
-  if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+  if (msgIndex < 0) {
+    logValidationFailure("message.rerun_stage2.invalid_body", "invalid msgIndex", {
+      conversationId: id,
+    });
+    return c.json({ detail: "invalid msgIndex" }, 400);
+  }
   const apiKey = extractApiKey(c);
-  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  if (!apiKey) {
+    logValidationFailure("message.rerun_stage2.missing_api_key", MISSING_API_KEY_DETAIL, {
+      conversationId: id,
+      msgIndex,
+    });
+    return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  }
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const councilModels = parseCouncilModels(body);
-  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+  if (councilModels.error) {
+    logValidationFailure("message.rerun_stage2.invalid_body", councilModels.error, {
+      conversationId: id,
+      msgIndex,
+    });
+    return c.json({ detail: councilModels.error }, 400);
+  }
   const judgeWeights = parseJudgeWeights(body);
+  logInfo("message.rerun_stage2.received", {
+    conversationId: id,
+    msgIndex,
+    councilModels: councilModels.models,
+    hasJudgeWeights: Boolean(judgeWeights),
+  });
 
   const result = await withConversationLock(id, async () => {
     const conv = await getConversation(id);
@@ -915,7 +1460,6 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
     const [stage2, labelToModel] = await stage2CollectRankings(
       effectiveQuery,
       msg.stage1,
-      rerunMode === "on",
       apiKey,
       undefined,
       councilModels.models ?? COUNCIL_MODELS,
@@ -956,20 +1500,49 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage2", async (c) => 
   if (result.error === "empty stage1")
     return c.json({ detail: "empty stage1" }, 400);
 
+  logInfo("message.rerun_stage2.completed", {
+    conversationId: id,
+    msgIndex,
+    stage2Count: result.stage2.length,
+    aggregateRankingCount: result.metadata.aggregate_rankings.length,
+  });
   return c.json(result);
 });
 
 app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => {
   const id = c.req.param("id");
   const msgIndex = parseMsgIndex(c);
-  if (msgIndex < 0) return c.json({ detail: "invalid msgIndex" }, 400);
+  if (msgIndex < 0) {
+    logValidationFailure("message.rerun_stage3.invalid_body", "invalid msgIndex", {
+      conversationId: id,
+    });
+    return c.json({ detail: "invalid msgIndex" }, 400);
+  }
   const apiKey = extractApiKey(c);
-  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  if (!apiKey) {
+    logValidationFailure("message.rerun_stage3.missing_api_key", MISSING_API_KEY_DETAIL, {
+      conversationId: id,
+      msgIndex,
+    });
+    return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  }
 
   const body = (await c.req.json().catch(() => ({}))) as RerunBody;
   const councilModels = parseCouncilModels(body);
-  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+  if (councilModels.error) {
+    logValidationFailure("message.rerun_stage3.invalid_body", councilModels.error, {
+      conversationId: id,
+      msgIndex,
+    });
+    return c.json({ detail: councilModels.error }, 400);
+  }
   const judgeWeights = parseJudgeWeights(body);
+  logInfo("message.rerun_stage3.received", {
+    conversationId: id,
+    msgIndex,
+    chairmanModel: parseChairman(body),
+    hasJudgeWeights: Boolean(judgeWeights),
+  });
 
   const result = await withConversationLock(id, async () => {
     const conv = await getConversation(id);
@@ -1022,7 +1595,6 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
       msg.stage1,
       msg.stage2,
       parseChairman(body),
-      rerunMode === "on",
       judgeWeights,
       labelToModel,
       apiKey,
@@ -1050,6 +1622,12 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
     return c.json({ detail: "no preceding user message" }, 400);
 
   if ("blocked" in result && result.blocked) {
+    logWarn("message.rerun_stage3.blocked", {
+      conversationId: id,
+      msgIndex,
+      chairmanModel: result.chairman_context.chairman_model,
+      estimatedInputTokens: result.chairman_context.estimated_input_tokens,
+    });
     return c.json(
       {
         detail: "chairman_context_exceeded",
@@ -1060,6 +1638,11 @@ app.post("/api/conversations/:id/messages/:msgIndex/rerun-stage3", async (c) => 
     );
   }
 
+  logInfo("message.rerun_stage3.completed", {
+    conversationId: id,
+    msgIndex,
+    ...stage3Summary(result.stage3),
+  });
   return c.json(result);
 });
 
@@ -1087,11 +1670,22 @@ type StatelessSendBody = {
 app.post("/api/message/stateless/stream", async (c) => {
   const body = (await c.req.json().catch(() => ({}))) as StatelessSendBody;
   const content = body.content?.trim();
-  if (!content) return c.json({ detail: "content required" }, 400);
+  if (!content) {
+    logValidationFailure("message.stateless_stream.invalid_body", "content required");
+    return c.json({ detail: "content required" }, 400);
+  }
   const councilModels = parseCouncilModels(body);
-  if (councilModels.error) return c.json({ detail: councilModels.error }, 400);
+  if (councilModels.error) {
+    logValidationFailure("message.stateless_stream.invalid_body", councilModels.error, {
+      ...bodySummary(body),
+    });
+    return c.json({ detail: councilModels.error }, 400);
+  }
   const apiKey = extractApiKey(c);
-  if (!apiKey) return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  if (!apiKey) {
+    logValidationFailure("message.stateless_stream.missing_api_key", MISSING_API_KEY_DETAIL);
+    return c.json({ detail: MISSING_API_KEY_DETAIL }, 400);
+  }
 
   const historyMessages = (body.messages ?? []) as import("./storage.js").Message[];
   const isFirstMessage = historyMessages.filter((m) => m.role === "user").length === 0;
@@ -1105,10 +1699,34 @@ app.post("/api/message/stateless/stream", async (c) => {
   const filterUntrustedSources = Boolean(body.filter_untrusted_sources);
   const effectiveCouncilModels = councilModels.models ?? COUNCIL_MODELS;
 
+  logInfo("message.stateless_stream.received", {
+    ...bodySummary(body),
+    historyCount: historyMessages.length,
+    isFirstMessage,
+    isFollowup,
+    councilModelCount: effectiveCouncilModels.length,
+  });
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const push = (obj: unknown) => controller.enqueue(sseLine(obj));
       const requestSignal = c.req.raw.signal;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      try {
+        controller.enqueue(ssePadding());
+        controller.enqueue(sseComment("stream-open"));
+        push({ type: "stream_open", data: { mode: "stateless" } });
+        heartbeat = setInterval(() => {
+          if (requestSignal.aborted) return;
+          try {
+            controller.enqueue(sseComment("keepalive"));
+          } catch {
+            /* stream closed */
+          }
+        }, SSE_HEARTBEAT_MS);
+      } catch {
+        /* stream closed before first flush */
+      }
       const ensureNotAborted = () => {
         if (requestSignal.aborted) {
           const err = new Error("Aborted");
@@ -1127,7 +1745,9 @@ app.post("/api/message/stateless/stream", async (c) => {
               ensureNotAborted();
               push({ type: "title_complete", data: { title } });
             } catch (err) {
-              console.error("generateConversationTitle (stateless):", err);
+              logWarn("message.stateless_stream.title_failed", {
+                error: summarizeError(err),
+              });
             }
           })();
         }
@@ -1138,7 +1758,15 @@ app.post("/api/message/stateless/stream", async (c) => {
 
         if (isFollowup) {
           if (continueUseWebSearch) {
-            push({ type: "web_fetch_start" });
+            push({ type: "web_fetch_start", data: { model: webFetchModel?.trim() || WEB_FETCH_MODEL } });
+            const scopePreview = await describeWebFetchScope(
+              effectiveQuery,
+              apiKey,
+              requestSignal,
+            );
+            if (scopePreview) {
+              push({ type: "web_fetch_scope", data: scopePreview });
+            }
             webFetchResult = await stageWebFetch(
               effectiveQuery,
               webFetchModel,
@@ -1150,6 +1778,7 @@ app.post("/api/message/stateless/stream", async (c) => {
                 reason: "继续对话已开启联网搜索。",
               },
               filterUntrustedSources,
+              scopePreview,
             );
             push({ type: "web_fetch_complete", data: webFetchResult });
             if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
@@ -1199,8 +1828,24 @@ app.post("/api/message/stateless/stream", async (c) => {
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         } else if (webSearchPlan.action === "search") {
-          push({ type: "web_fetch_start" });
-          webFetchResult = await stageWebFetch(effectiveQuery, webFetchModel, apiKey, requestSignal, webSearchPlan, filterUntrustedSources);
+          push({ type: "web_fetch_start", data: { model: webFetchModel?.trim() || WEB_FETCH_MODEL } });
+          const scopePreview = await describeWebFetchScope(
+            effectiveQuery,
+            apiKey,
+            requestSignal,
+          );
+          if (scopePreview) {
+            push({ type: "web_fetch_scope", data: scopePreview });
+          }
+          webFetchResult = await stageWebFetch(
+            effectiveQuery,
+            webFetchModel,
+            apiKey,
+            requestSignal,
+            webSearchPlan,
+            filterUntrustedSources,
+            scopePreview,
+          );
           push({ type: "web_fetch_complete", data: webFetchResult });
           if (!webFetchResult.webSearchSkipped && hasVerifiedWebFetchSources(webFetchResult)) webContext = webFetchResult.content;
         }
@@ -1208,7 +1853,6 @@ app.post("/api/message/stateless/stream", async (c) => {
         push({ type: "stage1_start" });
         const stage1Results = await stage1CollectResponses(
           effectiveQuery,
-          webSearchPlan.action === "search",
           webContext,
           webFetchResult?.retrievedAt != null && webContext
             ? { isoUtc: webFetchResult.retrievedAt, unixSeconds: webFetchResult.retrievedAtUnixSeconds ?? 0 }
@@ -1230,7 +1874,6 @@ app.post("/api/message/stateless/stream", async (c) => {
         const [stage2Results, labelToModel] = await stage2CollectRankings(
           effectiveQuery,
           stage1Results,
-          webSearchPlan.action === "search",
           apiKey,
           requestSignal,
           effectiveCouncilModels,
@@ -1267,7 +1910,7 @@ app.post("/api/message/stateless/stream", async (c) => {
           push({ type: "stage3_start", data: { model: chairModel } });
           stage3Result = await stage3SynthesizeFinalStream(
             effectiveQuery, stage1Results, stage2Results, chairmanModel,
-            webSearchPlan.action === "search", judgeWeights, labelToModel,
+            judgeWeights, labelToModel,
             (delta) => push({ type: "stage3_delta", data: { delta } }),
             apiKey, requestSignal, webFetchResult?.sources,
           );
@@ -1279,13 +1922,19 @@ app.post("/api/message/stateless/stream", async (c) => {
         if (isAbortError(e)) return;
         push({ type: "error", message: e instanceof Error ? e.message : String(e) });
       } finally {
+        if (heartbeat) clearInterval(heartbeat);
         controller.close();
       }
     },
   });
 
   return new Response(stream, {
-    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
   });
 });
 
@@ -1320,7 +1969,7 @@ app.post("/api/message/stateless/rerun-stage1", async (c) => {
   }
 
   const stage1 = await stage1CollectResponses(
-    effectiveQuery, rerunPlan.action === "search", webContext,
+    effectiveQuery, webContext,
     body.web_fetch?.retrievedAt != null
       ? { isoUtc: body.web_fetch.retrievedAt, unixSeconds: body.web_fetch.retrievedAtUnixSeconds ?? 0 }
       : undefined,
@@ -1349,7 +1998,49 @@ app.post("/api/message/stateless/rerun-stage1-model", async (c) => {
   const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const rerunPlan = await decideWebSearchPlan(userQuery, historyMessages, rerunMode, apiKey, c.req.raw.signal);
 
-  const res = await queryModel(model, [{ role: "user", content: effectiveQuery }], { useWebSearch: rerunPlan.action === "search", apiKey });
+  let webContext: string | undefined;
+  let webRetrievalMeta:
+    | {
+        isoUtc: string;
+        unixSeconds: number;
+      }
+    | undefined;
+  if (
+    rerunPlan.action === "reuse" &&
+    rerunPlan.previousWebFetch &&
+    !rerunPlan.previousWebFetch.webSearchSkipped &&
+    hasVerifiedWebFetchSources(rerunPlan.previousWebFetch)
+  ) {
+    webContext = rerunPlan.previousWebFetch.content;
+    if (rerunPlan.previousWebFetch.retrievedAt) {
+      webRetrievalMeta = {
+        isoUtc: rerunPlan.previousWebFetch.retrievedAt,
+        unixSeconds: rerunPlan.previousWebFetch.retrievedAtUnixSeconds ?? 0,
+      };
+    }
+  } else if (
+    rerunMode !== "off" &&
+    body.web_fetch &&
+    !body.web_fetch.webSearchSkipped &&
+    hasVerifiedWebFetchSources(body.web_fetch)
+  ) {
+    webContext = body.web_fetch.content;
+    if (body.web_fetch.retrievedAt) {
+      webRetrievalMeta = {
+        isoUtc: body.web_fetch.retrievedAt,
+        unixSeconds: body.web_fetch.retrievedAtUnixSeconds ?? 0,
+      };
+    }
+  }
+
+  const res = await queryModel(
+    model,
+    [{
+      role: "user",
+      content: buildStage1UserPrompt(effectiveQuery, webContext, webRetrievalMeta),
+    }],
+    { apiKey },
+  );
 
   const currentStage1 = body.stage1 ?? [];
   const ix = currentStage1.findIndex((s) => s.model === model);
@@ -1393,13 +2084,11 @@ app.post("/api/message/stateless/rerun-stage2", async (c) => {
 
   const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
   const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
-  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const judgeWeights = parseJudgeWeights(body);
 
   const [stage2, labelToModel] = await stage2CollectRankings(
     effectiveQuery,
     stage1,
-    rerunMode === "on",
     apiKey,
     undefined,
     councilModels.models ?? COUNCIL_MODELS,
@@ -1444,7 +2133,6 @@ app.post("/api/message/stateless/rerun-stage3", async (c) => {
 
   const historyMessages = (body.history_messages ?? []) as import("./storage.js").Message[];
   const effectiveQuery = composeEffectiveUserQuery(userQuery, historyMessages);
-  const rerunMode = parseWebSearchMode(body.use_web_search_mode, body.use_web_search);
   const chairmanModel = parseChairman(body);
   const judgeWeights = parseJudgeWeights(body);
   const labelToModel = labelToModelFromStage1(stage1);
@@ -1464,12 +2152,15 @@ app.post("/api/message/stateless/rerun-stage3", async (c) => {
   }
 
   const stage3 = await stage3SynthesizeFinal(
-    effectiveQuery, stage1, stage2, chairmanModel, rerunMode === "on", judgeWeights, labelToModel,
+    effectiveQuery, stage1, stage2, chairmanModel, judgeWeights, labelToModel,
     apiKey, undefined, body.web_fetch?.sources,
   );
 
   return c.json({ stage3, stale: { stage2: false, stage3: false } });
 });
 
-console.log(`Vela 助手 API listening on http://0.0.0.0:${API_PORT}`);
+logInfo("server.listen", {
+  host: "0.0.0.0",
+  port: API_PORT,
+});
 serve({ fetch: app.fetch, port: API_PORT });

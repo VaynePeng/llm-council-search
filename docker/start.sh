@@ -14,4 +14,4 @@ trap cleanup INT TERM EXIT
 pnpm --filter @llm-council-search/api start &
 API_PID=$!
 
-exec pnpm --filter @llm-council-search/web exec next start --hostname 0.0.0.0 -p 3000
+exec pnpm --filter @llm-council-search/web exec next start --hostname 0.0.0.0 -p 4000

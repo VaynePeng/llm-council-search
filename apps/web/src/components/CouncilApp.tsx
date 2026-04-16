@@ -40,6 +40,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
   SheetTrigger,
@@ -48,6 +49,7 @@ import { Slider } from "@/components/ui/slider";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  cancelStream,
   createConversation,
   createLocalConversation,
   deleteConversation,
@@ -71,6 +73,7 @@ import {
   sendMessageStream,
   setStoredApiKey,
   updateLocalConversationTitle,
+  generateUUID,
   type ApiConfig,
   type Conversation,
   type ConversationMeta,
@@ -91,8 +94,6 @@ type StoredUiPrefs = {
   chairmanCustom?: string;
   followupSelect?: string;
   followupCustom?: string;
-  webFetchSelect?: string;
-  webFetchCustom?: string;
   storageMode?: "server" | "local";
   filterUntrustedSources?: boolean;
   continueUseWebSearch?: boolean;
@@ -246,6 +247,28 @@ function buildWebFetchModelSections(
       };
     }),
   }));
+}
+
+function filterAvailableModels(
+  models: string[] | undefined,
+  availableModelIds?: Set<string>,
+): string[] {
+  const unique = [...new Set((models ?? []).map((model) => model.trim()).filter(Boolean))];
+  if (!availableModelIds?.size) return unique;
+  return unique.filter((model) => availableModelIds.has(model));
+}
+
+function chooseAvailableModel(
+  preferred: string | undefined,
+  fallbackCandidates: Array<string | undefined>,
+  availableModelIds?: Set<string>,
+): string {
+  const ordered = [preferred, ...fallbackCandidates]
+    .map((model) => model?.trim() ?? "")
+    .filter(Boolean);
+
+  if (!availableModelIds?.size) return ordered[0] ?? "";
+  return ordered.find((model) => availableModelIds.has(model)) ?? "";
 }
 
 function renderModelSelectSections(sections: ModelSelectSection[]) {
@@ -450,6 +473,9 @@ type WebFetchSource = {
 type WebFetchResult = {
   model: string;
   content: string;
+  plannedSearchTopics?: string[];
+  deferredTopics?: string[];
+  scopeSummary?: string;
   webSearchMode?: WebSearchMode;
   webSearchAction?: "skip" | "search" | "reuse";
   webSearchReason?: string;
@@ -480,6 +506,7 @@ type AssistantMsg = {
   role: "assistant";
   assistantMessageId?: string;
   responseMode?: "council" | "followup";
+  statusText?: string | null;
   pending?: boolean;
   webFetch?: WebFetchResult | null;
   stage1: Stage1Item[] | null;
@@ -576,20 +603,23 @@ function usePinnedBottomAutoscroll(
 function streamingAssistantShell({
   pending = false,
   responseMode = "council",
-  assistantMessageId = crypto.randomUUID(),
+  assistantMessageId = generateUUID(),
   stage3Model,
   stage3Loading = false,
+  statusText = "正在判断是否需要联网检索…",
 }: {
   pending?: boolean;
   responseMode?: AssistantMsg["responseMode"];
   assistantMessageId?: string;
   stage3Model?: string;
   stage3Loading?: boolean;
+  statusText?: string;
 } = {}): AssistantMsg {
   return {
     role: "assistant",
     assistantMessageId,
     responseMode,
+    statusText,
     pending,
     webFetch: null,
     stage1: null,
@@ -661,8 +691,6 @@ export default function CouncilApp() {
   const [chairmanCustom, setChairmanCustom] = useState("");
   const [followupSelect, setFollowupSelect] = useState<string>("");
   const [followupCustom, setFollowupCustom] = useState("");
-  const [webFetchSelect, setWebFetchSelect] = useState<string>("");
-  const [webFetchCustom, setWebFetchCustom] = useState("");
   const [webSearchMode, setWebSearchMode] = useState<WebSearchMode>("auto");
   const [continueUseWebSearch, setContinueUseWebSearch] = useState(false);
   const [filterUntrustedSources, setFilterUntrustedSources] = useState(true);
@@ -678,6 +706,9 @@ export default function CouncilApp() {
     Record<string, boolean>
   >({});
   const [rerunBusy, setRerunBusy] = useState<string | null>(null);
+  const [backgroundPendingByConversation, setBackgroundPendingByConversation] = useState<
+    Record<string, number>
+  >({});
   /** 主席 Stage3 因估算上下文不足被跳过时的引导弹窗 */
   const [chairmanContextPrompt, setChairmanContextPrompt] = useState<{
     convId: string;
@@ -750,6 +781,23 @@ export default function CouncilApp() {
     delete rerunRetryRef.current[targetId];
   }, []);
 
+  const markBackgroundPending = useCallback((convId: string, expectedMessageCount: number) => {
+    setBackgroundPendingByConversation((prev) => ({
+      ...prev,
+      [convId]: expectedMessageCount,
+    }));
+  }, []);
+
+  const clearBackgroundPending = useCallback((convId?: string | null) => {
+    if (!convId) return;
+    setBackgroundPendingByConversation((prev) => {
+      if (!(convId in prev)) return prev;
+      const next = { ...prev };
+      delete next[convId];
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     setMounted(true);
     setOpenrouterKey(getStoredApiKey());
@@ -761,12 +809,6 @@ export default function CouncilApp() {
     return "";
   }, [chairmanSelect, chairmanCustom]);
 
-  const webFetchEffective = useMemo(() => {
-    if (webFetchSelect === "__custom__") return webFetchCustom.trim();
-    if (webFetchSelect) return webFetchSelect;
-    return "";
-  }, [webFetchSelect, webFetchCustom]);
-
   const followupEffective = useMemo(() => {
     if (followupSelect === "__custom__") return followupCustom.trim();
     if (followupSelect) return followupSelect;
@@ -777,6 +819,10 @@ export default function CouncilApp() {
     () => normalizeCouncilModels(councilModels, apiConfig?.council_models ?? []),
     [apiConfig?.council_models, councilModels],
   );
+  const availableModelIds = useMemo(
+    () => new Set(apiConfig?.available_model_ids ?? []),
+    [apiConfig?.available_model_ids],
+  );
   const validCouncilModels = useMemo(() => {
     const cleaned = effectiveCouncilModels.map((model) => model.trim());
     if (cleaned.length < MIN_STAGE2_MODELS) return null;
@@ -785,22 +831,6 @@ export default function CouncilApp() {
     return cleaned;
   }, [effectiveCouncilModels]);
 
-  const webFetchModelSections = useMemo(
-    () =>
-      buildWebFetchModelSections(
-        apiConfig?.web_search_models ?? [],
-        apiConfig?.web_fetch_model,
-        apiConfig?.featured_model_groups ?? [],
-        apiConfig?.chairman_context_limits,
-      ),
-    [
-      apiConfig?.chairman_context_limits,
-      apiConfig?.featured_model_groups,
-      apiConfig?.web_fetch_model,
-      apiConfig?.web_search_models,
-    ],
-  );
-
   const chairmanModelSections = useMemo(
     () =>
       buildModelSelectSections([
@@ -808,13 +838,14 @@ export default function CouncilApp() {
           key: "chairman-defaults",
           label: "当前 Council 配置",
           models: [
-            ...(apiConfig?.council_models ?? []),
-            ...effectiveCouncilModels,
-            apiConfig?.chairman_model ?? "",
+            ...filterAvailableModels(apiConfig?.council_models, availableModelIds),
+            ...filterAvailableModels(effectiveCouncilModels, availableModelIds),
+            chooseAvailableModel(apiConfig?.chairman_model, [], availableModelIds),
           ],
         },
       ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
     [
+      availableModelIds,
       apiConfig?.chairman_model,
       apiConfig?.chairman_context_limits,
       apiConfig?.council_models,
@@ -830,13 +861,13 @@ export default function CouncilApp() {
           key: "followup-defaults",
           label: "当前继续对话配置",
           models: [
-            apiConfig?.followup_model ?? "",
-            "qwen/qwen3.6-plus:free",
-            ...effectiveCouncilModels,
+            chooseAvailableModel(apiConfig?.followup_model, [], availableModelIds),
+            ...filterAvailableModels(effectiveCouncilModels, availableModelIds),
           ],
         },
       ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
     [
+      availableModelIds,
       apiConfig?.chairman_context_limits,
       effectiveCouncilModels,
       apiConfig?.featured_model_groups,
@@ -856,9 +887,9 @@ export default function CouncilApp() {
           key: "stage2-defaults",
           label: "可选模型",
           models: [
-            ...(apiConfig?.council_models ?? []),
-            apiConfig?.chairman_model ?? "",
-            apiConfig?.followup_model ?? "",
+            ...filterAvailableModels(apiConfig?.council_models, availableModelIds),
+            chooseAvailableModel(apiConfig?.chairman_model, [], availableModelIds),
+            chooseAvailableModel(apiConfig?.followup_model, [], availableModelIds),
           ].filter((model) => {
             if (!model) return false;
             if (model === currentModel) return true;
@@ -867,6 +898,7 @@ export default function CouncilApp() {
         },
       ], apiConfig?.featured_model_groups ?? [], apiConfig?.chairman_context_limits),
     [
+      availableModelIds,
       apiConfig?.chairman_model,
       apiConfig?.chairman_context_limits,
       apiConfig?.council_models,
@@ -948,9 +980,18 @@ export default function CouncilApp() {
   }, [resetErrorState, setConversationLoading]);
 
   const isAbortError = useCallback((err: unknown) => {
+    const name = (err as { name?: string })?.name;
+    const message =
+      err instanceof Error
+        ? err.message
+        : typeof err === "string"
+          ? err
+          : "";
     return (
-      (err as { name?: string })?.name === "AbortError" ||
-      (err instanceof Error && err.message === "The operation was aborted.")
+      name === "AbortError" ||
+      message === "The operation was aborted." ||
+      message === "This operation was aborted" ||
+      message === "Load failed"
     );
   }, []);
 
@@ -993,30 +1034,32 @@ export default function CouncilApp() {
       try {
         const cfg = await fetchConfig();
         const prefs = loadUiPrefs();
+        const availableModelIds = new Set(cfg.available_model_ids ?? []);
         setApiConfig(cfg);
         const stored = loadStoredWeights();
         const initialCouncilModels = normalizeCouncilModels(
-          prefs.councilModels,
-          cfg.council_models,
+          filterAvailableModels(prefs.councilModels, availableModelIds),
+          filterAvailableModels(cfg.council_models, availableModelIds),
         );
         setCouncilModels(initialCouncilModels);
         setJudgeWeights(buildJudgeWeights(initialCouncilModels.filter(Boolean), stored));
         setWebSearchMode(prefs.webSearchMode ?? "auto");
         setChairmanSelect(
-          prefs.chairmanSelect ?? cfg.chairman_model,
+          chooseAvailableModel(
+            prefs.chairmanSelect,
+            [cfg.chairman_model, ...cfg.council_models],
+            availableModelIds,
+          ),
         );
         setChairmanCustom(prefs.chairmanCustom ?? "");
         setFollowupSelect(
-          prefs.followupSelect ?? cfg.followup_model ?? "qwen/qwen3.6-plus:free",
+          chooseAvailableModel(
+            prefs.followupSelect,
+            [cfg.followup_model, "qwen/qwen3.6-plus", ...cfg.council_models],
+            availableModelIds,
+          ),
         );
         setFollowupCustom(prefs.followupCustom ?? "");
-        const wfDefault = cfg.web_fetch_model?.trim() ?? "";
-        const wsModels = cfg.web_search_models ?? [];
-        const savedWf = prefs.webFetchSelect;
-        setWebFetchSelect(
-          savedWf ?? (wfDefault || wsModels[0] || ""),
-        );
-        setWebFetchCustom(prefs.webFetchCustom ?? "");
         setStorageMode(prefs.storageMode ?? "server");
         setFilterUntrustedSources(prefs.filterUntrustedSources ?? true);
         setContinueUseWebSearch(prefs.continueUseWebSearch ?? false);
@@ -1038,8 +1081,6 @@ export default function CouncilApp() {
           chairmanCustom,
           followupSelect,
           followupCustom,
-          webFetchSelect,
-          webFetchCustom,
           storageMode,
           filterUntrustedSources,
           continueUseWebSearch,
@@ -1056,8 +1097,6 @@ export default function CouncilApp() {
     chairmanCustom,
     followupSelect,
     followupCustom,
-    webFetchSelect,
-    webFetchCustom,
     storageMode,
     filterUntrustedSources,
     continueUseWebSearch,
@@ -1079,6 +1118,72 @@ export default function CouncilApp() {
   useEffect(() => {
     if (currentId) void loadConversation(currentId);
   }, [currentId, loadConversation]);
+
+  useEffect(() => {
+    if (storageMode === "local") return;
+    if (typeof document === "undefined" || typeof window === "undefined") return;
+
+    const convId = currentId;
+    const expectedMessageCount = convId
+      ? backgroundPendingByConversation[convId]
+      : undefined;
+    if (!convId || expectedMessageCount == null) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const poll = async () => {
+      if (cancelled || document.visibilityState !== "visible") return;
+      try {
+        const latest = await getConversation(convId);
+        if (cancelled) return;
+
+        if (latest.messages.length >= expectedMessageCount) {
+          clearBackgroundPending(convId);
+          void loadConversations();
+          if (currentIdRef.current === convId) {
+            setConversation(latest);
+            setConversationLoading(convId, false);
+            resetErrorState(convId);
+          }
+          return;
+        }
+      } catch {
+        /* ignore transient refresh failures */
+      }
+
+      if (!cancelled) {
+        timer = setTimeout(() => {
+          void poll();
+        }, 2000);
+      }
+    };
+
+    const triggerPoll = () => {
+      if (document.visibilityState !== "visible") return;
+      if (timer) clearTimeout(timer);
+      void poll();
+    };
+
+    triggerPoll();
+    document.addEventListener("visibilitychange", triggerPoll);
+    window.addEventListener("focus", triggerPoll);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", triggerPoll);
+      window.removeEventListener("focus", triggerPoll);
+    };
+  }, [
+    backgroundPendingByConversation,
+    clearBackgroundPending,
+    currentId,
+    loadConversations,
+    resetErrorState,
+    setConversationLoading,
+    storageMode,
+  ]);
 
   const persistWeights = (w: Record<string, number>) => {
     try {
@@ -1134,7 +1239,6 @@ export default function CouncilApp() {
     (isFollowup: boolean) => ({
       chairman_model: chairmanEffective || undefined,
       followup_model: followupEffective || undefined,
-      web_fetch_model: webFetchEffective || undefined,
       council_models: validCouncilModels ?? undefined,
       use_web_search: webSearchMode !== "off",
       use_web_search_mode: webSearchMode,
@@ -1148,7 +1252,6 @@ export default function CouncilApp() {
       validCouncilModels,
       filterUntrustedSources,
       followupEffective,
-      webFetchEffective,
       webSearchMode,
       judgeWeights,
     ],
@@ -1159,6 +1262,7 @@ export default function CouncilApp() {
       streamSidebarRefreshRef.current = false;
       const controller = new AbortController();
       streamAbortRef.current[convId] = controller;
+      let streamTerminated = false;
 
       const applyPatchToAssistantTail = (
         messages: Conversation["messages"],
@@ -1224,21 +1328,45 @@ export default function CouncilApp() {
 
         await streamFn((type, ev) => {
           switch (type) {
+          case "stream_open":
+            patchLastAssistant((m) => ({
+              ...m,
+              statusText: "请求已发出，正在判断是否需要联网检索…",
+            }));
+            break;
           case "web_fetch_start":
             maybeRefreshSidebar();
+            const webFetchStartData = (ev as { data?: Partial<WebFetchResult> }).data ?? {};
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "已确认需要联网，正在抓取资料与来源…",
               responseMode: isFollowup ? "followup" : "council",
               webFetch:
                 m.webFetch ??
-                ({ model: webFetchEffective || apiConfig?.web_fetch_model || "联网检索", content: "" } as WebFetchResult),
+                ({
+                  model: webFetchStartData.model || apiConfig?.web_fetch_model || "联网检索",
+                  content: "",
+                } as WebFetchResult),
               loading: { ...m.loading, webFetch: true },
+            }));
+            break;
+          case "web_fetch_scope":
+            patchLastAssistantActive((m) => ({
+              ...m,
+              statusText: "正在按已拆解的抓取范围检索资料…",
+              webFetch: {
+                ...(m.webFetch ?? ({ model: apiConfig?.web_fetch_model || "联网检索", content: "" } as WebFetchResult)),
+                plannedSearchTopics: (ev.data as WebFetchResult | undefined)?.plannedSearchTopics,
+                deferredTopics: (ev.data as WebFetchResult | undefined)?.deferredTopics,
+                scopeSummary: (ev.data as WebFetchResult | undefined)?.scopeSummary,
+              },
             }));
             break;
           case "web_fetch_complete":
             if (storageMode === "local") localCollected.webFetch = ev.data as WebFetchResult;
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "联网资料已返回，正在分发给候选模型生成初稿…",
               webFetch: ev.data as WebFetchResult,
               loading: { ...m.loading, webFetch: false },
             }));
@@ -1247,6 +1375,7 @@ export default function CouncilApp() {
             maybeRefreshSidebar();
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "正在生成多模型初稿…",
               responseMode: "council",
               loading: { ...m.loading, stage1: true },
             }));
@@ -1255,6 +1384,7 @@ export default function CouncilApp() {
             if (storageMode === "local") localCollected.stage1 = ev.data as Stage1Item[];
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "初稿已完成，正在交叉评审与排序…",
               stage1: ev.data as Stage1Item[],
               loading: { ...m.loading, stage1: false },
               stale: { stage2: false, stage3: false },
@@ -1263,6 +1393,7 @@ export default function CouncilApp() {
           case "stage2_start":
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "正在交叉评审与排序…",
               loading: { ...m.loading, stage2: true },
             }));
             break;
@@ -1273,6 +1404,7 @@ export default function CouncilApp() {
             }
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "评审完成，正在由主席模型综合结论…",
               stage2: ev.data as Stage2Item[],
               metadata: (ev.metadata as AssistantMsg["metadata"]) ?? null,
               loading: { ...m.loading, stage2: false },
@@ -1294,6 +1426,7 @@ export default function CouncilApp() {
             }
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "主席阶段因上下文限制暂停，等待你确认下一步…",
               stage3: d.stage3,
               loading: { ...m.loading, stage3: false },
             }));
@@ -1316,6 +1449,7 @@ export default function CouncilApp() {
             if (storageMode === "local") localCollected.responseMode = "followup";
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "正在生成继续对话回复…",
               responseMode: "followup",
               loading: { ...m.loading, stage3: true },
               stage3: { model: sm || "…", response: "" },
@@ -1343,6 +1477,7 @@ export default function CouncilApp() {
             }
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "继续对话回复已完成。",
               responseMode: "followup",
               stage3: ev.data as Stage3,
               loading: { ...m.loading, stage3: false },
@@ -1352,6 +1487,7 @@ export default function CouncilApp() {
             const sm = (ev as { data?: { model?: string } }).data?.model ?? "";
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "正在由主席模型综合结论…",
               responseMode: "council",
               loading: { ...m.loading, stage3: true },
               stage3: { model: sm || "…", response: "" },
@@ -1375,6 +1511,7 @@ export default function CouncilApp() {
             if (storageMode === "local") localCollected.stage3 = ev.data as Stage3;
             patchLastAssistantActive((m) => ({
               ...m,
+              statusText: "最终综合已完成。",
               stage3: ev.data as Stage3,
               loading: { ...m.loading, stage3: false },
             }));
@@ -1394,6 +1531,8 @@ export default function CouncilApp() {
             break;
           }
           case "complete": {
+            streamTerminated = true;
+            clearBackgroundPending(convId);
             if (storageMode === "local") {
               // Persist the completed conversation to localStorage
               const existingConv = getLocalConversation(convId);
@@ -1402,7 +1541,7 @@ export default function CouncilApp() {
                 const assistantMsg = {
                   role: "assistant" as const,
                   schemaVersion: 2,
-                  assistantMessageId: crypto.randomUUID(),
+                  assistantMessageId: generateUUID(),
                   responseMode:
                     localCollected.responseMode ??
                     (isFollowup ? "followup" : "council"),
@@ -1435,6 +1574,8 @@ export default function CouncilApp() {
             break;
           }
           case "error":
+            streamTerminated = true;
+            clearBackgroundPending(convId);
             delete streamDraftRef.current[convId];
             setActionErrorByConversation((prev) => ({
               ...prev,
@@ -1447,6 +1588,20 @@ export default function CouncilApp() {
               break;
           }
         }, sendOpts(isFollowup), controller.signal);
+
+        if (!streamTerminated && !controller.signal.aborted) {
+          clearBackgroundPending(convId);
+          delete streamDraftRef.current[convId];
+          setActionErrorByConversation((prev) => ({
+            ...prev,
+            [convId]: "流式连接已中断，正在同步后台结果。",
+          }));
+          setConversationLoading(convId, false);
+          void loadConversations();
+          if (storageMode !== "local" && currentIdRef.current === convId) {
+            void loadConversation(convId);
+          }
+        }
       } finally {
         if (streamAbortRef.current[convId] === controller) {
           delete streamAbortRef.current[convId];
@@ -1455,13 +1610,13 @@ export default function CouncilApp() {
     },
     [
       apiConfig?.web_fetch_model,
+      clearBackgroundPending,
       loadConversations,
       loadConversation,
       resetErrorState,
       sendOpts,
       setConversationLoading,
       storageMode,
-      webFetchEffective,
       conversation?.messages,
     ],
   );
@@ -1583,8 +1738,12 @@ export default function CouncilApp() {
     if (!currentLoading || !currentId) return;
     streamAbortRef.current[currentId]?.abort();
     delete streamAbortRef.current[currentId];
+    // 通知服务端取消任务（server 模式），避免后台继续消耗 API 额度
+    if (storageMode === "server") {
+      void cancelStream(currentId);
+    }
     stopStreamingPreview(currentId);
-  }, [currentId, currentLoading, stopStreamingPreview]);
+  }, [currentId, currentLoading, storageMode, stopStreamingPreview]);
 
   const runChairmanRetryWithPick = useCallback(async () => {
     const p = chairmanContextPrompt;
@@ -1699,7 +1858,14 @@ export default function CouncilApp() {
     try {
       await runStreamForContent(currentId, f.content);
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) {
+        markBackgroundPending(
+          currentId,
+          streamDraftRef.current[currentId]?.length ?? conversation?.messages.length ?? 0,
+        );
+        stopStreamingPreview(currentId);
+        return;
+      }
       console.error(e);
       delete streamDraftRef.current[currentId];
       setConversation((prev) =>
@@ -1723,6 +1889,8 @@ export default function CouncilApp() {
     runStreamForContent,
     resetErrorState,
     setConversationLoading,
+    markBackgroundPending,
+    stopStreamingPreview,
   ]);
 
   const handleSend = async () => {
@@ -1731,6 +1899,7 @@ export default function CouncilApp() {
     setInput("");
     setConversationLoading(currentId, true);
     resetErrorState(currentId);
+    clearBackgroundPending(currentId);
 
     failedSendRef.current[currentId] = {
       content,
@@ -1760,7 +1929,14 @@ export default function CouncilApp() {
     try {
       await runStreamForContent(currentId, content);
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) {
+        markBackgroundPending(
+          currentId,
+          streamDraftRef.current[currentId]?.length ?? messages.length + 2,
+        );
+        stopStreamingPreview(currentId);
+        return;
+      }
       console.error(e);
       delete streamDraftRef.current[currentId];
       setConversation((prev) =>
@@ -1843,6 +2019,10 @@ export default function CouncilApp() {
 
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetContent side="left" className="flex w-[min(100%,20rem)] flex-col p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>会话列表</SheetTitle>
+            <SheetDescription>浏览、切换、新建或删除当前保存的对话。</SheetDescription>
+          </SheetHeader>
           {SidebarBody}
         </SheetContent>
       </Sheet>
@@ -1934,6 +2114,9 @@ export default function CouncilApp() {
             <SheetContent className="flex max-h-dvh flex-col overflow-y-auto">
               <SheetHeader>
                 <SheetTitle>高级设置</SheetTitle>
+                <SheetDescription className="sr-only">
+                  配置联网策略、模型选择、评委权重和对话存储方式。
+                </SheetDescription>
               </SheetHeader>
               <div className="mt-4 space-y-6">
                 <div className="space-y-2">
@@ -1989,7 +2172,7 @@ export default function CouncilApp() {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   `自动判断` 会结合当前问题和前文决定本轮是否联网、是否复用上一轮检索结果；`强制联网` 每轮都会重新联网检索。
-                  若模型不支持联网，服务端会尝试去掉插件重试；本页选项会保存在本机浏览器。
+                  只有 Web 抓取阶段会调用 OpenRouter Web Search，后续评委与主席阶段只消费抓取结果；本页选项会保存在本机浏览器。
                 </p>
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -2005,47 +2188,22 @@ export default function CouncilApp() {
                   </p>
                 </div>
                 {webSearchMode !== "off" ? (
-                  <div className="space-y-2">
-                    <Label>Web 抓取模型（仅联网阶段）</Label>
-                    <Select
-                      value={webFetchSelect || undefined}
-                      onValueChange={setWebFetchSelect}
+                  <p className="text-xs text-muted-foreground">
+                    联网抓取模型由服务端统一决定，并固定通过{" "}
+                    <span className="font-mono">openrouter:web_search</span>
+                    {" "}使用{" "}
+                    <span className="font-mono">engine: "exa"</span>
+                    {" "}执行。前端不再单独覆盖抓取模型，见{" "}
+                    <a
+                      href="https://openrouter.ai/docs/guides/features/server-tools/web-search"
+                      className="underline underline-offset-2"
+                      target="_blank"
+                      rel="noreferrer"
                     >
-                      <SelectTrigger className="w-full">
-                        <SelectValue placeholder="选择模型" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {renderModelSelectSections(webFetchModelSections)}
-                        {webFetchModelSections.length ? <SelectSeparator /> : null}
-                        <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    {webFetchSelect === "__custom__" ? (
-                      <Input
-                        placeholder="openrouter/model-id"
-                        value={webFetchCustom}
-                        onChange={(e) => setWebFetchCustom(e.target.value)}
-                      />
-                    ) : null}
-                    <p className="text-xs text-muted-foreground">
-                      仅用于联网检索阶段，与主席模型独立。推荐项会固定排在最上面，来自服务端当前配置的
-                      <span className="font-mono"> WEB_SEARCH_MODELS </span>
-                      与默认
-                      <span className="font-mono"> WEB_FETCH_MODEL </span>
-                      （当前包含 OpenAI / Anthropic / Perplexity / xAI 的原生搜索模型，以及走 Exa 兜底的 Gemini）。带{" "}
-                      <span className="font-mono">:online</span> 或 Exa 兜底的模型，见{" "}
-                      <a
-                        href="https://openrouter.ai/docs/guides/features/server-tools/web-search"
-                        className="underline underline-offset-2"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        OpenRouter Web Search
-                      </a>
-                      ）。自定义留空时由服务端{" "}
-                      <span className="font-mono">WEB_FETCH_MODEL</span> 决定。
-                    </p>
-                  </div>
+                      OpenRouter Web Search
+                    </a>
+                    。
+                  </p>
                 ) : null}
                 <div className="space-y-2">
                   <Label>最终决策模型（主席）</Label>
@@ -2093,7 +2251,7 @@ export default function CouncilApp() {
                     />
                   ) : null}
                   <p className="text-xs text-muted-foreground">
-                    多轮继续对话默认使用 `qwen/qwen3.6-plus:free`，不再走多评委投票。
+                    多轮继续对话默认使用 `qwen/qwen3.6-plus`，不再走多评委投票。
                   </p>
                 </div>
                 <div className="space-y-3">
@@ -2609,10 +2767,6 @@ function CouncilAssistantCard({
   const stale2 = m.stale?.stage2;
   const stale3 = m.stale?.stage3;
 
-  const webSearchSkippedModels = (m.stage1 ?? [])
-    .filter((it) => it.webSearchSkipped)
-    .map((it) => it.model);
-
   const busyStage1Model =
     busyKey?.startsWith("s1-") === true ? busyKey.slice(3) : null;
   const busyStage1All = busyKey === "s1-all";
@@ -2631,6 +2785,7 @@ function CouncilAssistantCard({
   };
 
   const showWebFetch = Boolean(m.webFetch) || effectiveLoading.webFetch;
+  const statusText = m.statusText?.trim() || "正在处理中…";
 
   const stepperStage2Done = !isFollowup && s2done && !busyStage2;
   const stepperStage3Done = s3done && !busyStage2 && !busyStage3;
@@ -2691,14 +2846,9 @@ function CouncilAssistantCard({
           <Badge variant="warning">Stage3 可能已过期</Badge>
         ) : null}
       </div>
-      {(m.webFetch?.webSearchSkipped || webSearchSkippedModels.length > 0) ? (
+      {m.webFetch?.webSearchSkipped ? (
         <div className="mb-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
-          {m.webFetch?.webSearchSkipped ? (
-            <p>Web 抓取模型 ({modelShortName(m.webFetch.model)}) 不支持联网插件，已跳过联网搜索。</p>
-          ) : null}
-          {webSearchSkippedModels.length > 0 ? (
-            <p>以下模型不支持联网插件，已回退到无联网模式：{webSearchSkippedModels.map(modelShortName).join("、")}</p>
-          ) : null}
+          <p>Web 抓取模型 ({modelShortName(m.webFetch.model)}) 本轮没有成功拿到联网结果，后续阶段已退回为仅基于已有上下文继续生成。</p>
         </div>
       ) : null}
       {m.webFetch?.webSearchReason ? (
@@ -2730,10 +2880,10 @@ function CouncilAssistantCard({
               strokeWidth={2}
               aria-hidden
             />
-            <span>正在分析问题并判断是否需要联网检索…</span>
+            <span>{statusText}</span>
           </div>
           <div className="text-xs text-muted-foreground">
-            已开始处理，本条回答会在收到阶段事件后立即切换到对应视图。
+            当前流程：联网判断 → 联网抓取 → 多模型初稿 → 交叉评审 → 主席综合。
           </div>
           <Skeleton className="h-9 w-full rounded-lg bg-status-running/35" />
           <Skeleton className="h-24 w-full rounded-lg bg-status-running/35" />
@@ -2970,6 +3120,8 @@ function WebFetchView({
   const warningText =
     data?.webSearchWarning ??
     "OpenRouter 这次没有返回结构化 url_citation，前端拿不到精确 URL，所以不能做来源排序。下面正文里的“来源清单 / 参考来源”只是模型文本输出，不等于已验证来源。";
+  const plannedSearchTopics = data?.plannedSearchTopics ?? [];
+  const deferredTopics = data?.deferredTopics ?? [];
 
   if (loading)
     return (
@@ -2978,10 +3130,44 @@ function WebFetchView({
         style={{ animation: "council-fade-in 0.3s ease-out both" }}
       >
         <p className="text-sm text-foreground">
-          正在通过 OpenRouter 网页插件检索公开网页，请稍候…
+          正在通过 OpenRouter Web Search（Exa）检索公开网页，请稍候…
         </p>
         {data?.model ? (
           <div className="font-mono text-xs text-muted-foreground">{data.model}</div>
+        ) : null}
+        {data?.scopeSummary ? (
+          <div className="rounded-md border border-status-running-border/40 bg-background/60 p-3 text-xs text-foreground">
+            <div className="font-medium">本轮抓取重点</div>
+            <p className="mt-1 leading-relaxed">{data.scopeSummary}</p>
+          </div>
+        ) : null}
+        {plannedSearchTopics.length > 0 || deferredTopics.length > 0 ? (
+          <div className="grid gap-2 md:grid-cols-2">
+            <div className="rounded-md border border-status-running-border/40 bg-background/60 p-3 text-xs">
+              <div className="font-medium text-foreground">正在搜索</div>
+              {plannedSearchTopics.length > 0 ? (
+                <ul className="mt-2 space-y-1 text-muted-foreground">
+                  {plannedSearchTopics.map((item, index) => (
+                    <li key={`search-${index}`}>- {item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-muted-foreground">正在拆解检索范围…</p>
+              )}
+            </div>
+            <div className="rounded-md border border-border/60 bg-background/40 p-3 text-xs">
+              <div className="font-medium text-foreground">留给后续流程处理</div>
+              {deferredTopics.length > 0 ? (
+                <ul className="mt-2 space-y-1 text-muted-foreground">
+                  {deferredTopics.map((item, index) => (
+                    <li key={`deferred-${index}`}>- {item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-muted-foreground">等待拆解结果…</p>
+              )}
+            </div>
+          </div>
         ) : null}
         <Skeleton className="h-4 w-2/3 bg-status-running/35" />
         <Skeleton className="h-24 w-full bg-status-running/35" />
@@ -3007,6 +3193,40 @@ function WebFetchView({
       </div>
       {data.webSearchReason ? (
         <p className="mt-1 text-xs text-muted-foreground">{data.webSearchReason}</p>
+      ) : null}
+      {data.scopeSummary ? (
+        <div className="mt-2 rounded-md border border-blue-200 bg-background/70 p-2 text-xs">
+          <div className="font-medium text-foreground">本轮抓取重点</div>
+          <p className="mt-1 leading-relaxed text-muted-foreground">{data.scopeSummary}</p>
+        </div>
+      ) : null}
+      {plannedSearchTopics.length > 0 || deferredTopics.length > 0 ? (
+        <div className="mt-2 grid gap-2 md:grid-cols-2">
+          <div className="rounded-md border border-blue-200 bg-background/70 p-2 text-xs">
+            <div className="font-medium text-foreground">本轮已搜索/准备搜索</div>
+            {plannedSearchTopics.length > 0 ? (
+              <ul className="mt-1 space-y-1 text-muted-foreground">
+                {plannedSearchTopics.map((item, index) => (
+                  <li key={`done-search-${index}`}>- {item}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 text-muted-foreground">未提供细分项。</p>
+            )}
+          </div>
+          <div className="rounded-md border border-border bg-background/60 p-2 text-xs">
+            <div className="font-medium text-foreground">交给后续阶段处理</div>
+            {deferredTopics.length > 0 ? (
+              <ul className="mt-1 space-y-1 text-muted-foreground">
+                {deferredTopics.map((item, index) => (
+                  <li key={`done-deferred-${index}`}>- {item}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-1 text-muted-foreground">未提供细分项。</p>
+            )}
+          </div>
+        </div>
       ) : null}
       {data.retrievedAt ? (
         <p className="mt-1 text-xs text-muted-foreground">
@@ -3229,9 +3449,6 @@ function Stage1View({
             <div className="flex flex-wrap items-center gap-2">
               <div className="font-mono text-xs text-muted-foreground">{it.model}</div>
               {it.failed ? <Badge variant="destructive" className="text-[10px]">请求失败</Badge> : null}
-              {it.webSearchSkipped ? (
-                <Badge variant="warning" className="text-[10px]">已回退为无联网</Badge>
-              ) : null}
             </div>
             <div
               className={cn(

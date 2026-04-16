@@ -1,4 +1,10 @@
 import { OPENROUTER_API_URL } from "./config.js";
+import {
+  logError,
+  logInfo,
+  logWarn,
+  summarizeError,
+} from "./logging.js";
 
 export type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -109,20 +115,14 @@ function stripOnlineSuffix(model: string): string {
 
 /** OpenRouter：仅 OpenAI / Anthropic / Perplexity / xAI 适合 `native`/`auto`；其余强制 Exa，避免部分模型（如 Google）原生检索异常。 */
 function webSearchToolsPayload(
-  model: string,
   maxResults: number,
 ): Array<Record<string, unknown>> {
   const max = Math.min(25, Math.max(1, maxResults));
-  const m = stripOnlineSuffix(model).toLowerCase();
-  const nativePrefix =
-    m.startsWith("openai/") ||
-    m.startsWith("anthropic/") ||
-    m.startsWith("perplexity/") ||
-    m.startsWith("x-ai/");
-  const parameters: Record<string, unknown> = { max_results: max };
-  if (!nativePrefix) {
-    parameters.engine = "exa";
-  }
+  const parameters: Record<string, unknown> = {
+    engine: "exa",
+    max_results: max,
+    max_total_results: Math.max(max, Math.min(25, max * 2)),
+  };
   return [{ type: "openrouter:web_search", parameters }];
 }
 
@@ -212,7 +212,10 @@ async function consumeChatCompletionStream(
 ): Promise<{ ok: boolean; reasoning_details?: unknown[] }> {
   if (!res.ok) {
     const text = await res.text();
-    console.error("OpenRouter stream HTTP error:", res.status, text);
+    logError("openrouter.stream.http_error", {
+      status: res.status,
+      bodyPreview: text.slice(0, 500),
+    });
     return { ok: false };
   }
   const reader = res.body?.getReader();
@@ -245,7 +248,9 @@ async function consumeChatCompletionStream(
           error?: { message?: string };
         };
         if (j.error?.message) {
-          console.error("OpenRouter stream chunk error:", j.error.message);
+          logWarn("openrouter.stream.chunk_error", {
+            message: j.error.message,
+          });
           continue;
         }
         const delta = j.choices?.[0]?.delta;
@@ -274,6 +279,7 @@ export async function queryModel(
   webSearchSkipped?: boolean;
   citations?: UrlCitationItem[];
 } | null> {
+  const startedAt = Date.now();
   const {
     timeoutMs = 120_000,
     useWebSearch = false,
@@ -291,7 +297,7 @@ export async function queryModel(
     : messages;
 
   const webTools = useWebSearch
-    ? webSearchToolsPayload(effectiveModel, webMaxResults)
+    ? webSearchToolsPayload(webMaxResults)
     : undefined;
 
   const request = createRequestSignal(timeoutMs, signal);
@@ -305,7 +311,12 @@ export async function queryModel(
   } | null> => {
     if (!res.ok) {
       const text = await res.text();
-      console.error(`OpenRouter error ${effectiveModel}:`, res.status, text);
+      logWarn("openrouter.query.http_error", {
+        model,
+        effectiveModel,
+        status: res.status,
+        bodyPreview: text.slice(0, 500),
+      });
       return null;
     }
     const data = (await res.json()) as {
@@ -327,6 +338,13 @@ export async function queryModel(
   };
 
   try {
+    logInfo("openrouter.query.start", {
+      model,
+      effectiveModel,
+      useWebSearch,
+      messageCount: messages.length,
+      promptChars: messages.reduce((sum, message) => sum + message.content.length, 0),
+    });
     throwIfAborted(signal);
     if (useWebSearch) {
       let withWebSearchTool: {
@@ -344,12 +362,22 @@ export async function queryModel(
         );
         withWebSearchTool = await parseSuccess(resWith);
       } catch (e) {
-        console.warn(
-          `[OpenRouter] Web search request threw for ${effectiveModel}:`,
-          e,
-        );
+        logWarn("openrouter.query.web_search_throw", {
+          model,
+          effectiveModel,
+          error: summarizeError(e),
+        });
       }
       if (withWebSearchTool) {
+        logInfo("openrouter.query.success", {
+          model,
+          effectiveModel,
+          useWebSearch,
+          durationMs: Date.now() - startedAt,
+          contentChars: withWebSearchTool.content.length,
+          citationsCount: withWebSearchTool.citations?.length ?? 0,
+          webSearchSkipped: false,
+        });
         return {
           content: withWebSearchTool.content,
           reasoning_details: withWebSearchTool.reasoning_details,
@@ -357,9 +385,10 @@ export async function queryModel(
         };
       }
 
-      console.warn(
-        `[OpenRouter] Web search request failed for ${effectiveModel}; retrying without web search tool.`,
-      );
+      logWarn("openrouter.query.web_search_retry_without_tool", {
+        model,
+        effectiveModel,
+      });
       try {
         const resNo = await doFetch(
           effectiveModel,
@@ -370,16 +399,33 @@ export async function queryModel(
         );
         const fallback = await parseSuccess(resNo);
         if (fallback)
+          logInfo("openrouter.query.success", {
+            model,
+            effectiveModel,
+            useWebSearch,
+            durationMs: Date.now() - startedAt,
+            contentChars: fallback.content.length,
+            citationsCount: fallback.citations?.length ?? 0,
+            webSearchSkipped: true,
+          });
+        if (fallback)
           return {
             ...fallback,
             webSearchSkipped: true,
           };
       } catch (e) {
-        console.error(
-          `[OpenRouter] Fallback request without web search failed for ${effectiveModel}:`,
-          e,
-        );
+        logError("openrouter.query.fallback_error", {
+          model,
+          effectiveModel,
+          error: summarizeError(e),
+        });
       }
+      logWarn("openrouter.query.null_response", {
+        model,
+        effectiveModel,
+        useWebSearch,
+        durationMs: Date.now() - startedAt,
+      });
       return null;
     }
 
@@ -390,10 +436,35 @@ export async function queryModel(
       request.signal,
       apiKey,
     );
-    return parseSuccess(res);
+    const parsed = await parseSuccess(res);
+    if (parsed) {
+      logInfo("openrouter.query.success", {
+        model,
+        effectiveModel,
+        useWebSearch,
+        durationMs: Date.now() - startedAt,
+        contentChars: parsed.content.length,
+        citationsCount: parsed.citations?.length ?? 0,
+        webSearchSkipped: false,
+      });
+    } else {
+      logWarn("openrouter.query.null_response", {
+        model,
+        effectiveModel,
+        useWebSearch,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    return parsed;
   } catch (e) {
     if ((e as { name?: string })?.name === "AbortError") throw e;
-    console.error(`Error querying model ${model}:`, e);
+    logError("openrouter.query.error", {
+      model,
+      effectiveModel,
+      useWebSearch,
+      durationMs: Date.now() - startedAt,
+      error: summarizeError(e),
+    });
     return null;
   } finally {
     request.cleanup();
@@ -418,6 +489,7 @@ export async function queryModelStream(
   webSearchSkipped?: boolean;
   citations?: UrlCitationItem[];
 } | null> {
+  const startedAt = Date.now();
   const {
     onDelta,
     timeoutMs = 120_000,
@@ -442,7 +514,7 @@ export async function queryModelStream(
     ? withWebSearchSystemInstruction(messages, webSearchTemporalContext)
     : messages;
   const webTools = useWebSearch
-    ? webSearchToolsPayload(effectiveModel, webMaxResults)
+    ? webSearchToolsPayload(webMaxResults)
     : undefined;
 
   const request = createRequestSignal(timeoutMs, signal);
@@ -477,52 +549,132 @@ export async function queryModelStream(
   };
 
   try {
+    logInfo("openrouter.stream.start", {
+      model,
+      effectiveModel,
+      useWebSearch,
+      messageCount: messages.length,
+      promptChars: messages.reduce((sum, message) => sum + message.content.length, 0),
+    });
     throwIfAborted(signal);
     if (useWebSearch) {
       try {
         const acc = await runStream(payloadMessages, webTools);
-        if (acc !== null) return acc;
+        if (acc !== null) {
+          logInfo("openrouter.stream.success", {
+            model,
+            effectiveModel,
+            useWebSearch,
+            durationMs: Date.now() - startedAt,
+            contentChars: acc.content.length,
+            webSearchSkipped: false,
+          });
+          return acc;
+        }
       } catch (e) {
-        console.warn(
-          `[OpenRouter] Web search stream threw for ${effectiveModel}:`,
-          e,
-        );
+        logWarn("openrouter.stream.web_search_throw", {
+          model,
+          effectiveModel,
+          error: summarizeError(e),
+        });
       }
-      console.warn(
-        `[OpenRouter] Web search stream failed for ${effectiveModel}; retrying without web search tool.`,
-      );
+      logWarn("openrouter.stream.web_search_retry_without_tool", {
+        model,
+        effectiveModel,
+      });
       try {
         const acc = await runStream(messages, undefined);
-        if (acc !== null) return { ...acc, webSearchSkipped: true };
+        if (acc !== null) {
+          logInfo("openrouter.stream.success", {
+            model,
+            effectiveModel,
+            useWebSearch,
+            durationMs: Date.now() - startedAt,
+            contentChars: acc.content.length,
+            webSearchSkipped: true,
+          });
+          return { ...acc, webSearchSkipped: true };
+        }
       } catch (e) {
-        console.error(
-          `[OpenRouter] Stream without web search failed for ${effectiveModel}:`,
-          e,
-        );
+        logError("openrouter.stream.fallback_stream_error", {
+          model,
+          effectiveModel,
+          error: summarizeError(e),
+        });
       }
       const fb = await queryModel(model, messages, restQuery);
       if (fb?.content) {
         onDelta(fb.content);
+        logInfo("openrouter.stream.success", {
+          model,
+          effectiveModel,
+          useWebSearch,
+          durationMs: Date.now() - startedAt,
+          contentChars: fb.content.length,
+          webSearchSkipped: fb.webSearchSkipped ?? false,
+          fallbackToNonStream: true,
+        });
         return fb;
       }
+      logWarn("openrouter.stream.null_response", {
+        model,
+        effectiveModel,
+        useWebSearch,
+        durationMs: Date.now() - startedAt,
+      });
       return null;
     }
 
     try {
       const acc = await runStream(messages, undefined);
-      if (acc !== null) return acc;
+      if (acc !== null) {
+        logInfo("openrouter.stream.success", {
+          model,
+          effectiveModel,
+          useWebSearch,
+          durationMs: Date.now() - startedAt,
+          contentChars: acc.content.length,
+          webSearchSkipped: false,
+        });
+        return acc;
+      }
     } catch (e) {
-      console.error(`[OpenRouter] Stream failed for ${effectiveModel}:`, e);
+      logError("openrouter.stream.error", {
+        model,
+        effectiveModel,
+        error: summarizeError(e),
+      });
     }
     const fb = await queryModel(model, messages, restQuery);
     if (fb?.content) {
       onDelta(fb.content);
+      logInfo("openrouter.stream.success", {
+        model,
+        effectiveModel,
+        useWebSearch,
+        durationMs: Date.now() - startedAt,
+        contentChars: fb.content.length,
+        webSearchSkipped: fb.webSearchSkipped ?? false,
+        fallbackToNonStream: true,
+      });
       return fb;
     }
+    logWarn("openrouter.stream.null_response", {
+      model,
+      effectiveModel,
+      useWebSearch,
+      durationMs: Date.now() - startedAt,
+    });
     return null;
   } catch (e) {
     if ((e as { name?: string })?.name === "AbortError") throw e;
-    console.error(`Error streaming model ${model}:`, e);
+    logError("openrouter.stream.unhandled_error", {
+      model,
+      effectiveModel,
+      useWebSearch,
+      durationMs: Date.now() - startedAt,
+      error: summarizeError(e),
+    });
     return null;
   } finally {
     request.cleanup();
@@ -534,11 +686,23 @@ export async function queryModelsParallel(
   messages: ChatMessage[],
   options: QueryOptions = {},
 ): Promise<Map<string, Awaited<ReturnType<typeof queryModel>>>> {
+  const startedAt = Date.now();
+  logInfo("openrouter.parallel.start", {
+    models,
+    modelCount: models.length,
+    messageCount: messages.length,
+  });
   const entries = await Promise.all(
     models.map(async (model) => {
       const r = await queryModel(model, messages, options);
       return [model, r] as const;
     }),
   );
+  logInfo("openrouter.parallel.done", {
+    models,
+    modelCount: models.length,
+    durationMs: Date.now() - startedAt,
+    successCount: entries.filter(([, result]) => result != null).length,
+  });
   return new Map(entries);
 }

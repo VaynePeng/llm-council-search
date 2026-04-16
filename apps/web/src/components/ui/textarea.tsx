@@ -11,6 +11,7 @@ const Textarea = React.forwardRef<
       className,
     )}
     ref={ref}
+    suppressHydrationWarning
     {...props}
   />
 ));

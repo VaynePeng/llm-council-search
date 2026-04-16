@@ -15,9 +15,6 @@ RUN pnpm install --frozen-lockfile
 
 FROM base AS build
 
-ARG NEXT_PUBLIC_API_URL=
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
-
 COPY . .
 
 RUN pnpm --filter @llm-council-search/api build
@@ -40,7 +37,7 @@ COPY --from=build /app/apps/api/dist ./apps/api/dist
 
 RUN mkdir -p /app/data
 
-EXPOSE 8001
+EXPOSE 4001
 
 CMD ["pnpm", "--filter", "@llm-council-search/api", "start"]
 
@@ -50,7 +47,7 @@ ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_ENV=production
 ENV HOSTNAME=0.0.0.0
-ENV PORT=3000
+ENV PORT=4000
 
 RUN corepack enable
 
@@ -67,9 +64,9 @@ COPY --from=build /app/apps/web/.next ./apps/web/.next
 COPY --from=build /app/apps/web/public ./apps/web/public
 COPY --from=build /app/apps/web/next.config.ts ./apps/web/next.config.ts
 
-EXPOSE 3000
+EXPOSE 4000
 
-CMD ["pnpm", "--filter", "@llm-council-search/web", "exec", "next", "start", "--hostname", "0.0.0.0", "-p", "3000"]
+CMD ["pnpm", "--filter", "@llm-council-search/web", "exec", "next", "start", "--hostname", "0.0.0.0", "-p", "4000"]
 
 FROM node:22-bookworm-slim AS app
 
@@ -77,11 +74,10 @@ ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_ENV=production
 ENV HOSTNAME=0.0.0.0
-ENV PORT=8001
+ENV PORT=4001
 ENV DATA_DIR=/app/data
-ENV ALLOWED_ORIGINS=http://localhost:3000
-ENV NEXT_PUBLIC_API_URL=
-ENV API_PROXY_TARGET=http://127.0.0.1:8001
+ENV ALLOWED_ORIGINS=http://localhost:4000
+ENV API_PROXY_TARGET=http://127.0.0.1:4001
 
 RUN corepack enable
 
@@ -103,6 +99,7 @@ COPY docker/start.sh ./docker/start.sh
 
 RUN chmod +x ./docker/start.sh && mkdir -p /app/data
 
-EXPOSE 3000
+EXPOSE 4000
+EXPOSE 4001
 
 CMD ["./docker/start.sh"]

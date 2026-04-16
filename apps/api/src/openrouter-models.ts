@@ -1,6 +1,5 @@
 const OPENROUTER_MODELS_URL =
   "https://openrouter.ai/api/v1/models?output_modality=text";
-const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
 
 type OpenRouterModel = {
   id: string;
@@ -85,12 +84,10 @@ const FEATURED_MODEL_RULES: FeaturedModelRule[] = [
   },
 ];
 
-let cached:
-  | {
-      expiresAt: number;
-      groups: FeaturedModelGroup[];
-    }
-  | null = null;
+export type OpenRouterModelCatalog = {
+  availableModelIds: string[];
+  featuredModelGroups: FeaturedModelGroup[];
+};
 
 function modelCreatedAt(model: OpenRouterModel): number {
   return typeof model.created === "number" ? model.created : 0;
@@ -137,10 +134,13 @@ async function fetchOpenRouterModels(): Promise<OpenRouterModel[]> {
 }
 
 export async function getFeaturedModelGroups(): Promise<FeaturedModelGroup[]> {
-  const now = Date.now();
-  if (cached && cached.expiresAt > now) return cached.groups;
+  return buildFeaturedModelGroups(await fetchOpenRouterModels());
+}
 
-  const groups = buildFeaturedModelGroups(await fetchOpenRouterModels());
-  cached = { groups, expiresAt: now + MODEL_CACHE_TTL_MS };
-  return groups;
+export async function getOpenRouterModelCatalog(): Promise<OpenRouterModelCatalog> {
+  const models = await fetchOpenRouterModels();
+  return {
+    availableModelIds: [...new Set(models.map((model) => model.id).filter(Boolean))],
+    featuredModelGroups: buildFeaturedModelGroups(models),
+  };
 }
